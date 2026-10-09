@@ -1,0 +1,16 @@
+--- a/src/wlserver.cpp
++++ b/src/wlserver.cpp
+@@ -2610,6 +2610,13 @@
+ 	wl_list_remove( &wlserver.new_xdg_surface.link );
+ 	wl_list_remove( &wlserver.new_xdg_toplevel.link );
+ 	wl_list_remove( &wlserver.new_layer_shell_surface.link );
++	// gamenative A18: upstream never unregisters these two, but wlroots
++	// asserts empty manager-event listener lists in display-destroy
++	// handlers (wlr_virtual_pointer_v1.c:315, wlr_virtual_keyboard_v1.c:226).
++	// Any child-initiated clean shutdown reaching wl_display_destroy then
++	// SIGABRTs. (Desktop never notices: gamescope usually exits by signal.)
++	wl_list_remove( &wlserver.wlr.new_virtual_pointer.link );
++	wl_list_remove( &wlserver.wlr.new_virtual_keyboard.link );
+ 
+ #if HAVE_SESSION
+ 	if ( wlserver.wlr.session )

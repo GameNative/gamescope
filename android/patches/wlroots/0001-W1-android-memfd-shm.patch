@@ -1,0 +1,86 @@
+android: W1 — memfd-based shm for bionic (no shm_open/shm_unlink)
+
+bionic lacks POSIX shm entirely and memfd_create() is only declared from
+API 30; we target 28. Use raw SYS_memfd_create + /proc/self/fd re-open for
+allocate_shm_file()/allocate_shm_file_pair() under __ANDROID__; unused
+shm_open helpers compiled out. No new dependencies.
+
+---
+diff --git a/util/shm.c b/util/shm.c
+index 5eb87bb8..e684ebc1 100644
+--- a/util/shm.c
++++ b/util/shm.c
+@@ -8,8 +8,19 @@
+ #include <wlr/config.h>
+ #include "util/shm.h"
+ 
++// gamenative W1: bionic has no shm_open/shm_unlink (POSIX shm); use memfd via
++// raw syscall (memfd_create() is only declared by bionic from API 30).
++#if defined(__ANDROID__)
++#include <stdio.h>
++#include <sys/syscall.h>
++#ifndef MFD_CLOEXEC
++#define MFD_CLOEXEC 0x0001U
++#endif
++#endif
++
+ #define RANDNAME_PATTERN "/wlroots-XXXXXX"
+ 
++#if !defined(__ANDROID__)
+ static void randname(char *buf) {
+ 	struct timespec ts;
+ 	clock_gettime(CLOCK_REALTIME, &ts);
+@@ -35,14 +46,22 @@ static int excl_shm_open(char *name) {
+ 
+ 	return -1;
+ }
++#endif // !__ANDROID__
+ 
+ int allocate_shm_file(size_t size) {
++#if defined(__ANDROID__)
++	int fd = syscall(SYS_memfd_create, "wlroots", MFD_CLOEXEC);
++	if (fd < 0) {
++		return -1;
++	}
++#else
+ 	char name[] = RANDNAME_PATTERN;
+ 	int fd = excl_shm_open(name);
+ 	if (fd < 0) {
+ 		return -1;
+ 	}
+ 	shm_unlink(name);
++#endif
+ 
+ 	int ret;
+ 	do {
+@@ -57,6 +76,22 @@ int allocate_shm_file(size_t size) {
+ }
+ 
+ bool allocate_shm_file_pair(size_t size, int *rw_fd_ptr, int *ro_fd_ptr) {
++#if defined(__ANDROID__)
++	int rw_fd = syscall(SYS_memfd_create, "wlroots", MFD_CLOEXEC);
++	if (rw_fd < 0) {
++		return false;
++	}
++
++	// memfd has no name to re-open; go through /proc/self/fd instead. Do this
++	// before the fchmod() below drops the mode to 0.
++	char procpath[64];
++	snprintf(procpath, sizeof(procpath), "/proc/self/fd/%d", rw_fd);
++	int ro_fd = open(procpath, O_RDONLY | O_CLOEXEC);
++	if (ro_fd < 0) {
++		close(rw_fd);
++		return false;
++	}
++#else
+ 	char name[] = RANDNAME_PATTERN;
+ 	int rw_fd = excl_shm_open(name);
+ 	if (rw_fd < 0) {
+@@ -72,6 +107,7 @@ bool allocate_shm_file_pair(size_t size, int *rw_fd_ptr, int *ro_fd_ptr) {
+ 	}
+ 
+ 	shm_unlink(name);
++#endif
+ 
+ 	// Make sure the file cannot be re-opened in read-write mode (e.g. via
+ 	// "/proc/self/fd/" on Linux)

@@ -1,0 +1,21 @@
+diff --git a/src/Apps/gamescopereaper.cpp b/src/Apps/gamescopereaper.cpp
+index 5732c63f..083aaf6d 100644
+--- a/src/Apps/gamescopereaper.cpp
++++ b/src/Apps/gamescopereaper.cpp
+@@ -154,9 +154,14 @@ namespace gamescope
+                 }
+             }
+ 
++            // The primary child is the whole session: everything it leaves
++            // behind was reparented to us as the subreaper and is ours to take
++            // down. Wine's wineserver (plus explorer/services.exe) outlives the
++            // game forever and ignores SIGTERM, so kill the descendant tree
++            // outright, then exit without waiting on it -- blocking here would
++            // keep us, and gamescope, alive past the game.
+             s_bRun = false;
+-            Process::KillAllChildren( getpid(), SIGTERM );
+-            Process::WaitForAllChildren();
++            Process::KillAllChildren( getpid(), SIGKILL );
+ 
+             return 0;
+         }

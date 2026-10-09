@@ -1,0 +1,59 @@
+android: A31 — composite while a colour-management look is set
+
+gamescope applies colour-management look LUTs only on its composite path:
+create_color_mgmt_luts() bakes the active look into the composite 3D LUT, which
+only vulkan_composite() samples. A single fullscreen SDR layer with no scaling
+filter takes direct scanout (bNeedsFullComposite stays false), so a look set
+through set_look / gamescope_control.set_look / the GAMESCOPE_COLOR_LOOK_* root
+atoms never reaches the screen on this backend, which advertises no colour-mgmt
+plane properties and so cannot apply the LUT at scanout either.
+
+Add ColorLookInUse() — true while any g_ColorMgmtLooks LUT is loaded — and OR it
+into bNeedsFullComposite in the DRM backend, so the composite runs only while a
+look is actually active; there is no cost when none is set.
+
+---
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -158,6 +158,23 @@
+ static lut1d_t g_tmpLut1d;
+ static lut3d_t g_tmpLut3d;
+ 
++/// Whether a colour-management look is active: a 3D LUT set through `set_look`
++/// / `gamescope_control.set_look` / the `GAMESCOPE_COLOR_LOOK_*` root atoms.
++/// `create_color_mgmt_luts` bakes the look into the composite LUT, which is
++/// only sampled by `vulkan_composite`, so a backend that would otherwise
++/// direct-scanout a single fullscreen SDR layer must composite while one is
++/// set — otherwise the look never reaches the screen.
++bool ColorLookInUse()
++{
++	for ( uint32_t i = 0; i < EOTF_Count; i++ )
++	{
++		std::shared_ptr<lut3d_t> pLook = g_ColorMgmtLooks[ i ];
++		if ( pLook && pLook->lutEdgeSize > 0 )
++			return true;
++	}
++	return false;
++}
++
+ extern int g_nDynamicRefreshHz;
+ 
+ bool g_bForceHDRSupportDebug = false;
+--- a/src/Backends/DRMBackend.cpp
++++ b/src/Backends/DRMBackend.cpp
+@@ -583,6 +583,7 @@
+ 
+ extern gamescope::ConVar<bool> cv_composite_force;
+ extern bool g_bColorSliderInUse;
++bool ColorLookInUse();
+ extern bool fadingOut;
+ extern std::string g_reshade_effect;
+ 
+@@ -3992,6 +3993,7 @@
+ 			bNeedsFullComposite |= bNeedsCompositeFromFilter;
+ 			bNeedsFullComposite |= !cv_drm_cursor_plane && bDrewCursor;
+ 			bNeedsFullComposite |= g_bColorSliderInUse;
++			bNeedsFullComposite |= ColorLookInUse();
+ 			bNeedsFullComposite |= pFrameInfo->bFadingOut;
+ 			bNeedsFullComposite |= !g_reshade_effect.empty();
+ 

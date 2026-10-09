@@ -1,0 +1,41 @@
+android: A6 — sol2: noexcept(trait) on member templates breaks NDK clang
+
+NDK r27 clang+libc++ reject member function templates whose noexcept-spec
+uses std::is_nothrow_copy_assignable_v<T> of the enclosing class template
+("substitution failure" when taking the address as lua_CFunction); libstdc++
+and hoisting the trait into a constexpr member both work. Minimal fix:
+plain noexcept at the three affected sol::function_detail call sites.
+Semantically moot for our -fno-exceptions build.
+
+---
+diff --git a/thirdparty/sol/sol.hpp b/thirdparty/sol/sol.hpp
+index bbf8942..aed7b7a 100644
+--- a/thirdparty/sol/sol.hpp
++++ b/thirdparty/sol/sol.hpp
+@@ -19679,7 +19679,7 @@ namespace sol { namespace function_detail {
+ 		}
+ 
+ 		template <bool is_yielding, bool no_trampoline>
+-		static int call(lua_State* L) noexcept(std::is_nothrow_copy_assignable_v<T>) {
++		static int call(lua_State* L) noexcept /* gamenative A6: NDK clang substitutes trait-in-noexcept of member template */ {
+ 			int nr;
+ 			if constexpr (no_trampoline) {
+ 				nr = real_call(L);
+@@ -19719,7 +19719,7 @@ namespace sol { namespace function_detail {
+ 		}
+ 
+ 		template <bool is_yielding, bool no_trampoline>
+-		static int call(lua_State* L) noexcept(std::is_nothrow_copy_assignable_v<T>) {
++		static int call(lua_State* L) noexcept /* gamenative A6 */ {
+ 			int nr;
+ 			if constexpr (no_trampoline) {
+ 				nr = real_call(L);
+@@ -19838,7 +19838,7 @@ namespace sol { namespace function_detail {
+ 		: var(std::move(v)), member(std::forward<Args>(args)...) {
+ 		}
+ 
+-		static int call(lua_State* L, member_variable& self) noexcept(std::is_nothrow_copy_assignable_v<T>) {
++		static int call(lua_State* L, member_variable& self) noexcept /* gamenative A6 */ {
+ 			int nr;
+ 			{
+ 				M mem = detail::unwrap(detail::deref(self.member));

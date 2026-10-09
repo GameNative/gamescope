@@ -1,0 +1,61 @@
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -3121,6 +3121,20 @@
+ 	// Decide the fit target once so the window planes and the cursor plane agree.
+ 	fit = override;
+ 
++	// A23 present-path diagnostics (bring-up): whether the paint loop runs at
++	// all, and what the scene actually contains. Rate-limited, so a stalled
++	// pipeline still leaves a trail instead of going silent.
++	{
++		static long long int s_llLastA23PaintLog = 0;
++		if ( currentTime - s_llLastA23PaintLog >= 1000 )
++		{
++			s_llLastA23PaintLog = currentTime;
++			xwm_log.infof( "A23 paint_all: focus=%p override=%p overlay=%p input=%p connector=%p async=%d",
++				(void *)pFocus->focusWindow, (void *)override, (void *)overlay,
++				(void *)input, (void *)pConnector, async ? 1 : 0 );
++		}
++	}
++
+ 	if (++frameCounter == 300)
+ 	{
+ 		currentFrameRate = 300 * 1000.0f / (currentTime - lastSampledFrameTime);
+@@ -3483,7 +3497,17 @@
+ 		}
+ 	}
+ 
+-	if ( pConnector && pConnector->Present( &frameInfo, async ) != 0 )
++	int nA23PresentRet = pConnector ? pConnector->Present( &frameInfo, async ) : -1;
++	{
++		static long long int s_llLastA23PresentLog = 0;
++		unsigned int uA23Now = get_time_in_milliseconds();
++		if ( uA23Now - s_llLastA23PresentLog >= 1000 )
++		{
++			s_llLastA23PresentLog = uA23Now;
++			xwm_log.infof( "A23 present: ret=%d layers=%d", nA23PresentRet, frameInfo.layers.count() );
++		}
++	}
++	if ( pConnector && nA23PresentRet != 0 )
+ 	{
+ 		return;
+ 	}
+--- a/src/Backends/DRMBackend.cpp
++++ b/src/Backends/DRMBackend.cpp
+@@ -4388,7 +4388,15 @@
+ 			m_uNextPresentCtx = ( m_uNextPresentCtx + 1 ) % 3;
+ 			m_PresentCtxs[uCurrentPresentCtx].ulPendingFlipCount = g_DRM.pConnector->PresentationFeedback().m_uQueuedPresents;
+ 
+-			drm_log.debugf("flip commit %" PRIu64, (uint64_t)g_DRM.pConnector->PresentationFeedback().m_uQueuedPresents);
++			{
++				static uint64_t s_uLastA23FlipLog = 0;
++				uint64_t uA23Now = get_time_in_milliseconds();
++				if ( uA23Now - s_uLastA23FlipLog >= 1000 )
++				{
++					s_uLastA23FlipLog = uA23Now;
++					drm_log.infof("A23 flip commit %" PRIu64, (uint64_t)g_DRM.pConnector->PresentationFeedback().m_uQueuedPresents);
++				}
++			}
+ 			gpuvis_trace_printf( "flip commit %" PRIu64, (uint64_t)g_DRM.pConnector->PresentationFeedback().m_uQueuedPresents );
+ 
+ 			ret = drmModeAtomicCommit(drm->fd, drm->req, drm->flags, &m_PresentCtxs[uCurrentPresentCtx] );

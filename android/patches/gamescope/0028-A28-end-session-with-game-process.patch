@@ -1,0 +1,193 @@
+--- a/src/Apps/gamescopereaper.cpp
++++ b/src/Apps/gamescopereaper.cpp
+@@ -2,8 +2,10 @@
+ #include "../log.hpp"
+ 
+ #include <cassert>
++#include <cerrno>
+ #include <cstdlib>
+ #include <cstring>
++#include <ctime>
+ 
+ #include <getopt.h>
+ #include <pthread.h>
+@@ -16,6 +18,51 @@
+ {
+     static LogScope s_ReaperLog( "reaper" );
+ 
++    // Cleared by the signal handler when the parent (gamescope) dies.
++    static bool s_bRun = true;
++
++    // The primary child is wine's wrapper chain (explorer -> winhandler), which
++    // outlives the game, so waiting on it alone would keep the session alive
++    // after the game quits. The launcher hands us the game's image name in
++    // GAMENATIVE_GAME_PROCESS; when set, end the session as soon as that process
++    // is gone -- but only after it has been seen once, so a game that has not
++    // started yet (or a pre-install step) never ends the session early, and only
++    // after two consecutive misses, so a process briefly between images is not
++    // mistaken for an exit. Without the name we fall back to the primary child.
++    static void WaitForSessionEnd( pid_t nPrimaryChild )
++    {
++        const char *pszGameImage = getenv( "GAMENATIVE_GAME_PROCESS" );
++        if ( !pszGameImage || !*pszGameImage )
++        {
++            Process::WaitForAllChildren( nPrimaryChild );
++            return;
++        }
++
++        bool bSeen = false;
++        int nMisses = 0;
++        while ( s_bRun )
++        {
++            int nStatus = 0;
++            pid_t nDeadChild = waitpid( nPrimaryChild, &nStatus, WNOHANG );
++            if ( nDeadChild == nPrimaryChild || ( nDeadChild == -1 && errno == ECHILD ) )
++                return;
++
++            if ( Process::IsProcessImageRunning( pszGameImage ) )
++            {
++                bSeen = true;
++                nMisses = 0;
++            }
++            else if ( bSeen && ++nMisses >= 2 )
++            {
++                s_ReaperLog.infof( "\"%s\" exited. Ending session.", pszGameImage );
++                return;
++            }
++
++            struct timespec ts{ 0, 250 * 1000 * 1000 };
++            nanosleep( &ts, nullptr );
++        }
++    }
++
+     // Watches over a PID and waits for all the children to die.
+     // It sets itself up as a subreaper so any children get reparented ti oti.
+     // If the primary process dies, it kills all the children.
+@@ -37,7 +84,6 @@
+ 
+         bool bRespawn = false;
+         bool bNewSession = false;
+-        static bool s_bRun = true;
+ 
+         int nOptIndex = -1;
+         int nOption = -1;
+@@ -140,7 +186,7 @@
+             // Wait for the primary child to die, then forward the death signal to
+             // all of the other children, if we aren't in a PID namespace.
+             if ( s_bRun )
+-                Process::WaitForAllChildren( nPrimaryChild );
++                WaitForSessionEnd( nPrimaryChild );
+ 
+             if ( bRespawn )
+             {
+--- a/src/Utils/Process.h
++++ b/src/Utils/Process.h
+@@ -16,6 +16,12 @@
+     // Matches against comm, which the kernel truncates to 15 chars.
+     bool IsProcessRunning( const char *pszComm );
+ 
++    // True while a process is running whose command line names pszImageName as
++    // its own image (argv[0]) or as wine's argument (argv[1]) -- i.e. the game
++    // the session is hosting. Wrapper processes that merely carry the name as a
++    // later argument do not count.
++    bool IsProcessImageRunning( const char *pszImageName );
++
+     void KillAllChildren( pid_t nParentPid, int nSignal );
+     void KillProcess( pid_t nPid, int nSignal );
+ 
+--- a/src/Utils/Process.cpp
++++ b/src/Utils/Process.cpp
+@@ -11,6 +11,7 @@
+ #include <fstream>
+ #include <istream>
+ #include <string>
++#include <strings.h>
+ #include <vector>
+ 
+ #include <errno.h>
+@@ -139,6 +140,85 @@
+                 return true;
+         }
+ 
++        return false;
++    }
++
++    // Case-insensitive comparison of two paths' final components, treating both
++    // '/' and '\\' as separators (Windows paths).
++    static bool BasenameEquals( const char *pszPath, const char *pszName )
++    {
++        auto basename = []( const char *pszValue ) -> const char *
++        {
++            const char *pszBase = pszValue;
++            for ( const char *p = pszValue; *p; p++ )
++            {
++                if ( *p == '/' || *p == '\\' )
++                    pszBase = p + 1;
++            }
++            return pszBase;
++        };
++
++        const char *pszBase = basename( pszPath );
++        const char *pszWant = basename( pszName );
++        return *pszBase && *pszWant && strcasecmp( pszBase, pszWant ) == 0;
++    }
++
++    // True when the command line names the guest image as the process's own
++    // program (argv[0]) or as wine's argument (argv[1]). Wine execs a guest as
++    // "<wine-loader> <guest-image> [args]", and depending on how the guest was
++    // started either slot holds its Windows path. Nothing deeper is examined:
++    // gamescope, the session reaper, and the top-level wine that starts
++    // explorer carry the guest path only in later arguments, so a wider match
++    // makes the reaper match its own command line whenever the launcher hands
++    // the guest exe straight to wine (Dave the Diver) and it then never sees
++    // the guest leave. The compare is case-insensitive because Windows paths are.
++    static bool ImageNameMatches( const char *pszCmdline, size_t nLength, const char *pszImageName )
++    {
++        if ( BasenameEquals( pszCmdline, pszImageName ) )
++            return true;
++
++        // argv[1] is the field after the first NUL, if it lies within the read data.
++        const char *pszNul = (const char *) memchr( pszCmdline, '\0', nLength );
++        if ( !pszNul || pszNul + 1 >= pszCmdline + nLength )
++            return false;
++
++        return BasenameEquals( pszNul + 1, pszImageName );
++    }
++
++    bool IsProcessImageRunning( const char *pszImageName )
++    {
++        DIR *pProcDir = opendir( "/proc" );
++        if ( !pProcDir )
++            return false;
++        defer( closedir( pProcDir ) );
++
++        struct dirent *pEntry;
++        while ( ( pEntry = readdir( pProcDir ) ) )
++        {
++            if ( pEntry->d_type != DT_DIR )
++                continue;
++
++            if ( !IsDigit( pEntry->d_name[0] ) )
++                continue;
++
++            char szPath[ PATH_MAX ];
++            snprintf( szPath, sizeof( szPath ), "/proc/%s/cmdline", pEntry->d_name );
++
++            FILE *pCmdlineFile = fopen( szPath, "r" );
++            if ( !pCmdlineFile )
++                continue;
++            defer( fclose( pCmdlineFile ) );
++
++            // cmdline is NUL-separated; keep the bytes and the read length so the
++            // matcher can walk argv[0]/argv[1] without over-reading.
++            char szCmdline[ PATH_MAX ] = {};
++            size_t nRead = fread( szCmdline, 1, sizeof( szCmdline ) - 1, pCmdlineFile );
++            szCmdline[ nRead ] = '\0';
++
++            if ( ImageNameMatches( szCmdline, nRead, pszImageName ) )
++                return true;
++        }
++
+         return false;
+     }
+ 

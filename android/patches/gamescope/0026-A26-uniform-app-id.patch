@@ -1,0 +1,39 @@
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -1547,6 +1547,18 @@
+ #define SCREEN_SCALE_PROP	"STEAM_SCREEN_SCALE"
+ #define SCREEN_MAGNIFICATION_PROP	"STEAM_SCREEN_MAGNIFICATION"
+ 
++// GameNative: every game in a session gets ONE uniform app id, regardless of
++// the store it came from (Steam/GOG/Epic/custom). Without --steam, gamescope
++// otherwise derives w->appID from the Xwayland window id (map_win/add_win
++// below) -- a per-launch value the app process cannot know, since the
++// gamescope_control client that calls request_app_performance_stats() lives in
++// the app process with no X11 connection. The requested id keys
++// wlserver.app_perf_requests, which wlserver_app_presented() matches against
++// w->appID (published on the base plane); a fixed id makes both sides agree
++// with no cross-process channel and no file I/O. The app side (GameNative
++// GameNativeDrm.GAMESCOPE_APP_ID) must use the same value.
++static constexpr uint32_t kGameNativeUniformAppId = 1;
++
+ #define TRANSLUCENT	0x00000000
+ #define OPAQUE		0xffffffff
+ 
+@@ -5841,7 +5853,7 @@
+ 	}
+ 	else
+ 	{
+-		w->appID = w->xwayland().id;
++		w->appID = kGameNativeUniformAppId;
+ 	}
+ 
+ 	if ( w->isSteamLegacyBigPicture )
+@@ -6072,7 +6084,7 @@
+ 	}
+ 	else
+ 	{
+-		new_win->appID = id;
++		new_win->appID = kGameNativeUniformAppId;
+ 	}
+ 
+ 	if ( new_win->isExternalOverlay )

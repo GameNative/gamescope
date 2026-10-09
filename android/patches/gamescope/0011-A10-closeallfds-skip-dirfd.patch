@@ -1,0 +1,26 @@
+diff --git a/src/Utils/Process.cpp b/src/Utils/Process.cpp
+index 4528207..7333229 100644
+--- a/src/Utils/Process.cpp
++++ b/src/Utils/Process.cpp
+@@ -297,6 +297,11 @@ namespace gamescope::Process
+         }
+         defer( closedir( pProcDir ) );
+ 
++        // The directory itself owns an fd; the loop must not close it,
++        // otherwise closedir() closes it a second time (bionic fdsan
++        // aborts on the double-close; glibc silently tolerates).
++        int nDirFd = dirfd( pProcDir );
++
+         struct dirent *pEntry;
+         while ( ( pEntry = readdir( pProcDir ) ) )
+         {
+@@ -306,6 +311,9 @@ namespace gamescope::Process
+ 
+             int nFd = *onFd;
+ 
++            if ( nFd == nDirFd )
++                continue;
++
+             bool bExcluded = Algorithm::Contains( nExcludedFds, nFd );
+             if ( bExcluded )
+                 continue;

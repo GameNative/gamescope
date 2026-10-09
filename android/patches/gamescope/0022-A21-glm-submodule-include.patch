@@ -1,0 +1,19 @@
+--- a/meson.build
++++ b/meson.build
+@@ -50,8 +50,14 @@
+ dep_wayland = dependency('wayland-client')
+ vulkan_dep = dependency('vulkan')
+ 
+-glm_proj = subproject('glm')
+-glm_dep = glm_proj.get_variable('glm_dep')
++# gamenative A21: glm is a tracked git submodule (third_party/glm); it is
++# header-only, so depend on its include dir directly instead of resolving
++# the wrap (the wrap's meson.build overlay is not part of the submodule).
++# Lives outside subprojects/ because meson treats that tree as reserved
++# for wrap-resolved subprojects (sandbox violation warning otherwise).
++glm_dep = declare_dependency(
++  include_directories: include_directories('third_party/glm'),
++)
+ stb_proj = subproject('stb')
+ stb_dep = stb_proj.get_variable('stb_dep')
+ 

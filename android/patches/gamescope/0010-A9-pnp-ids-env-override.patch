@@ -1,0 +1,28 @@
+From: gamenative <dev@localhost>
+Date: Wed, 24 Sep 2026 09:20:00 +0800
+Subject: [PATCH gamescope] A9: honor GAMESCOPE_PNP_IDS_PATH for the PNP IDs
+ file
+
+HWDATA_PNP_IDS is a build-time prefix path (build-host termux prefix) that
+does not exist on device. The GameNative payload ships pnp.ids under
+filesDir/gamescope/share/hwdata/; the launcher exports GAMESCOPE_PNP_IDS_PATH.
+Fall back to the compiled path when unset. Cosmetic only (monitor names).
+---
+ src/Backends/DRMBackend.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/Backends/DRMBackend.cpp b/src/Backends/DRMBackend.cpp
+--- a/src/Backends/DRMBackend.cpp
++++ b/src/Backends/DRMBackend.cpp
+@@ -1208,6 +1208,8 @@ void load_pnps(void)
+ {
+ #ifdef HWDATA_PNP_IDS
+-	const char *filename = HWDATA_PNP_IDS;
++	const char *filename = getenv( "GAMESCOPE_PNP_IDS_PATH" );
++	if ( !filename || !*filename )
++		filename = HWDATA_PNP_IDS;
+ 	FILE *f = fopen(filename, "r");
+ 	if (!f) {
+ 		drm_log.infof("failed to open PNP IDs file at '%s'", filename);
+-- 
+2.51.1

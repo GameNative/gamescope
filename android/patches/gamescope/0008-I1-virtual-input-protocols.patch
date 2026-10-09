@@ -1,0 +1,100 @@
+android: I1 — virtual pointer/keyboard input protocols
+
+Android has no evdev access, so no physical input device can ever appear
+(M3 removed the libinput backend). All input is app-injected instead:
+GameNative's in-app wayland injector client creates a virtual pointer and
+keyboard through the zwlr_virtual_pointer_manager_v1 and
+zwp_virtual_keyboard_manager_v1 globals, both already implemented by the
+vendored wlroots but never instantiated.
+
+New devices are fed through the stock device->seat path by emitting
+multi_backend->events.new_input — the same mechanism physical backends
+use and the same self-emit gamescope already does for its built-in
+virtual keyboard. Runs on the wayland thread, which owns wlserver state.
+Touch stays app-side-mapped to pointer for now (no upstream virtual-touch
+protocol exists).
+---
+
+diff --git a/src/wlserver.cpp b/src/wlserver.cpp
+index fa57e2b..b1b6e36 100644
+--- a/src/wlserver.cpp
++++ b/src/wlserver.cpp
+@@ -43,6 +43,8 @@
+ #include <wlr/xwayland/server.h>
+ #include <wlr/types/wlr_xdg_shell.h>
+ #include <wlr/types/wlr_relative_pointer_v1.h>
++#include <wlr/types/wlr_virtual_pointer_v1.h>
++#include <wlr/types/wlr_virtual_keyboard_v1.h>
+ #include <wlr/types/wlr_pointer_constraints_v1.h>
+ #include <wlr/types/wlr_layer_shell_v1.h>
+ #include <wlr/types/wlr_data_device.h>
+@@ -593,6 +595,27 @@ static void wlserver_new_input(struct wl_listener *listener, void *data)
+ 
+ static struct wl_listener new_input_listener = { .notify = wlserver_new_input };
+ 
++// gamenative I1: a wayland client (GameNative's injector) created a virtual
++// device. Feed it through the exact same device→seat path physical devices
++// take (the multi_backend new_input signal, handled by wlserver_new_input
++// above — the built-in virtual keyboard is emitted the same way below).
++// Runs on the wayland thread, which also owns wlserver state.
++static void wlserver_new_virtual_pointer( struct wl_listener *listener, void *data )
++{
++	struct wlr_virtual_pointer_v1_new_pointer_event *event = (struct wlr_virtual_pointer_v1_new_pointer_event *) data;
++
++	wl_log.infof( "virtual pointer connected" );
++	wl_signal_emit( &wlserver.wlr.multi_backend->events.new_input, &event->new_pointer->pointer.base );
++}
++
++static void wlserver_new_virtual_keyboard( struct wl_listener *listener, void *data )
++{
++	struct wlr_virtual_keyboard_v1 *kbd = (struct wlr_virtual_keyboard_v1 *) data;
++
++	wl_log.infof( "virtual keyboard connected" );
++	wl_signal_emit( &wlserver.wlr.multi_backend->events.new_input, &kbd->keyboard.base );
++}
++
+ wlserver_wl_surface_info *get_wl_surface_info(struct wlr_surface *wlr_surf)
+ {
+ 	if (!wlr_surf)
+@@ -2285,6 +2308,21 @@ bool wlserver_init( void ) {
+ 
+ 	wlr_data_device_manager_create(wlserver.display);
+ 
++	// gamenative I1: no libinput backend exists on Android (M3); these
++	// globals are the only input path. Gamescope's own seat wiring is
++	// untouched — injected devices look exactly like physical ones.
++	wlserver.wlr.virtual_pointer_manager = wlr_virtual_pointer_manager_v1_create( wlserver.display );
++	wlserver.wlr.virtual_keyboard_manager = wlr_virtual_keyboard_manager_v1_create( wlserver.display );
++	if ( !wlserver.wlr.virtual_pointer_manager || !wlserver.wlr.virtual_keyboard_manager )
++	{
++		wl_log.errorf( "Failed to create virtual input managers" );
++		return false;
++	}
++	wlserver.wlr.new_virtual_pointer.notify = wlserver_new_virtual_pointer;
++	wl_signal_add( &wlserver.wlr.virtual_pointer_manager->events.new_virtual_pointer, &wlserver.wlr.new_virtual_pointer );
++	wlserver.wlr.new_virtual_keyboard.notify = wlserver_new_virtual_keyboard;
++	wl_signal_add( &wlserver.wlr.virtual_keyboard_manager->events.new_virtual_keyboard, &wlserver.wlr.new_virtual_keyboard );
++
+ 	wlserver.xdg_shell = wlr_xdg_shell_create(wlserver.display, 3);
+ 	if (!wlserver.xdg_shell)
+ 	{
+diff --git a/src/wlserver.hpp b/src/wlserver.hpp
+index 4adbd1c..a2da1d9 100644
+--- a/src/wlserver.hpp
++++ b/src/wlserver.hpp
+@@ -128,6 +128,14 @@ struct wlserver_t {
+ 		// Used to simulate key events and set the keymap
+ 		struct wlr_keyboard *virtual_keyboard_device;
+ 
++		// gamenative I1: virtual-input protocols. Android has no evdev, so
++		// all input is app-injected — GameNative's wayland injector client
++		// creates devices through these managers.
++		struct wlr_virtual_pointer_manager_v1 *virtual_pointer_manager;
++		struct wlr_virtual_keyboard_manager_v1 *virtual_keyboard_manager;
++		struct wl_listener new_virtual_pointer = {};
++		struct wl_listener new_virtual_keyboard = {};
++
+ 		struct wlr_device *device;
+ 		struct wl_listener device_change_listener = {};
+ 
+

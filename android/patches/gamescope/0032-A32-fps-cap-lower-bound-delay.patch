@@ -1,0 +1,78 @@
+android: A32 — pace the fps cap by a lower-bound delay, not a vblank grid
+
+`steamcompmgr_should_vblank_window` drops callbacks on a
+`vblank_idx % (refresh / target)` grid whenever a fixed-rate panel is in use.
+That grid is unrelated to when the guest actually committed, so a title already
+at its own ceiling loses a whole cycle whenever its commit lands late or off the
+grid: Dishonored reads ~57/s uncapped but ~45-51/s with a 60 target armed. The
+VRR branch instead defers on `w->last_commit_first_latch_time + cycle`, a lower
+bound anchored to the frame's own latch, so it can never push the rate below
+what the guest produced.
+
+Give the static path the same lower-bound delay, and make the limiter's cycle
+the exact target frame time (`1/target`) instead of
+`AppRefreshCycle * floor(refresh / target)`. The integer divisor both quantised
+the cap and mis-capped targets that do not divide the refresh (60 on 90Hz gave
+floor(90/60) = 1, i.e. no cap). The VRR path already used `1/target`; both
+paths now share it.
+
+No VRR property and no fabricated panel mode: this changes only the pacing
+arithmetic of gamescope's own backend, and is a no-op for a real VRR panel.
+
+---
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -6950,11 +6950,20 @@
+ 	}
+ 	else
+ 	{
+-		if ( g_nSteamCompMgrTargetFPS && bShouldLimitFPS && nRefreshHz > nTargetFPS )
++		// gamenative A32: a fixed-rate panel paces by a lower-bound delay on
++		// the target frame time, exactly as the VRR branch above, instead of
++		// dropping callbacks on a `vblank_idx % divisor` grid. The grid lost a
++		// whole cycle whenever a commit landed late or off the grid, so a title
++		// already at its own ceiling (Dishonored: ~57/s uncapped) was dragged
++		// *below* that ceiling by a 60 target (~45-51/s). A delay anchored to
++		// the frame's own latch can only hold the rate down to the target; it
++		// cannot push it below what the guest produced.
++		if ( g_nSteamCompMgrTargetFPS && bShouldLimitFPS && w && nRefreshHz > nTargetFPS )
+ 		{
+-			int nVblankDivisor = nRefreshHz / nTargetFPS;
++			uint64_t schedule = w->last_commit_first_latch_time + g_SteamCompMgrLimitedAppRefreshCycle;
+ 
+-			if ( vblank_idx % nVblankDivisor != 0 )
++			static constexpr uint64_t k_ulScheduleFudge = 200'000; // 0.2ms
++			if ( now + k_ulScheduleFudge < schedule )
+ 				bSendCallback = false;
+ 		}
+ 	}
+@@ -10511,20 +10520,17 @@
+ 			g_SteamCompMgrLimitedAppRefreshCycle = g_SteamCompMgrAppRefreshCycle;
+ 			if ( g_nSteamCompMgrTargetFPS )
+ 			{
+-				int nRealRefreshHz = gamescope::ConvertmHzToHz( nRealRefreshmHz );
+ 				int nTargetFPS = g_nSteamCompMgrTargetFPS;
+-				nTargetFPS = std::min<int>( nTargetFPS, nRealRefreshHz );
++				nTargetFPS = std::min<int>( nTargetFPS, gamescope::ConvertmHzToHz( nRealRefreshmHz ) );
+ 
+-				if ( GetBackend()->GetCurrentConnector() && GetBackend()->GetCurrentConnector()->IsVRRActive() )
+-				{
+-					g_SteamCompMgrLimitedAppRefreshCycle = gamescope::mHzToRefreshCycle( gamescope::ConvertHztomHz( nTargetFPS ) );
+-				}
+-				else
+-				{
+-					int nVblankDivisor = nRealRefreshHz / nTargetFPS;
+-
+-					g_SteamCompMgrLimitedAppRefreshCycle = g_SteamCompMgrAppRefreshCycle * nVblankDivisor;
+-				}
++				// gamenative A32: the limiter's cycle is the target frame time
++				// on every panel. `steamcompmgr_should_vblank_window` holds
++				// frames to it as a lower bound; the static path no longer
++				// rounds the target to an integer number of panel cycles, which
++				// both quantised the cap and mis-capped targets that do not
++				// divide the refresh (60 on 90Hz gave floor(90/60) = 1, i.e.
++				// no cap at all).
++				g_SteamCompMgrLimitedAppRefreshCycle = gamescope::mHzToRefreshCycle( gamescope::ConvertHztomHz( nTargetFPS ) );
+ 			}
+ 		}
+ 

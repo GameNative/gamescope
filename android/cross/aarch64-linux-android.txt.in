@@ -1,0 +1,46 @@
+# Meson cross file template: aarch64-linux-android (API 28) against the termux prefix.
+# Mirrors proton-wine build-step-arm64ec.sh toolchain settings.
+#
+# This file is a template. android/build-gamescope.sh fills in the NDK binary
+# directory and the termux prefix from its own settings and writes the result to
+# android/cross/aarch64-linux-android.txt, which is the file `--cross-file`
+# names. Generate it through the script rather than editing the output.
+
+[binaries]
+c          = '@NDK_BIN@/aarch64-linux-android28-clang'
+cpp        = '@NDK_BIN@/aarch64-linux-android28-clang++'
+ar         = '@NDK_BIN@/llvm-ar'
+strip      = '@NDK_BIN@/llvm-strip'
+nm         = '@NDK_BIN@/llvm-nm'
+pkgconfig  = 'pkg-config'
+# host (build-machine) tools — never the aarch64 ones from the prefix
+wayland-scanner = '/usr/bin/wayland-scanner'
+glslangValidator = '/usr/bin/glslangValidator'
+
+[host_machine]
+system     = 'linux'
+cpu_family = 'aarch64'
+cpu        = 'armv8-a'
+endian     = 'little'
+
+[built-in options]
+c_args   = ['-g0', '-O2', '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES', '-Drindex=strrchr',
+            '-idirafter', '@TERMUXFS@/include']
+# -D_LIBCPP_ENABLE_EXPERIMENTAL: NDK clang does not set __has_feature(experimental_library),
+#   so libc++ hides std::jthread/std::stop_token behind _LIBCPP_HAS_NO_EXPERIMENTAL_STOP_TOKEN
+#   (rendervulkan.hpp needs them; no API-level availability issue on Android).
+cpp_args = ['-g0', '-O2', '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES', '-Drindex=strrchr',
+            '-D_LIBCPP_ENABLE_EXPERIMENTAL',
+            # dev-stage: upstream swapchain-override protocol tracing
+            '-DGAMESCOPE_SWAPCHAIN_DEBUG',
+            '-idirafter', '@TERMUXFS@/include']
+c_link_args   = ['-L@TERMUXFS@/lib',
+                 '-Wl,-rpath=/data/data/com.termux/files/usr/lib',
+                 '-Wl,-z,max-page-size=16384']
+cpp_link_args = ['-L@TERMUXFS@/lib',
+                 '-Wl,-rpath=/data/data/com.termux/files/usr/lib',
+                 '-Wl,-z,max-page-size=16384']
+
+[properties]
+pkg_config_libdir = ['@TERMUXFS@/lib/pkgconfig',
+                     '@TERMUXFS@/share/pkgconfig']

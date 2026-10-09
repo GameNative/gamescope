@@ -1,0 +1,169 @@
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -1894,16 +1894,35 @@
+ static int32_t
+ window_last_done_commit_index( steamcompmgr_win_t *w )
+ {
+-	int32_t lastCommit = -1;
++	int32_t lastAnyCommit = -1;
++	// A window with a content override draws its real frame on the override
++	// surface (the guest's Vulkan swapchain the WSI shim bound to it). Wine also
++	// commits the window's own X11 surface — the window frame, its decorations,
++	// and the 1x1 helper the override is bound to — and those commits are not
++	// the app's frame: texturing them paints wine's window furniture instead of
++	// the game, which is a full-frame dropout. Once the override has committed
++	// at all it is the only content this window has; when none of its commits is
++	// done yet there is no new frame to paint, and the base plane holds the last
++	// one until there is.
++	struct wlr_surface *pOverrideSurface = w->override_surface();
++	int32_t lastOverrideCommit = -1;
+ 	for ( uint32_t i = 0; i < w->commit_queue.size(); i++ )
+ 	{
+-		if ( w->commit_queue[ i ]->done )
++		if ( pOverrideSurface && w->commit_queue[ i ]->surf == pOverrideSurface )
+ 		{
+-			lastCommit = i;
++			w->bHasOverrideContent = true;
++			if ( w->commit_queue[ i ]->done )
++				lastOverrideCommit = i;
+ 		}
++
++		if ( w->commit_queue[ i ]->done )
++			lastAnyCommit = i;
+ 	}
+ 
+-	return lastCommit;
++	if ( pOverrideSurface && w->bHasOverrideContent )
++		return lastOverrideCommit;
++
++	return lastAnyCommit;
+ }
+ 
+ static bool
+@@ -1919,11 +1938,22 @@
+ 
+ 	if ( lastCommit == -1 )
+ 	{
++		// Nothing new on the override surface. Hold the last frame the guest
++		// drew there: wine's own surface is not the app's picture, and dropping
++		// the layer blanks it.
++		if ( w->overrideContentCommit )
++		{
++			commit = w->overrideContentCommit;
++			w->nOverrideHolds++;
++		}
+ 		return;
+ 	}
+ 
+ 	if ( commit != w->commit_queue[ lastCommit ] )
+ 		commit = w->commit_queue[ lastCommit ];
++
++	if ( w->commit_queue[ lastCommit ]->surf == w->override_surface() )
++		w->overrideContentCommit = w->commit_queue[ lastCommit ];
+ }
+ 
+ static commit_t*
+@@ -2619,6 +2649,15 @@
+ 
+ 	layer->tex = lastCommit->GetTexture( layer->filter, frameInfo->eUpscaleScaler, layer->colorspace );
+ 
++	// A window whose content is its content override — the guest's frame the
++	// WSI shim bound to it — carries that frame at the override surface's
++	// committed size. Its own X11 geometry is meaningless for it (wine can
++	// leave the window it is bound to at 1x1 at an arbitrary offset, as
++	// Dishonored does), so it is sized and placed from the committed buffer,
++	// exactly like the focused window (scaleW), not from the X11 geometry.
++	const bool bOverrideContent = ( flags & PaintWindowFlag::NoScale ) == 0 &&
++		w != scaleW && w->override_surface() != nullptr;
++
+ 	if ( flags & PaintWindowFlag::NoScale )
+ 	{
+ 		sourceWidth = baseWidth = currentOutputWidth;
+@@ -2635,7 +2674,7 @@
+ 		// Typically XWayland would do a blit here to avoid that, but when we
+ 		// are using the bypass layer, we don't get that, so we need to handle
+ 		// this case explicitly.
+-		if (w == scaleW) {
++		if (w == scaleW || bOverrideContent) {
+ 			sourceWidth = layer->tex->width();
+ 			sourceHeight = layer->tex->height();
+ 
+@@ -2675,7 +2714,7 @@
+ 		winOffsetY = std::max( winOffsetY, 0 );
+ 	}
+ 
+-	bool offset = ( ( winOffsetX || winOffsetY ) && w != scaleW );
++	bool offset = ( ( winOffsetX || winOffsetY ) && w != scaleW && !bOverrideContent );
+ 
+ 	// A pre-emptively upscaled commit draws from an output sized texture, so the
+ 	// window's own transform comes from the commit dimensions rather than those.
+@@ -2687,7 +2726,7 @@
+ 		baseXOffset = ((int)currentOutputWidth - (int)baseWidth * baseScaleRatio_x) / 2.0f;
+ 		baseYOffset = ((int)currentOutputHeight - (int)baseHeight * baseScaleRatio_y) / 2.0f;
+ 
+-		if ( w != scaleW )
++		if ( w != scaleW && !bOverrideContent )
+ 		{
+ 			baseXOffset += winOffsetX * baseScaleRatio_x;
+ 			baseYOffset += winOffsetY * baseScaleRatio_y;
+@@ -2707,7 +2746,7 @@
+ 		drawXOffset = ((int)currentOutputWidth - (int)sourceWidth * currentScaleRatio_x) / 2.0f;
+ 		drawYOffset = ((int)currentOutputHeight - (int)sourceHeight * currentScaleRatio_y) / 2.0f;
+ 
+-		if ( w != scaleW )
++		if ( w != scaleW && !bOverrideContent )
+ 		{
+ 			drawXOffset += winOffsetX * currentScaleRatio_x;
+ 			drawYOffset += winOffsetY * currentScaleRatio_y;
+@@ -2768,6 +2807,29 @@
+ 
+ 	layer->eAlphaBlendingMode = ( flags & PaintWindowFlag::CoverageMode ) ? ALPHA_BLENDING_MODE_COVERAGE : ALPHA_BLENDING_MODE_PREMULTIPLIED;
+ 
++	// A30 content-override diagnostic: names the window each painted layer comes
++	// from, its committed buffer, and the resulting layer size/placement, so a
++	// composite that paints a frame at the wrong size says so instead of only
++	// showing a few pixels. Rate-limited, so a stalled pipeline still leaves a
++	// trail instead of going silent.
++	{
++		static long long int s_llLastA30PaintLog = 0;
++		unsigned int uA30Now = get_time_in_milliseconds();
++		if ( uA30Now - s_llLastA30PaintLog >= 1000 )
++		{
++			s_llLastA30PaintLog = uA30Now;
++			const char *pA30Commit = lastCommit->surf == w->override_surface() ? "ovr" : ( w->override_surface() ? "win" : "none" );
++			xwm_log.infof( "A30 layer: win=0x%x ovr=%d cmt=%s hold=%u xgeom=%dx%d+%d+%d tex=%dx%d src=%dx%d scale=%.3f,%.3f off=%.1f,%.1f",
++				w->id(), w->override_surface() != nullptr ? 1 : 0, pA30Commit, w->nOverrideHolds,
++				w->GetGeometry().nWidth, w->GetGeometry().nHeight,
++				w->GetGeometry().nX, w->GetGeometry().nY,
++				layer->tex ? layer->tex->width() : 0, layer->tex ? layer->tex->height() : 0,
++				sourceWidth, sourceHeight,
++				layer->scale.x, layer->scale.y,
++				layer->offset.x, layer->offset.y );
++		}
++	}
++
+ 	return layer;
+ }
+ 
+--- a/src/steamcompmgr_shared.hpp
++++ b/src/steamcompmgr_shared.hpp
+@@ -155,6 +155,19 @@
+ 
+ 	bool bHasHadNonSRGBColorSpace = false;
+ 
++	// The window has drawn a frame on its content override surface (the guest's
++	// frame the WSI shim bound to it), so wine's own surface is no longer the
++	// app's picture.
++	bool bHasOverrideContent = false;
++
++	// The last frame the guest drew there, held so the window is never
++	// composited without its picture: the override's commits are consumed as
++	// they are latched, so between frames there is nothing new queued, and
++	// falling back to wine's surface (or dropping the layer) is what blanks the
++	// picture.
++	gamescope::Rc<commit_t> overrideContentCommit;
++	uint32_t nOverrideHolds = 0;
++
+ 	bool placed = false;
+ 	bool ignoreOverrideRedirect = false;
+ 

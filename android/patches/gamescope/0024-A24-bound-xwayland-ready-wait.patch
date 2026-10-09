@@ -1,0 +1,263 @@
+--- a/src/wlserver.cpp
++++ b/src/wlserver.cpp
+@@ -8,6 +8,11 @@
+ #include <string.h>
+ #include <poll.h>
+ #include <fcntl.h>
++#include <dirent.h>
++#include <stdio.h>
++#include <limits.h>
++#include <atomic>
++#include <chrono>
+ #include <xf86drm.h>
+ #include <sys/eventfd.h>
+ 
+@@ -2218,6 +2278,171 @@
+ 	cv_xkb_layout = std::string{ pszLayout };
+ }
+ 
++// gamenative: bound the Xwayland ready-wait.
++//
++// While a server signals readiness it does so by writing its display number to
++// the -displayfd pipe; wlroots turns that into the server's ready signal, which
++// is only ever delivered by the Wayland event loop. This wait is therefore the
++// only thing servicing Wayland during startup, and it must satisfy every
++// request the child makes while it initialises (roundtrips, dmabuf feedback,
++// output/seat events). If the child's startup handshake stalls, nothing else
++// runs and the process pins silently until the caller's own budget expires.
++//
++// Keep the blocking dispatch for the healthy path (an event wakes it at once;
++// the poll timeout is only an upper bound, never a delay), and additionally
++// flush after each dispatch so replies/events produced while servicing the
++// loop are pushed to the child before the loop blocks again. A bounded overall
++// deadline then names the stall instead of pinning.
++static constexpr int kXWaylandReadyTimeoutMs = 15000;
++
++// gamenative: the ready-wait deadline tears the session down, so it is the last
++// moment the wedged child can be observed. Capture, once, what Xwayland is
++// blocked in: each thread's wchan, and each fd it holds mapped back to its
++// /proc/net/unix endpoint (or its readlink target for pipes and device nodes).
++// The wchan names the syscall; the unix path names the socket that produced it,
++// which is what separates a wait on our own X listener from one on the Wayland
++// or gndrm channels.
++static void
++log_xwayland_stall( gamescope_xwayland_server_t *pServer, size_t uIndex )
++{
++	pid_t pid = pServer->get_pid();
++	if ( pid <= 0 )
++		return;
++
++	wl_log.errorf( "xwayland-stall: index=%zu pid=%d wchan/fd snapshot:", uIndex, (int)pid );
++
++	char path[PATH_MAX];
++	snprintf( path, sizeof(path), "/proc/%d/task", (int)pid );
++	DIR *pTasks = opendir( path );
++	if ( pTasks )
++	{
++		struct dirent *pEnt;
++		while ( ( pEnt = readdir( pTasks ) ) != nullptr )
++		{
++			if ( pEnt->d_name[0] < '0' || pEnt->d_name[0] > '9' )
++				continue;
++
++			char comm[64] = "?";
++			char wchan[64] = "?";
++			char file[PATH_MAX];
++			int fd;
++
++			snprintf( file, sizeof(file), "/proc/%d/task/%s/comm", (int)pid, pEnt->d_name );
++			fd = open( file, O_RDONLY );
++			if ( fd >= 0 )
++			{
++				ssize_t n = read( fd, comm, sizeof(comm) - 1 );
++				if ( n > 0 ) { comm[n] = '\0'; char *pNl = strchr( comm, '\n' ); if ( pNl ) *pNl = '\0'; }
++				close( fd );
++			}
++
++			snprintf( file, sizeof(file), "/proc/%d/task/%s/wchan", (int)pid, pEnt->d_name );
++			fd = open( file, O_RDONLY );
++			if ( fd >= 0 )
++			{
++				ssize_t n = read( fd, wchan, sizeof(wchan) - 1 );
++				if ( n > 0 ) wchan[n] = '\0';
++				close( fd );
++			}
++
++			wl_log.errorf( "xwayland-stall:   tid=%s comm=%s wchan=%s", pEnt->d_name, comm, wchan );
++		}
++		closedir( pTasks );
++	}
++
++	snprintf( path, sizeof(path), "/proc/%d/fd", (int)pid );
++	DIR *pFds = opendir( path );
++	if ( pFds )
++	{
++		struct dirent *pEnt;
++		while ( ( pEnt = readdir( pFds ) ) != nullptr )
++		{
++			if ( pEnt->d_name[0] < '0' || pEnt->d_name[0] > '9' )
++				continue;
++
++			char target[PATH_MAX];
++			char file[PATH_MAX];
++			snprintf( file, sizeof(file), "/proc/%d/fd/%s", (int)pid, pEnt->d_name );
++			ssize_t n = readlink( file, target, sizeof(target) - 1 );
++			if ( n < 0 )
++				continue;
++			target[n] = '\0';
++
++			unsigned long ino = 0;
++			if ( sscanf( target, "socket:[%lu]", &ino ) == 1 )
++			{
++				char unix_name[PATH_MAX] = "";
++				FILE *pUnix = fopen( "/proc/net/unix", "r" );
++				if ( pUnix )
++				{
++					char line[512];
++					bool bHeader = true;
++					while ( fgets( line, sizeof(line), pUnix ) )
++					{
++						if ( bHeader ) { bHeader = false; continue; }
++						unsigned long ulInode = 0;
++						if ( sscanf( line, "%*x: %*x %*x %*x %*x %*x %lu", &ulInode ) == 1 && ulInode == ino )
++						{
++							char *pPath = strrchr( line, ' ' );
++							if ( pPath )
++							{
++								pPath++;
++								char *pNl = strchr( pPath, '\n' );
++								if ( pNl ) *pNl = '\0';
++								snprintf( unix_name, sizeof(unix_name), "%s", pPath );
++							}
++							break;
++						}
++					}
++					fclose( pUnix );
++				}
++				wl_log.errorf( "xwayland-stall:   fd=%s socket inode=%lu unix=%s",
++					pEnt->d_name, ino, unix_name[0] ? unix_name : "(unbound)" );
++			}
++			else
++			{
++				wl_log.errorf( "xwayland-stall:   fd=%s -> %s", pEnt->d_name, target );
++			}
++		}
++		closedir( pFds );
++	}
++}
++
++static bool wait_xwayland_server_ready( gamescope_xwayland_server_t *pServer, size_t uIndex )
++{
++	const auto start = std::chrono::steady_clock::now();
++
++	while ( !pServer->is_xwayland_ready() )
++	{
++		wlserver_lock();
++		wl_display_flush_clients( wlserver.display );
++		int ret = wl_event_loop_dispatch( wlserver.event_loop, 250 );
++		wl_display_flush_clients( wlserver.display );
++		wlserver_unlock();
++
++		if ( ret < 0 )
++		{
++			wl_log.errorf( "wl_event_loop_dispatch failed\n" );
++			return false;
++		}
++
++		const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
++			std::chrono::steady_clock::now() - start ).count();
++		if ( elapsedMs >= kXWaylandReadyTimeoutMs )
++		{
++			wl_log.errorf(
++				"Xwayland server %zu ('%s') did not signal ready within %d ms — "
++				"startup handshake stalled with no -displayfd write; the Wayland "
++				"loop was still dispatching requests throughout.\n",
++				uIndex, pServer->get_nested_display_name(), kXWaylandReadyTimeoutMs );
++			log_xwayland_stall( pServer, uIndex );
++			return false;
++		}
++	}
++
++	return true;
++}
++
+ bool wlserver_init( void ) {
+ 	assert( wlserver.display != nullptr );
+ 
+@@ -2418,16 +2643,8 @@
+ 
+ 	for (size_t i = 0; i < wlserver.wlr.xwayland_servers.size(); i++)
+ 	{
+-		while (!wlserver.wlr.xwayland_servers[i]->is_xwayland_ready()) {
+-			wlserver_lock();
+-			wl_display_flush_clients(wlserver.display);
+-			int ret = wl_event_loop_dispatch(wlserver.event_loop, -1);
+-			wlserver_unlock();
+-			if (ret < 0) {
+-				wl_log.errorf("wl_event_loop_dispatch failed\n");
+-				return false;
+-			}
+-		}
++		if ( !wait_xwayland_server_ready( wlserver.wlr.xwayland_servers[i].get(), i ) )
++			return false;
+ 	}
+ 
+ 	return true;
+@@ -3610,6 +3832,11 @@
+ 	return xwayland_server->display_name;
+ }
+ 
++pid_t gamescope_xwayland_server_t::get_pid() const
++{
++	return xwayland_server ? xwayland_server->pid : -1;
++}
++
+ void wlserver_x11_surface_info_finish( struct wlserver_x11_surface_info *surf )
+ {
+ 	assert( wlserver_is_lock_held() );
+@@ -3695,13 +3922,8 @@
+ 
+ 	auto& server = wlserver.wlr.xwayland_servers.emplace_back(std::make_unique<gamescope_xwayland_server_t>(wlserver.display, (int)wlserver.wlr.xwayland_servers.size()));
+ 
+-	while (!server->is_xwayland_ready()) {
+-		wl_display_flush_clients(wlserver.display);
+-		if (wl_event_loop_dispatch(wlserver.event_loop, -1) < 0) {
+-			wl_log.errorf("wl_event_loop_dispatch failed\n");
+-			return ~0u;
+-		}
+-	}
++	if ( !wait_xwayland_server_ready( server.get(), wlserver.wlr.xwayland_servers.size() - 1 ) )
++		return ~0u;
+ 
+ 	return uint32_t(wlserver.wlr.xwayland_servers.size() - 1);
+ }
+--- a/src/wlserver.hpp
++++ b/src/wlserver.hpp
+@@ -92,6 +92,8 @@
+ 
+ 	int get_index() const { return m_nIndex; }
+ 
++	pid_t get_pid() const;
++
+ private:
+ 	struct wlr_xwayland_server *xwayland_server = NULL;
+ 	struct wl_listener xwayland_ready_listener = { .notify = xwayland_ready_callback };
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1062,8 +1062,15 @@
+ 
+ 	if ( !wlserver_init() )
+ 	{
++		/* Unrecoverable. The failing step has already logged the reason
++		 * (e.g. the Xwayland ready-wait deadline). Do NOT return: the DRM
++		 * backend's static flip-handler thread is joinable by now, so
++		 * unwinding through the C++ runtime calls std::terminate on its
++		 * destructor — an abort and a tombstone for what is a clean,
++		 * named init failure. _exit skips static destructors. */
+ 		fprintf( stderr, "Failed to initialize wlserver\n" );
+-		return 1;
++		fflush( nullptr );
++		_exit( 1 );
+ 	}
+ 
+ 	gamescope_xwayland_server_t *base_server = wlserver_get_xwayland_server(0);

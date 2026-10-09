@@ -1,0 +1,43 @@
+--- a/src/Backends/DRMBackend.cpp
++++ b/src/Backends/DRMBackend.cpp
+@@ -2690,7 +2690,10 @@
+ 	if (is_liftoff_caching_enabled())
+ 	{
+ 		if (g_LiftoffStateCache.count(entry) != 0)
++		{
++			drm_log.errorf( "gamenative A17 diag: liftoff state cache HIT (%d layers) -> -EINVAL with no ioctl", frameInfo->layers.count() );
+ 			return -EINVAL;
++		}
+ 	}
+ 
+ 	bool bSinglePlane = frameInfo->layers.count() < 2 && cv_drm_single_plane_optimizations;
+@@ -2704,6 +2707,8 @@
+ 
+ 			if ( pDrmFb == nullptr )
+ 			{
++				drm_log.errorf( "gamenative A17 diag: layer %d has no DRM FB (tex=%p backendFb=%p) -> -EINVAL with no ioctl",
++					i, (void *)pLayer->tex.get(), (void *)( pLayer->tex ? pLayer->tex->GetBackendFb() : nullptr ) );
+ 				drm_log.debugf("drm_prepare_liftoff: layer %d has no FB", i );
+ 				return -EINVAL;
+ 			}
+@@ -2872,6 +2877,9 @@
+ 
+ 	int ret = liftoff_output_apply( drm->lo_output, drm->req, drm->flags, &lo_options);
+ 
++	if ( ret != 0 )
++		drm_log.errorf( "gamenative A17 diag: liftoff_output_apply -> %d (%s)", ret, strerror( -ret ) );
++
+ 	// The NVIDIA 555 series drivers started advertising DRM_CAP_SYNCOBJ, but do
+ 	// not support IN_FENCE_FD. However, there is no way to hide the IN_FENCE_FD
+ 	// property in a DRM-KMS driver, so the driver returns EPERM when an
+@@ -2901,7 +2909,10 @@
+ 	{
+ 		// We don't support partial composition yet
+ 		if ( liftoff_output_needs_composition( drm->lo_output ) )
++		{
++			drm_log.errorf( "gamenative A17 diag: liftoff_output_needs_composition -> forcing -EINVAL (apply itself succeeded)" );
+ 			ret = -EINVAL;
++		}
+ 	}
+ 
+ 	// If we aren't modesetting and we got -EINVAL, that means that we

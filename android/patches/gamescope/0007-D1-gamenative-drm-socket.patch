@@ -1,0 +1,129 @@
+android: D1 — GAMENATIVE_DRM_SOCKET userspace-KMS hookup
+
+The GameNative display path: gamescope never touches a real /dev/dri node.
+When GAMENATIVE_DRM_SOCKET is set (GameNative sets it together with
+LD_PRELOAD=<pkg>/lib/libgndrm_shim.so):
+
+- init_drm() skips the vulkan_primary_dev_id/drmGetDeviceFromDevId primary
+  node probe and the wlsession_open_kms() session open, and instead calls
+  gamenative_drm_connect() — a weak symbol provided by the preloaded
+  gamenative-drm shim. The returned fd is a connected SOCK_SEQPACKET to the
+  in-app daemon; the shim intercepts every KMS ioctl on it, and flip events
+  arrive on the same fd (a real socket: read/poll/epoll need no hooks).
+- Weak linkage keeps gamescope runnable without the shim; a set env var
+  with an unresolved symbol is a hard error with a clear message.
+- IsSessionBased() reports false in this mode: there is no VT/seat session,
+  and overlay plane reservation must not assume a real display stack
+  (the daemon exposes exactly one primary + one cursor plane).
+
+Everything downstream of the fd (drmIsKMS, caps, resources, atomic
+commits) is answered by the daemon's kernel-ABI emulation; this patch is
+deliberately the only display hookup point.
+---
+
+diff --git a/src/Backends/DRMBackend.cpp b/src/Backends/DRMBackend.cpp
+index 7fe7648..7cc2e53 100644
+--- a/src/Backends/DRMBackend.cpp
++++ b/src/Backends/DRMBackend.cpp
+@@ -47,6 +47,24 @@
+ #include "refresh_rate.h"
+ #include <sys/utsname.h>
+ 
++// gamenative D1: userspace KMS via gamenative-drm. When
++// GAMENATIVE_DRM_SOCKET is set, libgndrm_shim.so is LD_PRELOAD'ed into this
++// process; it owns the daemon connection, intercepts every KMS ioctl on the
++// fd returned below, and serves flip events on it (a real socket, so
++// read/poll/epoll need no interposition). Weak: gamescope must still link
++// and run when the shim is absent.
++extern "C" __attribute__( ( weak ) ) int gamenative_drm_connect( void );
++
++static bool BUsesGameNativeDrm()
++{
++	static const bool bUsing = []()
++	{
++		const char *pszSock = getenv( "GAMENATIVE_DRM_SOCKET" );
++		return pszSock && *pszSock;
++	}();
++	return bUsing;
++}
++
+ #include "wlr_begin.hpp"
+ #include <libliftoff.h>
+ #include <wlr/types/wlr_buffer.h>
+@@ -1258,27 +1276,49 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
+ 	drm->preferred_refresh = refresh;
+ 
+ 	drm->device_name = nullptr;
+-	dev_t dev_id = 0;
+-	if (vulkan_primary_dev_id(&dev_id)) {
+-		drmDevice *drm_dev = nullptr;
+-		if (drmGetDeviceFromDevId(dev_id, 0, &drm_dev) != 0) {
+-			drm_log.errorf("Failed to find DRM device with device ID %" PRIu64, (uint64_t)dev_id);
++
++	if ( BUsesGameNativeDrm() )
++	{
++		// gamenative D1: no primary-node probe (the "device" is the
++		// userspace daemon), no session open — the shim hands us a
++		// connected fd and answers drmIsKMS/caps via the wire protocol.
++		if ( gamenative_drm_connect == nullptr )
++		{
++			drm_log.errorf( "GAMENATIVE_DRM_SOCKET is set but libgndrm_shim.so is not preloaded (gamenative_drm_connect unresolved)" );
++			return false;
++		}
++		drm->fd = gamenative_drm_connect();
++		if ( drm->fd < 0 )
++		{
++			drm_log.errorf( "gamenative_drm_connect(%s) failed: %s", getenv( "GAMENATIVE_DRM_SOCKET" ), strerror( errno ) );
+ 			return false;
+ 		}
+-		assert(drm_dev->available_nodes & (1 << DRM_NODE_PRIMARY));
+-		drm->device_name = strdup(drm_dev->nodes[DRM_NODE_PRIMARY]);
+-		drm_log.infof("opening DRM node '%s'", drm->device_name);
++		drm_log.infof( "using gamenative-drm userspace KMS via socket '%s'", getenv( "GAMENATIVE_DRM_SOCKET" ) );
+ 	}
+ 	else
+ 	{
+-		drm_log.infof("warning: picking an arbitrary DRM device");
+-	}
++		dev_t dev_id = 0;
++		if (vulkan_primary_dev_id(&dev_id)) {
++			drmDevice *drm_dev = nullptr;
++			if (drmGetDeviceFromDevId(dev_id, 0, &drm_dev) != 0) {
++				drm_log.errorf("Failed to find DRM device with device ID %" PRIu64, (uint64_t)dev_id);
++				return false;
++			}
++			assert(drm_dev->available_nodes & (1 << DRM_NODE_PRIMARY));
++			drm->device_name = strdup(drm_dev->nodes[DRM_NODE_PRIMARY]);
++			drm_log.infof("opening DRM node '%s'", drm->device_name);
++		}
++		else
++		{
++			drm_log.infof("warning: picking an arbitrary DRM device");
++		}
+ 
+-	drm->fd = wlsession_open_kms( drm->device_name );
+-	if ( drm->fd < 0 )
+-	{
+-		drm_log.errorf("Could not open KMS device");
+-		return false;
++		drm->fd = wlsession_open_kms( drm->device_name );
++		if ( drm->fd < 0 )
++		{
++			drm_log.errorf("Could not open KMS device");
++			return false;
++		}
+ 	}
+ 
+ 	if ( !drmIsKMS( drm->fd ) )
+@@ -4025,7 +4065,9 @@ namespace gamescope
+ 
+         virtual bool IsSessionBased() const override
+ 		{
+-			return true;
++			// gamenative D1: userspace KMS has no VT/seat session; also
++			// keeps overlay plane reservation from assuming a real stack.
++			return !BUsesGameNativeDrm();
+ 		}
+ 
+ 		virtual bool SupportsExplicitSync() const override
+

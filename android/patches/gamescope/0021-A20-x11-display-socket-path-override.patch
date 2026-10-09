@@ -1,0 +1,38 @@
+--- a/src/wlserver.cpp
++++ b/src/wlserver.cpp
+@@ -314,7 +314,15 @@
+ 	if (!xwayland_server->options.no_touch_pointer_emulation)
+ 		wl_log.infof("Xwayland doesn't support -noTouchPointerEmulation, touch events might get duplicated");
+ 
+-	dpy = XOpenDisplay( get_nested_display_name() );
++	// gamenative A20: the bundled (termux-prefix) libX11/libxcb resolve ":0"
++	// to a compiled-in socket dir that does not exist on device, while
++	// wlroots binds the filesystem socket under WLR_X11_SOCKET_DIR. libxcb
++	// accepts a full socket path as the display name
++	// (_xcb_parse_display_path_to_socket), so let the launcher hand us the
++	// exact path wlroots bound.
++	const char *display_override = getenv( "GAMESCOPE_X11_DISPLAY" );
++	dpy = XOpenDisplay( ( display_override && *display_override ) ?
++		display_override : get_nested_display_name() );
+ }
+ 
+ void gamescope_xwayland_server_t::xwayland_ready_callback(struct wl_listener *listener, void *data)
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1068,7 +1068,15 @@
+ 
+ 	gamescope_xwayland_server_t *base_server = wlserver_get_xwayland_server(0);
+ 
+-	setenv("DISPLAY", base_server->get_nested_display_name(), 1);
++	// gamenative A20: the bundled (termux-prefix) libX11/libxcb resolves
++	// ":0" via an abstract-socket-first dial whose abstract->unix fallback
++	// never fires on device, so plain ":0" children can never connect.
++	// The launcher hands us the exact fs socket wlroots bound; libxcb
++	// accepts a full socket path as the display name
++	// (_xcb_parse_display_path_to_socket), so propagate it to children.
++	const char *child_display = getenv( "GAMESCOPE_X11_DISPLAY" );
++	setenv("DISPLAY", ( child_display && *child_display ) ?
++		child_display : base_server->get_nested_display_name(), 1);
+ 	if ( g_bExposeWayland )
+ 		setenv("XDG_SESSION_TYPE", "wayland", 1);
+ 	else

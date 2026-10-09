@@ -1,0 +1,159 @@
+android: W2 — WLR_X11_SOCKET_DIR for X11 lock/socket filesystem paths
+
+Android has no /tmp. open_display_sockets() creates /tmp/.X<n>-lock and
+binds the filesystem socket under /tmp/.X11-unix — every display number
+fails ENOENT → "No display available in the first 33" → gamescope's
+Xwayland server creation dies (fatal).
+
+WLR_X11_SOCKET_DIR redirects the filesystem artifacts (lock files, socket
+dir, filesystem socket). The ABSTRACT socket name stays the standard
+/tmp/.X11-unix/X%d — kernel namespace, no fs, and X11 clients connect
+to it by that exact name. The GameNative launcher sets
+WLR_X11_SOCKET_DIR=<imagefs>/tmp and pre-creates <dir>/.X11-unix
+(0700, owned by us → check_socket_dir passes).
+
+socket_fmt2 (non-linux second-socket suffix) folded away: the fs socket
+path now always comes from the env base; non-linux keeps the /tmp
+default. Xwayland never binds sockets itself (wlroots passes -listenfd).
+
+---
+diff --git a/xwayland/sockets.c b/xwayland/sockets.c
+index 364fbc47..edf02db2 100644
+--- a/xwayland/sockets.c
++++ b/xwayland/sockets.c
+@@ -16,12 +16,16 @@
+ #include "sockets.h"
+ #include "util/fd.h"
+ 
+-static const char lock_fmt[] = "/tmp/.X%d-lock";
+-static const char socket_dir[] = "/tmp/.X11-unix";
+ static const char socket_fmt[] = "/tmp/.X11-unix/X%d";
+-#ifndef __linux__
+-static const char socket_fmt2[] = "/tmp/.X11-unix/X%d_";
+-#endif
++
++/* gamenative W2: Android has no /tmp. WLR_X11_SOCKET_DIR redirects the
++ * filesystem artifacts (lock files, socket dir, filesystem socket); the
++ * ABSTRACT socket name above stays standard — it lives in the kernel
++ * namespace (no fs) and X11 clients connect to it by that exact name. */
++static const char *x11_fs_base(void) {
++	const char *d = getenv("WLR_X11_SOCKET_DIR");
++	return (d && *d) ? d : "/tmp";
++}
+ 
+ static int open_socket(struct sockaddr_un *addr, size_t path_size) {
+ 	int fd, rc;
+@@ -68,26 +72,26 @@ cleanup:
+ 	return -1;
+ }
+ 
+-static bool check_socket_dir(void) {
++static bool check_socket_dir(const char *dir) {
+ 	struct stat buf;
+ 
+-	if (lstat(socket_dir, &buf)) {
+-		wlr_log_errno(WLR_ERROR, "Failed to stat %s", socket_dir);
++	if (lstat(dir, &buf)) {
++		wlr_log_errno(WLR_ERROR, "Failed to stat %s", dir);
+ 		return false;
+ 	}
+ 	if (!(buf.st_mode & S_IFDIR)) {
+-		wlr_log(WLR_ERROR, "%s is not a directory", socket_dir);
++		wlr_log(WLR_ERROR, "%s is not a directory", dir);
+ 		return false;
+ 	}
+ 	if (!((buf.st_uid == 0) || (buf.st_uid == getuid()))) {
+-		wlr_log(WLR_ERROR, "%s not owned by root or us", socket_dir);
++		wlr_log(WLR_ERROR, "%s not owned by root or us", dir);
+ 		return false;
+ 	}
+ 	if (!(buf.st_mode & S_ISVTX)) {
+ 		/* we can deal with no sticky bit... */
+ 		if ((buf.st_mode & (S_IWGRP | S_IWOTH))) {
+ 			/* but not if other users can mess with our sockets */
+-			wlr_log(WLR_ERROR, "sticky bit not set on %s", socket_dir);
++			wlr_log(WLR_ERROR, "sticky bit not set on %s", dir);
+ 			return false;
+ 		}
+ 	}
+@@ -97,30 +101,41 @@ static bool check_socket_dir(void) {
+ static bool open_sockets(int socks[2], int display) {
+ 	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+ 	size_t path_size;
++	char dir[512];
+ 
+-	if (mkdir(socket_dir, 0755) == 0) {
++	snprintf(dir, sizeof(dir), "%s/.X11-unix", x11_fs_base());
++	if (mkdir(dir, 0755) == 0) {
+ 		wlr_log(WLR_INFO, "Created %s ourselves -- other users will "
+ 			"be unable to create X11 UNIX sockets of their own",
+-			socket_dir);
++			dir);
+ 	} else if (errno != EEXIST) {
+-		wlr_log_errno(WLR_ERROR, "Unable to mkdir %s", socket_dir);
++		wlr_log_errno(WLR_ERROR, "Unable to mkdir %s", dir);
+ 		return false;
+-	} else if (!check_socket_dir()) {
++	} else if (!check_socket_dir(dir)) {
+ 		return false;
+ 	}
+ 
+ #ifdef __linux__
++	/* Abstract socket: keep the standard name, clients connect to it. */
+ 	addr.sun_path[0] = 0;
+ 	path_size = snprintf(addr.sun_path + 1, sizeof(addr.sun_path) - 1, socket_fmt, display);
+ #else
+-	path_size = snprintf(addr.sun_path, sizeof(addr.sun_path), socket_fmt2, display);
++	path_size = snprintf(addr.sun_path, sizeof(addr.sun_path),
++		"%s/.X11-unix/X%d_", x11_fs_base(), display);
+ #endif
+ 	socks[0] = open_socket(&addr, path_size);
+ 	if (socks[0] < 0) {
+ 		return false;
+ 	}
+ 
+-	path_size = snprintf(addr.sun_path, sizeof(addr.sun_path), socket_fmt, display);
++	path_size = snprintf(addr.sun_path, sizeof(addr.sun_path),
++		"%s/.X11-unix/X%d", x11_fs_base(), display);
++	if (path_size >= sizeof(addr.sun_path)) {
++		wlr_log(WLR_ERROR, "X11 socket path too long (WLR_X11_SOCKET_DIR)");
++		close(socks[0]);
++		socks[0] = -1;
++		return false;
++	}
+ 	socks[1] = open_socket(&addr, path_size);
+ 	if (socks[1] < 0) {
+ 		close(socks[0]);
+@@ -132,26 +147,26 @@ static bool open_sockets(int socks[2], int display) {
+ }
+ 
+ void unlink_display_sockets(int display) {
+-	char sun_path[64];
++	char sun_path[512];
+ 
+-	snprintf(sun_path, sizeof(sun_path), socket_fmt, display);
++	snprintf(sun_path, sizeof(sun_path), "%s/.X11-unix/X%d", x11_fs_base(), display);
+ 	unlink(sun_path);
+ 
+ #ifndef __linux__
+-	snprintf(sun_path, sizeof(sun_path), socket_fmt2, display);
++	snprintf(sun_path, sizeof(sun_path), "%s/.X11-unix/X%d_", x11_fs_base(), display);
+ 	unlink(sun_path);
+ #endif
+ 
+-	snprintf(sun_path, sizeof(sun_path), lock_fmt, display);
++	snprintf(sun_path, sizeof(sun_path), "%s/.X%d-lock", x11_fs_base(), display);
+ 	unlink(sun_path);
+ }
+ 
+ int open_display_sockets(int socks[2]) {
+ 	int lock_fd, display;
+-	char lock_name[64];
++	char lock_name[512];
+ 
+ 	for (display = 0; display <= 32; display++) {
+-		snprintf(lock_name, sizeof(lock_name), lock_fmt, display);
++		snprintf(lock_name, sizeof(lock_name), "%s/.X%d-lock", x11_fs_base(), display);
+ 		if ((lock_fd = open(lock_name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0444)) >= 0) {
+ 			if (!open_sockets(socks, display)) {
+ 				unlink(lock_name);

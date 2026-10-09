@@ -1,0 +1,128 @@
+--- a/src/wlserver.cpp
++++ b/src/wlserver.cpp
+@@ -32,6 +37,8 @@
+ #include <wlr/backend/multi.h>
+ #include <wlr/interfaces/wlr_keyboard.h>
+ #include <wlr/render/wlr_renderer.h>
++#include <wlr/render/dmabuf.h>
++#include <wlr/types/wlr_buffer.h>
+ #include <wlr/types/wlr_compositor.h>
+ #include <wlr/types/wlr_keyboard.h>
+ #include <wlr/types/wlr_keyboard_group.h>
+@@ -229,12 +236,56 @@
+ 	// Mutter and Weston have forward progress on the frame callback in this situation,
+ 	// so let the commit go through. It will be duplication-eliminated later.
+ 
++	// gamenative: first-N commit diagnostics — log buffer shape,
++	// texture-acquire failures and the routing decision. Only
++	// buffer-carrying commits count against the budget — state-only
++	// commits (no buffer attached) are routine and would exhaust it.
++	static std::atomic<int> s_nCommitLog{ 0 };
++	const bool bHasBuffer = wlr_surface->buffer != nullptr;
++	const bool bLogCommit = bHasBuffer && s_nCommitLog.fetch_add( 1 ) < 24;
++
+ 	VulkanWlrTexture_t *tex = (VulkanWlrTexture_t *) wlr_surface_get_texture( wlr_surface );
+ 	if ( tex == NULL )
+ 	{
++		// gamenative: texture-acquire failure is fatal for that surface's
++		// forward progress (no PrepareCommit -> no wl_buffer.release -> the
++		// client's swapchain starves) and typically means the dmabuf's
++		// format/modifier is not importable by our vulkan device. Log it
++		// outside the first-N budget: by the time a game swapchain commits,
++		// the desktop has long exhausted it.
++		static std::atomic<int> s_nDropLog{ 0 };
++		if ( s_nDropLog.fetch_add( 1 ) < 32 )
++		{
++			struct wlr_buffer *rawbuf = wlr_surface->buffer ? &wlr_surface->buffer->base : nullptr;
++			struct wlr_dmabuf_attributes dmabuf = {};
++			const bool bIsDmabuf = rawbuf && wlr_buffer_get_dmabuf( rawbuf, &dmabuf );
++			wl_log.infof( "wlcommit DROP surf=%p tex=NULL buf=%p %dx%d dmabuf=%d fourcc=0x%x modifier=0x%llx planes=%d",
++				(void *)wlr_surface, (void *)rawbuf,
++				rawbuf ? rawbuf->width : 0, rawbuf ? rawbuf->height : 0,
++				bIsDmabuf ? 1 : 0,
++				bIsDmabuf ? dmabuf.format : 0,
++				bIsDmabuf ? (unsigned long long)dmabuf.modifier : 0ULL,
++				bIsDmabuf ? dmabuf.n_planes : 0 );
++		}
+ 		return;
+ 	}
+ 
++	if ( bLogCommit )
++	{
++		struct wlr_buffer *rawbuf = tex->buf;
++		struct wlr_dmabuf_attributes dmabuf = {};
++		const bool bIsDmabuf = rawbuf && wlr_buffer_get_dmabuf( rawbuf, &dmabuf );
++		struct wlr_surface *root = wlr_surface_get_root_surface( wlr_surface );
++		wl_log.infof( "wlcommit surf=%p root=%p xdg=%d buf=%dx%d dmabuf=%d route=%s",
++			(void *)wlr_surface, (void *)root,
++			wlserver_xdg_surface_info != nullptr ? 1 : 0,
++			rawbuf ? rawbuf->width : 0, rawbuf ? rawbuf->height : 0,
++			bIsDmabuf ? 1 : 0,
++			wlserver_x11_surface_info ? "x11" :
++				( wlserver_xdg_surface_info ? "xdg" :
++					( root && root != wlr_surface ? "sub->xdg" : "pending" ) ) );
++	}
++
+ 	struct wlr_buffer *buf = wlr_buffer_lock( tex->buf );
+ 
+ 	gpuvis_trace_printf( "xwayland_surface_commit wlr_surface %p", wlr_surface );
+@@ -634,6 +685,12 @@
+ static void handle_wl_surface_commit( struct wl_listener *l, void *data )
+ {
+ 	wlserver_wl_surface_info *surf = wl_container_of( l, surf, commit );
++	// gamenative (diagnostic): proves wl_surface.commit requests reach the
++	// server at all — independent of the buffer/texture diagnostics in
++	// xwayland_surface_commit, which only fire on their own conditions.
++	static std::atomic<int> s_nRawCommitLog{ 0 };
++	if ( s_nRawCommitLog.fetch_add( 1 ) < 64 )
++		wl_log.infof( "wlcommit-raw surf=%p", (void *)surf->wlr );
+ 	xwayland_surface_commit(surf->wlr);
+ }
+ 
+@@ -761,6 +818,9 @@
+ 
+ void gamescope_xwayland_server_t::destroy_content_override( struct wlserver_content_override *co )
+ {
++	// gamenative (diagnostic): the override chain coming down explains a
++	// silent present stall as well as a never-fired link.
++	wl_log.infof( "override unbind: x11_window=0x%x surface=%p", co->x11_window, (void *)co->surface );
+ #ifdef GAMESCOPE_SWAPCHAIN_DEBUG
+ 	wl_log.infof( "destroy_content_override REAL: co: %p co->surface: %p co->x11_window: 0x%x co->gamescope_swapchain: %p", co, co->surface, co->x11_window, co->gamescope_swapchain );
+ #endif
+@@ -835,9 +895,9 @@
+ 	if ( x11_surface )
+ 		x11_window = x11_surface->x11_id;
+ 
+-#ifdef GAMESCOPE_SWAPCHAIN_DEBUG
+-	wl_log.infof( "handle_override_window_content: (1) x11_window: 0x%x swapchain_resource: %p surface: %p", x11_window, gamescope_swapchain_resource, surface );
+-#endif
++	// gamenative (diagnostic): bring-up visibility for the swapchain-override
++	// chain; x11_window here is the toplevel the game surface binds to.
++	wl_log.infof( "override bind: x11_window=0x%x x11_surface=%p surface=%p", x11_window, (void *)x11_surface, (void *)surface );
+ 
+ 	if ( content_overrides.count( x11_window ) ) {
+ 		if ( content_overrides[x11_window]->gamescope_swapchain == gamescope_swapchain_resource )
+@@ -3590,6 +3807,11 @@
+ 	{
+ 		struct wlr_surface *wlr_override_surf = content_overrides[ surf->x11_id ]->surface;
+ 
++		// gamenative (diagnostic): the x11 window's wl_surface is replaced by
++		// the game's override surface; without this the game buffers are
++		// never textured and never released.
++		wl_log.infof( "override link: x11_id=0x%x surface=%p", surf->x11_id, (void *)wlr_override_surf );
++
+ 		if ( wlr_override_surf != nullptr )
+ 			wlserver_x11_surface_info_set_wlr( surf, wlr_override_surf, true );
+ 	}
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -8385,6 +8385,9 @@
+ 	if ( newCommit == nullptr )
+ 	{
+ 		// Import failed to import, early exit.
++		xwm_log.errorf( "import_commit failed surf=%p buf=%p %dx%d",
++			(void *)reslistentry.surf, (void *)buf,
++			buf ? buf->width : 0, buf ? buf->height : 0 );
+ 		return;
+ 	}
+ 

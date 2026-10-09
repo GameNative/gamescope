@@ -1,0 +1,22 @@
+android: A7 — silence unused-function warning with -Dpipewire=disabled
+
+window_last_done_commit_id() is only called from paint_pipewire(), which is
+compiled out when pipewire is disabled. Mark [[maybe_unused]] to keep the
+zero-new-warnings gate green.
+
+---
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index 660ca44..6fe88c0 100644
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -1926,7 +1926,9 @@ get_window_last_done_commit_peek( steamcompmgr_win_t *w )
+ 	return w->commit_queue[ lastCommit ].get();
+ }
+ 
+-static int64_t
++// gamenative: [[maybe_unused]] — its only callers are inside paint_pipewire(),
++// which is compiled out with -Dpipewire=disabled.
++[[maybe_unused]] static int64_t
+ window_last_done_commit_id( steamcompmgr_win_t *w )
+ {
+ 	if ( !w )

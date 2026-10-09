@@ -1,0 +1,82 @@
+android: M4 — compile out wlroots session dependency
+
+wlroots is built with session=disabled on Android (no logind/seatd/VT).
+wlserver.hpp tied HAVE_SESSION to HAVE_DRM; make it meson-overridable and
+pass -DHAVE_SESSION=0 when wlroots has no session support. Adds inert
+wlsession_* stubs for the session-less build; the GameNative DRM backend
+gets its fd from gamenative_drm_connect() (patch D1) instead.
+
+---
+diff --git a/src/meson.build b/src/meson.build
+index 79a9550..e7ee9c4 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -148,10 +158,17 @@ if sdl2_dep.found()
+ endif
+ 
+ gamescope_cpp_args += '-DHAVE_DRM=@0@'.format(drm_dep.found().to_int())
++# gamenative M4: wlserver.hpp ties HAVE_SESSION to HAVE_DRM; when wlroots is
++# built with session=disabled (Android has no logind/seatd/VT), compile the
++# session code paths out instead.
++if wlroots_dep.get_variable('have_session') != 'true'
++  gamescope_cpp_args += '-DHAVE_SESSION=0'
++endif
+ gamescope_cpp_args += '-DHAVE_SDL2=@0@'.format(sdl2_dep.found().to_int())
+ gamescope_cpp_args += '-DHAVE_AVIF=@0@'.format(avif_dep.found().to_int())
+ gamescope_cpp_args += '-DHAVE_LIBCAP=@0@'.format(cap_dep.found().to_int())
+ gamescope_cpp_args += '-DHAVE_LIBEIS=@0@'.format(eis_dep.found().to_int())
++gamescope_cpp_args += '-DHAVE_LIBINPUT=@0@'.format(libinput_dep.found().to_int())
+ gamescope_cpp_args += '-DHAVE_SCRIPTING=1'
+ 
+ src += spirv_shaders
+diff --git a/src/wlserver.cpp b/src/wlserver.cpp
+index 3d7d123..fa57e2b 100644
+--- a/src/wlserver.cpp
++++ b/src/wlserver.cpp
+@@ -1706,6 +1708,12 @@ static void handle_session_active( struct wl_listener *listener, void *data )
+ 	GetBackend()->DirtyState( wlserver.wlr.session->active, wlserver.wlr.session->active );
+ 	wl_log.infof( "Session %s", wlserver.wlr.session->active ? "resumed" : "paused" );
+ }
++#else
++// gamenative M4: no logind/seatd on Android -> no VT switching; always active.
++bool wlsession_active()
++{
++	return true;
++}
+ #endif
+ 
+ static void handle_wlr_log(enum wlr_log_importance importance, const char *fmt, va_list args)
+@@ -1868,6 +1876,20 @@ void wlsession_close_kms()
+ 	wlserver.wlr.device = nullptr;
+ }
+ 
++#else
++// gamenative M4: session-less build. The GameNative DRM backend obtains its fd
++// from gamenative_drm_connect() (patch D1) before this path is ever reached;
++// a bare wlsession_open_kms() call here means misconfiguration.
++int wlsession_open_kms( const char *device_name )
++{
++	(void)device_name;
++	wl_log.errorf( "wlsession_open_kms: session support not compiled in" );
++	return -1;
++}
++
++void wlsession_close_kms()
++{
++}
+ #endif
+ 
+ gamescope_xwayland_server_t::gamescope_xwayland_server_t(wl_display *display, int nIndex)
+diff --git a/src/wlserver.hpp b/src/wlserver.hpp
+index 79a0723..4adbd1c 100644
+--- a/src/wlserver.hpp
++++ b/src/wlserver.hpp
+@@ -24,7 +24,7 @@
+ 
+ #include "steamcompmgr_shared.hpp"
+ 
+-#if HAVE_DRM
++#if HAVE_DRM && !defined(HAVE_SESSION)
+ #define HAVE_SESSION 1
+ #endif
+ 

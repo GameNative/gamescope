@@ -1,0 +1,145 @@
+android: A4 — std::atomic<std::shared_ptr<T>> compat shim
+
+NDK r27 libc++ provides no atomic<shared_ptr> specialization and the C++11
+free-function API is deprecated in C++20 (warnings). Drop-in
+gamescope::atomic_shared_ptr<T> (mutex-based, same member API) in new
+src/Utils/AtomicSharedPtr.h, swapped in at the 5 compiled use sites.
+(SDLBackend sites left untouched: backend disabled in our build.)
+
+---
+diff --git a/src/Backends/WaylandBackend.cpp b/src/Backends/WaylandBackend.cpp
+index ee5cac0..898ec5c 100644
+--- a/src/Backends/WaylandBackend.cpp
++++ b/src/Backends/WaylandBackend.cpp
+@@ -572,7 +572,7 @@ namespace gamescope
+         std::optional<wl_fixed_t> m_ofPendingCursorX;
+         std::optional<wl_fixed_t> m_ofPendingCursorY;
+ 
+-        std::atomic<std::shared_ptr<zwp_relative_pointer_v1>> m_pRelativePointer = nullptr;
++        gamescope::atomic_shared_ptr<zwp_relative_pointer_v1> m_pRelativePointer = nullptr;
+         std::unordered_set<uint32_t> m_uScancodesHeld;
+ 
+         void Wayland_Registry_Global( wl_registry *pRegistry, uint32_t uName, const char *pInterface, uint32_t uVersion );
+diff --git a/src/Utils/AtomicSharedPtr.h b/src/Utils/AtomicSharedPtr.h
+new file mode 100644
+index 0000000..c987bff
+--- /dev/null
++++ b/src/Utils/AtomicSharedPtr.h
+@@ -0,0 +1,61 @@
++#pragma once
++
++// gamenative A4: NDK libc++ has no std::atomic<std::shared_ptr<T>> specialization
++// (the primary template requires trivially-copyable T), and the C++11
++// std::atomic_load/std::atomic_store shared_ptr free functions are deprecated in
++// C++20 (would add warnings). Drop-in replacement with the same member API,
++// implemented over a mutex — contention is irrelevant for its uses here
++// (cursor/title/icon hints, color LUTs, focus window name).
++
++#include <memory>
++#include <mutex>
++
++namespace gamescope
++{
++    template <typename T>
++    struct atomic_shared_ptr
++    {
++        mutable std::mutex m_Mutex;
++        std::shared_ptr<T> m_pPtr;
++
++        atomic_shared_ptr() noexcept = default;
++        atomic_shared_ptr( std::nullptr_t ) noexcept {}
++        atomic_shared_ptr( std::shared_ptr<T> pPtr ) noexcept : m_pPtr( std::move( pPtr ) ) {}
++
++        atomic_shared_ptr( const atomic_shared_ptr & ) = delete;
++        atomic_shared_ptr &operator=( const atomic_shared_ptr & ) = delete;
++
++        std::shared_ptr<T> load() const noexcept
++        {
++            std::lock_guard lock( m_Mutex );
++            return m_pPtr;
++        }
++
++        void store( std::shared_ptr<T> pPtr ) noexcept
++        {
++            std::lock_guard lock( m_Mutex );
++            m_pPtr = std::move( pPtr );
++        }
++
++        std::shared_ptr<T> exchange( std::shared_ptr<T> pPtr ) noexcept
++        {
++            std::lock_guard lock( m_Mutex );
++            std::swap( m_pPtr, pPtr );
++            return pPtr;
++        }
++
++        operator std::shared_ptr<T>() const noexcept { return load(); }
++
++        atomic_shared_ptr &operator=( std::shared_ptr<T> pPtr ) noexcept
++        {
++            store( std::move( pPtr ) );
++            return *this;
++        }
++
++        atomic_shared_ptr &operator=( std::nullptr_t ) noexcept
++        {
++            store( nullptr );
++            return *this;
++        }
++    };
++}
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index 660ca44..6fe88c0 100644
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -147,7 +147,7 @@ std::atomic<uint64_t> g_FocusedVROverlayKeyboard;
+ gamescope_color_mgmt_tracker_t g_ColorMgmt{};
+ 
+ static gamescope_color_mgmt_luts g_ColorMgmtLutsOverride[ EOTF_Count ];
+-std::atomic<std::shared_ptr<lut3d_t>> g_ColorMgmtLooks[EOTF_Count];
++gamescope::atomic_shared_ptr<lut3d_t> g_ColorMgmtLooks[EOTF_Count];
+ 
+ 
+ gamescope_color_mgmt_luts g_ColorMgmtLuts[ EOTF_Count ];
+@@ -1310,7 +1310,7 @@ int g_BlurRadius = 5;
+ unsigned int g_BlurFadeStartTime = 0;
+ 
+ pid_t focusWindow_pid, sdFocusWindow_pid;
+-std::atomic<std::shared_ptr<std::string>> focusWindow_engine = nullptr;
++gamescope::atomic_shared_ptr<std::string> focusWindow_engine = nullptr;
+ 
+ focus_t g_steamcompmgr_xdg_focus;
+ std::vector<std::shared_ptr<steamcompmgr_win_t>> g_steamcompmgr_xdg_wins;
+diff --git a/src/steamcompmgr.hpp b/src/steamcompmgr.hpp
+index c428784..55cde07 100644
+--- a/src/steamcompmgr.hpp
++++ b/src/steamcompmgr.hpp
+@@ -21,6 +21,7 @@ void steamcompmgr_main(int argc, char **argv);
+ #include "wlserver.hpp"
+ #include "vblankmanager.hpp"
+ #include "mangoapp_control.h"
++#include "Utils/AtomicSharedPtr.h"
+ 
+ #include <mutex>
+ #include <vector>
+@@ -187,7 +188,7 @@ struct wlserver_x11_surface_info *lookup_x11_surface_info_from_xid( gamescope_xw
+ 
+ extern gamescope::VBlankTime g_SteamCompMgrVBlankTime;
+ extern pid_t focusWindow_pid;
+-extern std::atomic<std::shared_ptr<std::string>> focusWindow_engine;
++extern gamescope::atomic_shared_ptr<std::string> focusWindow_engine;
+ 
+ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_server);
+ void gamescope_set_selection(std::string contents, GamescopeSelection eSelection);
+diff --git a/src/wlserver.cpp b/src/wlserver.cpp
+index 3d7d123..fa57e2b 100644
+--- a/src/wlserver.cpp
++++ b/src/wlserver.cpp
+@@ -1236,7 +1238,7 @@ static void gamescope_control_display_sleep( struct wl_client *client, struct wl
+ }
+ 
+ extern gamescope::ConVar<bool> cv_overlay_unmultiplied_alpha;
+-extern std::atomic<std::shared_ptr<lut3d_t>> g_ColorMgmtLooks[EOTF_Count];
++extern gamescope::atomic_shared_ptr<lut3d_t> g_ColorMgmtLooks[EOTF_Count];
+ 
+ static gamescope::ConCommand cc_set_look("set_look", "Set a look for a specific EOTF. Eg. set_look mylook.cube (g22 only), set_look pq mylook.cube, set_look mylook_g22.cube mylook_pq.cube",
+ []( std::span<std::string_view> args )

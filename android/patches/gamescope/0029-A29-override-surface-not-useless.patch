@@ -1,0 +1,17 @@
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -4061,6 +4061,14 @@
+ 	if ( w->isSysTrayIcon )
+ 		return true;
+ 
++	// A content-override window holds the app's real frame on its override
++	// surface, so its X11 geometry says nothing. The ICD shim can land the
++	// override on a 1x1 override-redirect wine helper (Dishonored); dropping it
++	// would discard the only compositable content. A genuinely useless 1x1
++	// window has no override and is still dropped below.
++	if ( w->override_surface() )
++		return false;
++
+ 	// Windows that are 1x1 are pretty useless for override redirects.
+ 	// Just ignore them.
+ 	// Fixes the Xbox Login in Age of Empires 2: DE.

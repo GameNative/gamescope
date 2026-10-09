@@ -19,3 +19,6 @@
 [submodule "thirdparty/SPIRV-Headers"]
 	path = thirdparty/SPIRV-Headers
 	url = https://github.com/KhronosGroup/SPIRV-Headers/
+[submodule "subprojects/glm"]
+	path = third_party/glm
+	url = https://github.com/g-truc/glm.git

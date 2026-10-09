@@ -1,0 +1,41 @@
+android: A8 — accept any Vulkan physical device on the gamenative-drm device
+
+The DRM backend's ValidPhysicalDevice() requires the Vulkan device to
+expose VK_EXT_physical_device_drm so it can match the GPU's DRM node
+against the DRM device gamescope opened. With the gamenative-drm
+userspace KMS device there is no real DRM node at all — the fd is a
+connected socket — so node matching is meaningless by construction.
+And through wrapper ICDs (adrenotools Wrapper(Turnip …)) the extension
+may not even be enumerated, which made gamescope fail with:
+
+    vulkan: selecting physical device 'Wrapper(Turnip Adreno (TM) 740)'
+    vulkan: not a valid physical device
+    Failed to initialize Vulkan / Failed to create backend.
+
+When GAMENATIVE_DRM_SOCKET is set the "which device" question is already
+answered by the environment (the only GPU on an Android device), so
+accept any physical device. Downstream code already tolerates
+!vulkan_has_drm_props() with a warning (rendervulkan.cpp createDevice),
+so no other patch is needed.
+---
+
+diff --git a/src/Backends/DRMBackend.cpp b/src/Backends/DRMBackend.cpp
+--- a/src/Backends/DRMBackend.cpp
++++ b/src/Backends/DRMBackend.cpp
+@@ -3674,7 +3674,15 @@
+         }
+ 		virtual bool ValidPhysicalDevice( VkPhysicalDevice pVkPhysicalDevice ) const override
+ 		{
+-			return vulkan_has_drm_props();
++			// (gamenative) The gamenative-drm device is a userspace KMS
++			// socket (D1): there is no real DRM node to match a Vulkan
++			// device against, and VK_EXT_physical_device_drm may be
++			// missing through wrapper ICDs (adrenotools). Any device is
++			// valid — the environment already picked it.
++			if ( getenv( "GAMENATIVE_DRM_SOCKET" ) != nullptr )
++				return true;
++
++			return vulkan_has_drm_props();
+ 		}
+ 
+ 		virtual int Present( const FrameInfo_t *pFrameInfo, bool bAsync )

@@ -1,0 +1,85 @@
+android: A5 — floating-point Parse<T> without std::from_chars
+
+NDK r27 libc++ marks floating-point std::from_chars deleted. Route
+Parse<float>/Parse<double> through strtof/strtod with matching semantics
+(nullopt on no-conversion/range, trailing garbage tolerated).
+
+---
+diff --git a/src/Utils/Parsers.h b/src/Utils/Parsers.h
+index 244cb1a..f90173d 100644
+--- a/src/Utils/Parsers.h
++++ b/src/Utils/Parsers.h
+@@ -3,20 +3,68 @@
+ #include <charconv>
+ #include <cstdint>
+ #include <optional>
++#include <string>
+ #include <string_view>
+ #include <strings.h>
+ 
++#if defined(__ANDROID__)
++#include <cerrno>
++#include <cstdlib>
++#include <type_traits>
++#endif
++
+ namespace gamescope
+ {
++#if defined(__ANDROID__)
++    // gamenative A5: NDK r27 libc++ marks floating-point std::from_chars
++    // deleted; parse via strtod/strtof instead. Mirrors the generic template's
++    // semantics (no full-string consumption requirement, nullopt on error/range).
++    template <typename T>
++    inline std::optional<T> ParseFloatImpl( std::string_view chars );
++
++    template <>
++    inline std::optional<float> ParseFloatImpl<float>( std::string_view chars )
++    {
++        std::string str{ chars };
++        char *end = nullptr;
++        errno = 0;
++        float f = strtof( str.c_str(), &end );
++        if ( end == str.c_str() || errno == ERANGE )
++            return std::nullopt;
++        return f;
++    }
++
++    template <>
++    inline std::optional<double> ParseFloatImpl<double>( std::string_view chars )
++    {
++        std::string str{ chars };
++        char *end = nullptr;
++        errno = 0;
++        double d = strtod( str.c_str(), &end );
++        if ( end == str.c_str() || errno == ERANGE )
++            return std::nullopt;
++        return d;
++    }
++#endif
++
+     template <typename T>
+     inline std::optional<T> Parse( std::string_view chars )
+     {
+-        T obj;
+-        auto result = std::from_chars( chars.begin(), chars.end(), obj );
+-        if ( result.ec == std::errc{} )
+-            return obj;
++#if defined(__ANDROID__)
++        if constexpr ( std::is_same_v<T, float> || std::is_same_v<T, double> )
++        {
++            return ParseFloatImpl<T>( chars );
++        }
+         else
+-            return std::nullopt;
++#endif
++        {
++            T obj;
++            auto result = std::from_chars( chars.begin(), chars.end(), obj );
++            if ( result.ec == std::errc{} )
++                return obj;
++            else
++                return std::nullopt;
++        }
+     }
+ 
+     template <>

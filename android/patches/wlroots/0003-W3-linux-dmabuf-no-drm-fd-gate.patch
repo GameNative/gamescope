@@ -1,0 +1,73 @@
+--- a/render/wlr_renderer.c
++++ b/render/wlr_renderer.c
+@@ -84,8 +84,12 @@
+ 		return false;
+ 	}
+ 
++	/* gamenative W3: advertise zwp_linux_dmabuf_v1 whenever the renderer has
++	 * DMABUF texture formats, even without a DRM fd. gamescope's vulkan
++	 * renderer can't provide one on drivers lacking
++	 * VK_EXT_physical_device_drm (e.g. Turnip on Android), but the fd is
++	 * only used by the legacy wl_drm interface, not by linux-dmabuf. */
+ 	if (wlr_renderer_get_texture_formats(r, WLR_BUFFER_CAP_DMABUF) != NULL &&
+-			wlr_renderer_get_drm_fd(r) >= 0 &&
+ 			wlr_linux_dmabuf_v1_create_with_renderer(wl_display, 4, r) == NULL) {
+ 		return false;
+ 	}
+--- a/types/wlr_linux_dmabuf_v1.c
++++ b/types/wlr_linux_dmabuf_v1.c
+@@ -892,12 +892,20 @@
+ 	}
+ 
+ 	drmDevice *device = NULL;
++	/* gamenative W3: main_device is 0 when the renderer has no DRM fd
++	 * (Turnip without VK_EXT_physical_device_drm) — skip the device open;
++	 * main_device_fd stays -1, which check_import_dmabuf() already
++	 * tolerates by skipping the import check. The feedback tranche formats
++	 * come from the renderer, not from this fd. */
++	int main_device_fd = -1;
++	if (feedback->main_device == 0) {
++		goto skip_device_open;
++	}
+ 	if (drmGetDeviceFromDevId(feedback->main_device, 0, &device) != 0) {
+ 		wlr_log_errno(WLR_ERROR, "drmGetDeviceFromDevId failed");
+ 		goto error_compiled;
+ 	}
+ 
+-	int main_device_fd = -1;
+ 	if (device->available_nodes & (1 << DRM_NODE_RENDER)) {
+ 		const char *name = device->nodes[DRM_NODE_RENDER];
+ 		main_device_fd = open(name, O_RDWR | O_CLOEXEC);
+@@ -916,6 +924,7 @@
+ 		drmFreeDevice(&device);
+ 	}
+ 
++skip_device_open:; // gamenative W3
+ 	size_t tranches_len =
+ 		feedback->tranches.size / sizeof(struct wlr_linux_dmabuf_feedback_v1_tranche);
+ 	const struct wlr_linux_dmabuf_feedback_v1_tranche *tranches = feedback->tranches.data;
+@@ -1090,13 +1099,18 @@
+ 	*feedback = (struct wlr_linux_dmabuf_feedback_v1){0};
+ 
+ 	int renderer_drm_fd = wlr_renderer_get_drm_fd(options->main_renderer);
++	/* gamenative W3: gamescope's vulkan renderer has no DRM fd on
++	 * drivers lacking VK_EXT_physical_device_drm (Turnip). The
++	 * main_device/target_device are only client hints (allocation
++	 * preference); leave them 0 rather than failing the whole
++	 * linux-dmabuf global. */
++	dev_t renderer_dev = 0;
+ 	if (renderer_drm_fd < 0) {
+-		wlr_log(WLR_ERROR, "Failed to get renderer DRM FD");
+-		goto error;
+-	}
+-	dev_t renderer_dev;
+-	if (!devid_from_fd(renderer_drm_fd, &renderer_dev)) {
+-		goto error;
++		wlr_log(WLR_INFO, "No renderer DRM FD, advertising linux-dmabuf without main device");
++	} else {
++		if (!devid_from_fd(renderer_drm_fd, &renderer_dev)) {
++			goto error;
++		}
+ 	}
+ 
+ 	feedback->main_device = renderer_dev;
