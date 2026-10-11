@@ -70,6 +70,7 @@ ICD_SO="$GNDRM_REL/libadrenotools_gamescope.so"
 DMTEST_BIN="$GNDRM_REL/gn-dmabuf-test"
 WSITEST_BIN="$GNDRM_REL/gn-wsi-test"
 XTREE_BIN="$GNDRM_REL/gn-xtree-probe"
+SCALE_BIN="$GNDRM_REL/gn-scaling-mode"
 
 # --- prerequisites (build whatever is missing) ------------------------------
 [ -x "$GAMESCOPE_BIN" ] || bash "$GS_DIR/android/build-gamescope.sh"
@@ -77,10 +78,10 @@ XTREE_BIN="$GNDRM_REL/gn-xtree-probe"
 # build-android.sh produces the gamenative-drm artifacts (cargo cdylibs + the
 # guest clients, incl. gn-xtree-probe) in one invocation — run it if any is
 # missing.
-for f in "$DRM_SO" "$ICD_SO" "$DMTEST_BIN" "$WSITEST_BIN" "$XTREE_BIN"; do
+for f in "$DRM_SO" "$ICD_SO" "$DMTEST_BIN" "$WSITEST_BIN" "$XTREE_BIN" "$SCALE_BIN"; do
     [ -f "$f" ] || { "$GNDRM_DIR/tools/build-android.sh"; break; }
 done
-for f in "$GAMESCOPE_BIN" "$REAPER_BIN" "$SHIM_SO" "$DRM_SO" "$ICD_SO" "$DMTEST_BIN" "$WSITEST_BIN" "$XTREE_BIN"; do
+for f in "$GAMESCOPE_BIN" "$REAPER_BIN" "$SHIM_SO" "$DRM_SO" "$ICD_SO" "$DMTEST_BIN" "$WSITEST_BIN" "$XTREE_BIN" "$SCALE_BIN"; do
     [ -e "$f" ] || { echo "error: missing $f" >&2; exit 1; }
 done
 
@@ -271,7 +272,12 @@ resolve_libs "$STAGE/lib/libadrenotools_gamescope.so" \
 cp "$DMTEST_BIN" "$STAGE/bin/gn-dmabuf-test"
 cp "$WSITEST_BIN" "$STAGE/bin/gn-wsi-test"
 cp "$XTREE_BIN" "$STAGE/bin/gn-xtree-probe"
-resolve_libs "$STAGE/bin/gn-dmabuf-test" "$STAGE/bin/gn-wsi-test" "$STAGE/bin/gn-xtree-probe"
+# bin/gn-scaling-mode: the live Scaling Mode client — sets gamescope's
+# GAMESCOPE_NEW_SCALING_SCALER root property over the session's X socket so a
+# mode change applies without a relaunch. Spawned by the app per committed
+# selection; links the payload's libxcb.
+cp "$SCALE_BIN" "$STAGE/bin/gn-scaling-mode"
+resolve_libs "$STAGE/bin/gn-dmabuf-test" "$STAGE/bin/gn-wsi-test" "$STAGE/bin/gn-xtree-probe" "$STAGE/bin/gn-scaling-mode"
 
 # --- data files --------------------------------------------------------------
 # gamescope's own installed data (shaders, base EDID, …) via meson install
@@ -279,8 +285,8 @@ DESTDIR="$WORK/install"
 mkdir -p "$DESTDIR"
 meson install -C "$GS_DIR/build-android" --destdir "$(cd "$DESTDIR" && pwd)" --quiet >/dev/null
 find "$DESTDIR" -type d -name gamescope -path "*/share/*" -exec cp -a {} "$STAGE/share/" \; 2>/dev/null || true
-# Keymap data for libxkbcommon (gamescope seat + winewayland keymaps read
-# these at runtime — XKB_CONFIG_ROOT in the launcher points here; the
+# Keymap data for libxkbcommon (gamescope's seat reads these at runtime —
+# XKB_CONFIG_ROOT in the launcher points here; the
 # compiled fallback path is prefix-rewritten below)
 [ -d "$DEPS/share/xkeyboard-config-2" ] && cp -a "$DEPS/share/xkeyboard-config-2" "$STAGE/share/"
 # libxkbcommon's compiled XKB root is <prefix>/share/X11/xkb — upstream an
