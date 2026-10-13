@@ -6,7 +6,13 @@
 # upstream-clean; this script applies android/patches/** then builds.
 #
 # Usage:
-#   android/build-gamescope.sh [--skip-patches] [--setup-only]
+#   android/build-gamescope.sh [--skip-patches] [--setup-only] [--clean]
+#
+# --clean restores the tree to what the patch train expects: tracked files
+# reset, untracked build state removed (patch-seeded headers, the subprojects
+# wraps and fetched sources), the meson build dir dropped. Ignored paths are
+# left alone, so .idea/ and the meson package cache survive. The discarded
+# diff is saved first. Composes with the flags above.
 #
 # Env overrides:
 #   NDK        — NDK path           (default: $HOME/Android/Sdk/ndk/27.3.13750724)
@@ -20,10 +26,12 @@ TERMUXFS="${TERMUXFS:-$HOME/termuxfs/aarch64/data/data/com.termux/files/usr}"
 BUILD_DIR="${BUILD_DIR:-build-android}"
 SKIP_PATCHES=0
 SETUP_ONLY=0
+DO_CLEAN=0
 for arg in "$@"; do
     case "$arg" in
         --skip-patches) SKIP_PATCHES=1 ;;
         --setup-only)   SETUP_ONLY=1 ;;
+        --clean)        DO_CLEAN=1 ;;
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
@@ -51,6 +59,33 @@ fi
 if [ ! -d "$GS_DIR/src/reshade/source" ] || [ ! -d "$GS_DIR/subprojects/wlroots/include" ]; then
     echo "submodules missing — run: git -C \"$GS_DIR\" submodule update --init --recursive" >&2
     exit 1
+fi
+
+# --- 0.5 clean (only with --clean) -----------------------------------------
+# The patch-seeded and fetched build state is untracked, so `git reset --hard`
+# leaves it behind and the patch train then fails on a stale file (for example
+# src/Utils/AtomicSharedPtr.h, which patch 0003 creates). --clean removes that
+# state; the patches themselves are tracked files and are re-applied below.
+if [ "$DO_CLEAN" = 1 ]; then
+    SAVE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/gamenative"
+    mkdir -p "$SAVE_DIR"
+    SAVE="$SAVE_DIR/gamescope-clean-$(date +%Y%m%d-%H%M%S).patch"
+    git -C "$GS_DIR" diff > "$SAVE"
+    if [ -s "$SAVE" ]; then
+        echo "clean: discarded diff saved to $SAVE ($(wc -l < "$SAVE") lines)"
+    else
+        rm -f "$SAVE"
+    fi
+    echo "clean: removing untracked build state:"
+    git -C "$GS_DIR" clean -fdn | sed 's/^/    /'
+    git -C "$GS_DIR" reset --hard
+    git -C "$GS_DIR" clean -fd
+    if [ -d "$GS_DIR/subprojects/wlroots/.git" ] || [ -f "$GS_DIR/subprojects/wlroots/.git" ]; then
+        git -C "$GS_DIR/subprojects/wlroots" reset --hard
+        git -C "$GS_DIR/subprojects/wlroots" clean -fd
+    fi
+    rm -rf "$GS_DIR/$BUILD_DIR"
+    echo "clean: tree at $(git -C "$GS_DIR" rev-parse --short HEAD), build dir '$BUILD_DIR' removed"
 fi
 
 # --- 1. patch train -------------------------------------------------------
