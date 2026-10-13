@@ -9,10 +9,11 @@
 #   android/build-gamescope.sh [--skip-patches] [--setup-only] [--clean]
 #
 # --clean restores the tree to what the patch train expects: tracked files
-# reset, untracked build state removed (patch-seeded headers, the subprojects
-# wraps and fetched sources), the meson build dir dropped. Ignored paths are
-# left alone, so .idea/ and the meson package cache survive. The discarded
-# diff is saved first. Composes with the flags above.
+# reset, untracked meson state removed (patch-seeded headers, the wrap-redirect
+# files meson writes), the wrap overlays re-applied, the meson build dir
+# dropped. Ignored paths are left alone, so .idea/, the fetched subprojects and
+# the meson package cache survive. The discarded diff is saved first. Composes
+# with the flags above.
 #
 # Env overrides:
 #   NDK        — NDK path           (default: $HOME/Android/Sdk/ndk/27.3.13750724)
@@ -85,6 +86,21 @@ if [ "$DO_CLEAN" = 1 ]; then
         git -C "$GS_DIR/subprojects/wlroots" clean -fd
     fi
     rm -rf "$GS_DIR/$BUILD_DIR"
+    # meson applies a wrap's patch_directory overlay only when it first extracts
+    # the wrap; a subproject dir that survives the clean is used as-is, so its
+    # overlay is re-applied from the tracked packagefiles here — stb has no
+    # meson.build of its own and the next setup would otherwise fail.
+    for wrap in "$GS_DIR"/subprojects/*.wrap; do
+        [ -f "$wrap" ] || continue
+        patch_dir=$(sed -n 's/^ *patch_directory *= *//p' "$wrap")
+        [ -n "$patch_dir" ] || continue
+        dir=$(sed -n 's/^ *directory *= *//p' "$wrap")
+        [ -n "$dir" ] || dir=$(basename "$wrap" .wrap)
+        if [ -d "$GS_DIR/subprojects/packagefiles/$patch_dir" ] && \
+           [ -d "$GS_DIR/subprojects/$dir" ]; then
+            cp -a "$GS_DIR/subprojects/packagefiles/$patch_dir/." "$GS_DIR/subprojects/$dir/"
+        fi
+    done
     echo "clean: tree at $(git -C "$GS_DIR" rev-parse --short HEAD), build dir '$BUILD_DIR' removed"
 fi
 
