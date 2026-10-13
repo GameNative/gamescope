@@ -1,0 +1,32 @@
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -2807,6 +2807,29 @@
+ 
+ 	layer->eAlphaBlendingMode = ( flags & PaintWindowFlag::CoverageMode ) ? ALPHA_BLENDING_MODE_COVERAGE : ALPHA_BLENDING_MODE_PREMULTIPLIED;
+ 
++	// A30 content-override diagnostic: names the window each painted layer comes
++	// from, its committed buffer, and the resulting layer size/placement, so a
++	// composite that paints a frame at the wrong size says so instead of only
++	// showing a few pixels. Rate-limited, so a stalled pipeline still leaves a
++	// trail instead of going silent.
++	{
++		static long long int s_llLastA30PaintLog = 0;
++		unsigned int uA30Now = get_time_in_milliseconds();
++		if ( uA30Now - s_llLastA30PaintLog >= 1000 )
++		{
++			s_llLastA30PaintLog = uA30Now;
++			const char *pA30Commit = lastCommit->surf == w->override_surface() ? "ovr" : ( w->override_surface() ? "win" : "none" );
++			xwm_log.infof( "A30 layer: win=0x%x ovr=%d cmt=%s hold=%u xgeom=%dx%d+%d+%d tex=%dx%d src=%dx%d scale=%.3f,%.3f off=%.1f,%.1f",
++				w->id(), w->override_surface() != nullptr ? 1 : 0, pA30Commit, w->nOverrideHolds,
++				w->GetGeometry().nWidth, w->GetGeometry().nHeight,
++				w->GetGeometry().nX, w->GetGeometry().nY,
++				layer->tex ? layer->tex->width() : 0, layer->tex ? layer->tex->height() : 0,
++				sourceWidth, sourceHeight,
++				layer->scale.x, layer->scale.y,
++				layer->offset.x, layer->offset.y );
++		}
++	}
++
+ 	return layer;
+ }
+ 
