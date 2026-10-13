@@ -6,7 +6,12 @@
 # upstream-clean; this script applies android/patches/** then builds.
 #
 # Usage:
-#   android/build-gamescope.sh [--skip-patches] [--setup-only] [--clean]
+#   android/build-gamescope.sh [--skip-patches] [--setup-only] [--clean] [--include-diagnostics]
+#
+# --include-diagnostics also applies android/patches/diagnostics/*.patch on top
+# of the train: opt-in bring-up logging (A17 prepare-path, A23 present-path,
+# A25 startup-present) that is not part of the shipping build. Off by default,
+# so a normal build never carries it. Composes with the flags above.
 #
 # --clean restores the tree to what the patch train expects: tracked files
 # reset, untracked meson state removed (patch-seeded headers, the wrap-redirect
@@ -28,11 +33,13 @@ BUILD_DIR="${BUILD_DIR:-build-android}"
 SKIP_PATCHES=0
 SETUP_ONLY=0
 DO_CLEAN=0
+INCLUDE_DIAGNOSTICS=0
 for arg in "$@"; do
     case "$arg" in
-        --skip-patches) SKIP_PATCHES=1 ;;
-        --setup-only)   SETUP_ONLY=1 ;;
-        --clean)        DO_CLEAN=1 ;;
+        --skip-patches)        SKIP_PATCHES=1 ;;
+        --setup-only)          SETUP_ONLY=1 ;;
+        --clean)               DO_CLEAN=1 ;;
+        --include-diagnostics) INCLUDE_DIAGNOSTICS=1 ;;
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
@@ -117,6 +124,22 @@ if [ "$SKIP_PATCHES" = 0 ]; then
             exit 1
         fi
     done
+    # opt-in diagnostics train (android/patches/diagnostics/) — same apply
+    # idiom, on top of the train, only when --include-diagnostics is given.
+    if [ "$INCLUDE_DIAGNOSTICS" = 1 ]; then
+        for p in "$GS_DIR"/android/patches/diagnostics/*.patch; do
+            [ -e "$p" ] || continue
+            if git -C "$GS_DIR" apply --check "$p" 2>/dev/null; then
+                git -C "$GS_DIR" apply "$p"
+                echo "applied diagnostics/$(basename "$p")"
+            elif git -C "$GS_DIR" apply -R --check "$p" 2>/dev/null; then
+                echo "already applied: diagnostics/$(basename "$p")"
+            else
+                echo "PATCH DOES NOT APPLY: $p" >&2
+                exit 1
+            fi
+        done
+    fi
     # wlroots submodule
     if [ -d "$GS_DIR/subprojects/wlroots/.git" ] || [ -f "$GS_DIR/subprojects/wlroots/.git" ]; then
         for p in "$GS_DIR"/android/patches/wlroots/*.patch; do
