@@ -1,0 +1,222 @@
+A33 — blank the output on the session-end path
+
+The reaper (A27/A28) ends the session when the game's process is gone, but wine's
+virtual desktop window outlives the game: by then it is the compositor's only
+remaining client, so the last commit -- and what the display is left holding --
+is wine's desktop background. The compositor already waits on the reaper's exit
+to end the session; hold the output black there, and paint one black frame
+before the loop stops.
+
+The same desktop background is what the panel is left holding at the other end:
+from startup until the guest's first frame arrives on the override surface,
+wine's desktop is the only window the compositor has. So the blank is raised on
+the texture selection itself -- is this window's newest done commit still the
+override surface's? -- and not on the reaper alone, and a window that has never
+had an override surface is never blanked.
+
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -3114,6 +3114,92 @@
+ gamescope::ConVar<bool> cv_paint_cursor_plane{ "paint_cursor_plane", true };
+ gamescope::ConVar<bool> cv_paint_mura_plane{ "paint_mura_plane", true };
+ 
++// The session reaper ends the session when the game's process is gone -- it
++// watches that process itself, as the primary child it was handed is wine's
++// wrapper chain, which outlives the game. Wine's virtual desktop window
++// outlives the game the same way, so at that point the compositor still has a
++// client to composite and the display is left holding its background. The
++// reaper is a separate process with no way to set anything here, but its exit
++// is the session's end and the compositor already waits on it, so the blank is
++// raised there and the frame is painted once before the loop stops.
++static std::atomic<bool> g_bSessionEndBlank{ false };
++
++// Paints the output black, as one full-output plane from the blank texture the
++// compositor already holds for this purpose.
++static void
++paint_session_end_blank( struct FrameInfo_t *frameInfo )
++{
++	gamescope::Rc<CVulkanTexture> pBlankTexture = vulkan_get_hacky_blank_texture();
++	if ( !pBlankTexture )
++		return;
++
++	FrameInfo_t::Layer_t *layer = frameInfo->layers.push();
++	if ( !layer )
++		return;
++
++	layer->scale.x = g_nOutputWidth == pBlankTexture->width() ? 1.0f : pBlankTexture->width() / (float)g_nOutputWidth;
++	layer->scale.y = g_nOutputHeight == pBlankTexture->height() ? 1.0f : pBlankTexture->height() / (float)g_nOutputHeight;
++	layer->offset.x = 0.0f;
++	layer->offset.y = 0.0f;
++	layer->opacity = 1.0f;
++	layer->zpos = g_zposBase;
++	layer->applyColorMgmt = false;
++	layer->eAlphaBlendingMode = ALPHA_BLENDING_MODE_PREMULTIPLIED;
++	layer->colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
++	layer->hdr_metadata_blob = nullptr;
++	layer->ctm = nullptr;
++	layer->tex = pBlankTexture;
++	layer->filter = GamescopeUpscaleFilter::NEAREST;
++	layer->blackBorder = true;
++}
++
++// gamenative: one-shot stated outcome for the session blind, so the panel
++// evidence at each transition can be tied to the predicate instead of a guess.
++static LogScope s_SessionBlankLogScope( "session-blank" );
++
++// The game's window is gone while the session is still alive whenever the only
++// window the compositor has left -- wine's virtual desktop -- is carrying
++// nothing but its own 2D content. That is what is on the panel as the solid
++// desktop blue, and it appears at BOTH transitions: at startup, until the
++// guest's first frame arrives on the override surface, and at exit, once the
++// game's window and with it the override are gone.
++//
++// The discriminator is therefore the texture selection itself, not the app-id:
++// A26 gives every window the same uniform app-id, so the app-id cannot tell the
++// game's window from the desktop's. What can is where the compositor's newest
++// done commit for the window came from -- the WSI shim binds an override
++// surface on the wine desktop window for the guest's swapchain, and
++// get_window_last_done_commit() is surface-agnostic (last-done-wins), so the
++// commit's own surface says which of the two content streams is being painted.
++//
++// Two properties are load-bearing and are why this is safe:
++//   - it cannot be true during normal play: while the game runs the override
++//     commits every frame, so the newest done commit is always the override;
++//   - it cannot wedge a session that never opens a second window: the latch is
++//     only ever set by the override surface coming into existence, so a session
++//     whose guest never brings one up is never blanked.
++static bool
++session_game_window_absent( steamcompmgr_win_t *w )
++{
++	if ( w == nullptr || w->type != steamcompmgr_win_type_t::XWAYLAND )
++		return false;
++
++	struct wlr_surface *override_surface = w->xwayland().surface.override_surface;
++	if ( override_surface != nullptr )
++		w->bSessionSawGameWindow = true;
++
++	if ( !w->bSessionSawGameWindow )
++		return false;
++
++	gamescope::Rc<commit_t> lastCommit;
++	get_window_last_done_commit( w, lastCommit );
++
++	// The guest's own content is what would be painted only while the newest
++	// done commit is the override's. Null override, no commit, or a commit from
++	// the window's own surface all mean the desktop is all that is left.
++	return lastCommit == nullptr || lastCommit->surf != override_surface;
++}
++
+ static void
+ paint_all( global_focus_t *pFocus, bool async )
+ {
+@@ -3153,6 +3239,37 @@
+ 	// Decide the fit target once so the window planes and the cursor plane agree.
+ 	fit = override;
+ 
++	// A33: once the reaper has ended the session, wine's desktop window is all
++	// that is left to composite, so the frame is a black plane in place of
++	// every window. This round the same blind is raised earlier -- whenever the
++	// game's window is gone while the session is still alive -- so the desktop
++	// blue is not what the panel is left holding at either transition.
++	bool bSessionBlank = g_bSessionEndBlank || session_game_window_absent( w );
++
++	// One-shot stated outcome, raised on every change of the blind's state.
++	static int s_nLastBlankState = -1;
++	if ( ( bSessionBlank ? 1 : 0 ) != s_nLastBlankState )
++	{
++		s_nLastBlankState = bSessionBlank ? 1 : 0;
++		s_SessionBlankLogScope.infof( "blank=%d reaper=%d window=%s override_bound=%d saw_game_window=%d",
++			s_nLastBlankState,
++			g_bSessionEndBlank ? 1 : 0,
++			w ? "present" : "none",
++			( w && w->type == steamcompmgr_win_type_t::XWAYLAND && w->xwayland().surface.override_surface != nullptr ) ? 1 : 0,
++			( w && w->type == steamcompmgr_win_type_t::XWAYLAND && w->bSessionSawGameWindow ) ? 1 : 0 );
++	}
++
++	if ( bSessionBlank )
++	{
++		w = nullptr;
++		overlay = nullptr;
++		externalOverlay = nullptr;
++		notification = nullptr;
++		override = nullptr;
++		input = nullptr;
++		fit = nullptr;
++	}
++
+ 	if (++frameCounter == 300)
+ 	{
+ 		currentFrameRate = 300 * 1000.0f / (currentTime - lastSampledFrameTime);
+@@ -3184,7 +3301,11 @@
+ 	// find the video underlay and put it up first in the scenegraph
+ 	if ( cv_paint_primary_plane )
+ 	{
+-		if ( w )
++		if ( bSessionBlank )
++		{
++			paint_session_end_blank( &frameInfo );
++		}
++		else if ( w )
+ 		{
+ 			if ( w->isSteamStreamingClient == true )
+ 			{
+@@ -9447,6 +9568,10 @@
+ 			gamescope::Process::WaitForChild( nPrimaryChildPid );
+ 			s_LaunchLogScope.infof( "Primary child shut down!" );
+ 
++			// The reaper has ended the session: the compositor's only remaining
++			// client is wine's desktop window, so hold the output black.
++			g_bSessionEndBlank = true;
++
+ 			if ( cv_shutdown_on_primary_child_death )
+ 				ShutdownGamescope();
+ 		});
+@@ -10040,6 +10165,14 @@
+ 
+ 		if ( g_bRun == false )
+ 		{
++			// Paint the session-end blank before the output goes away, so wine's
++			// desktop background is not what the display is left holding.
++			if ( g_bSessionEndBlank )
++			{
++				for ( auto &iter : g_VirtualConnectorFocuses )
++					paint_all( &iter.second, false );
++			}
++
+ 			break;
+ 		}
+ 
+--- a/src/steamcompmgr_shared.hpp
++++ b/src/steamcompmgr_shared.hpp
+@@ -161,6 +161,12 @@
+ 	bool unlockedForFrameCallback = false;
+ 	bool receivedDoneCommit = false;
+ 
++	// gamenative: set once the guest's own content (the WSI shim's override
++	// surface) has been bound on this window, i.e. this session has had a game
++	// window at some point. Only ever set by that coming into existence, so a
++	// session that never opens a game/second window can never be blanked.
++	bool bSessionSawGameWindow = false;
++
+ 	std::shared_ptr<std::string> engineName;
+ 
+ 	std::vector< gamescope::Rc<commit_t> > commit_queue;
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -3189,9 +3189,13 @@
+ 
+ gamescope::OwningRc<CVulkanTexture> vulkan_create_debug_blank_texture()
+ {
+-	// To match Steam's scaling, which is capped at 1080p
+-	int width = std::min<int>( g_nOutputWidth, 1920 );
+-	int height = std::min<int>( g_nOutputHeight, 1080 );
++	// A33: this texture is the session-end blank, painted as one full-output
++	// layer. Its extent must be the output's, not Steam's 1080p overlay cap:
++	// a capped extent is not screen size, which forces the composite path and
++	// leaves the blank's coverage resting on the shader's out-of-extent black
++	// fill instead of on the layer's own geometry.
++	int width = g_nOutputWidth;
++	int height = g_nOutputHeight;
+ 
+ 	return vulkan_create_flat_texture( width, height, 0, 0, 0, 0 );
+ }
