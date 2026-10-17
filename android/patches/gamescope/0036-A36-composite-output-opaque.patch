@@ -1,0 +1,34 @@
+diff --git a/src/shaders/cs_composite_rcas.comp b/src/shaders/cs_composite_rcas.comp
+index 3caefb14..a0e2dc6a 100644
+--- a/src/shaders/cs_composite_rcas.comp
++++ b/src/shaders/cs_composite_rcas.comp
+@@ -91,7 +91,11 @@ void rcasComposite(uvec2 pos)
+     }
+ 
+     outputValue = encodeOutputColor(outputValue);
+-    imageStore(dst, rotateOutputCoord(pos, u_rotation), vec4(outputValue, 0));
++    // Opaque alpha. The composite target is a DRM scan-out plane with an
++    // X-prefixed fourcc, so alpha is meaningless to the panel, but the buffer
++    // is also published as an Android layer and a 10-bit layer's alpha is
++    // honoured there: a 0 here composites the whole frame away.
++    imageStore(dst, rotateOutputCoord(pos, u_rotation), vec4(outputValue, 1));
+ 
+     if (checkDebugFlag(compositedebug_Markers))
+         compositing_debug(pos, u_rotation);
+diff --git a/src/shaders/cs_composite_rcas_1px.comp b/src/shaders/cs_composite_rcas_1px.comp
+index 822aa822..4fba0516 100644
+--- a/src/shaders/cs_composite_rcas_1px.comp
++++ b/src/shaders/cs_composite_rcas_1px.comp
+@@ -91,7 +91,11 @@ void rcasComposite(uvec2 pos)
+     }
+ 
+     outputValue = encodeOutputColor(outputValue);
+-    imageStore(dst, rotateOutputCoord(pos, u_rotation), vec4(outputValue, 0));
++    // Opaque alpha. The composite target is a DRM scan-out plane with an
++    // X-prefixed fourcc, so alpha is meaningless to the panel, but the buffer
++    // is also published as an Android layer and a 10-bit layer's alpha is
++    // honoured there: a 0 here composites the whole frame away.
++    imageStore(dst, rotateOutputCoord(pos, u_rotation), vec4(outputValue, 1));
+ 
+     if (checkDebugFlag(compositedebug_Markers))
+         compositing_debug(pos, u_rotation);
