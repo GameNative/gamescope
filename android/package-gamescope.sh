@@ -260,6 +260,11 @@ cp "$ICD_SO" "$STAGE/lib/libadrenotools_gamescope.so"
 resolve_libs "$STAGE/lib/libadrenotools_gamescope.so" \
     "$STAGE/lib/libvulkan_freedreno.so"
 
+# Frame generation: the LSFG engine, opened by the ICD on its first device
+# create. A leaf library — static libc++, so its only NEEDEDs are libc/libdl/libm
+# and the resolver above has nothing to vendor for it.
+cp "$GNDRM_REL/liblsfg_engine.so" "$STAGE/lib/liblsfg_engine.so"
+
 # --- guest smoke-test clients (04 §4.4) ---------------------------------------
 # bin/gn-dmabuf-test: client-dmabuf output-half smoke test; bin/gn-wsi-test:
 # plain vulkan WSI client (swapchain clear-color presents) exercising the
