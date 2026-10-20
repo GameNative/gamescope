@@ -1,0 +1,73 @@
+A37 — clear flat textures instead of staging them through the upload buffer
+
+vulkan_create_flat_texture filled the whole image through the device's upload
+buffer, which is a fixed 1920x1080x4 bytes. Since A33 the session blank is
+created at the full output size, so any output wider than 1080p (2400x1080
+phones, 1440p handhelds) hit the size assert in uploadBufferData and gamescope
+aborted before its first frame. A flat texture needs no staging at all: it is
+a transfer destination already, so one vkCmdClearColorImage fills it. The
+upload buffer keeps its size; nothing else uploads an output-sized image.
+
+diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
+index f3f914a..5061b54 100644
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -1905,6 +1905,26 @@ void CVulkanCmdBuffer::copyBufferToImage(VkBuffer buffer, VkDeviceSize offset, u
+ 	m_textureRefs.emplace_back(std::move(dst));
+ }
+ 
++void CVulkanCmdBuffer::clearImage(gamescope::Rc<CVulkanTexture> dst, uint8_t r, uint8_t g, uint8_t b, uint8_t a)
++{
++	prepareDestImage(dst.get());
++	insertBarrier();
++	VkClearColorValue color = {
++		.float32 = { r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f },
++	};
++	VkImageSubresourceRange range = {
++		.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++		.levelCount = 1,
++		.layerCount = 1,
++	};
++
++	m_device->vk.CmdClearColorImage(m_cmdBuffer, dst->vkImage(), VK_IMAGE_LAYOUT_GENERAL, &color, 1, &range);
++
++	markDirty(dst.get());
++
++	m_textureRefs.emplace_back(std::move(dst));
++}
++
+ void CVulkanCmdBuffer::prepareSrcImage(CVulkanTexture *image)
+ {
+ 	auto result = m_textureState.emplace(image, TextureState());
+@@ -3169,18 +3189,8 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_flat_texture( uint32_t width,
+ 	bool bRes = texture->BInit( width, height, 1u, VulkanFormatToDRM( VK_FORMAT_B8G8R8A8_UNORM ), flags );
+ 	assert( bRes );
+ 
+-	auto [_dst, offset] = g_device.uploadBufferData( width * height * 4 );
+-	uint8_t *dst = (uint8_t *)_dst;
+-	for ( uint32_t i = 0; i < width * height * 4; i += 4 )
+-	{
+-		dst[i + 0] = b;
+-		dst[i + 1] = g;
+-		dst[i + 2] = r;
+-		dst[i + 3] = a;
+-	}
+-
+ 	auto cmdBuffer = g_device.commandBuffer();
+-	cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), offset, 0, texture.get());
++	cmdBuffer->clearImage( texture.get(), r, g, b, a );
+ 	g_device.submit(std::move(cmdBuffer));
+ 	g_device.waitIdle();
+ 
+diff --git a/src/rendervulkan.hpp b/src/rendervulkan.hpp
+index fa519db..f290c4d 100644
+--- a/src/rendervulkan.hpp
++++ b/src/rendervulkan.hpp
+@@ -1008,6 +1008,7 @@ public:
+ 	void dispatch(uint32_t x, uint32_t y = 1, uint32_t z = 1);
+ 	void copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst);
+ 	void copyBufferToImage(VkBuffer buffer, VkDeviceSize offset, uint32_t stride, gamescope::Rc<CVulkanTexture> dst);
++	void clearImage(gamescope::Rc<CVulkanTexture> dst, uint8_t r, uint8_t g, uint8_t b, uint8_t a);
+ 
+ 
+ 	void prepareSrcImage(CVulkanTexture *image);
