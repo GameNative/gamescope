@@ -163,6 +163,9 @@ fi
 # The cross file carries the correct pkg_config_libdir for cross lookups.
 MESON_OPTIONS=(
     --cross-file android/cross/aarch64-linux-android.txt
+    # Release: meson defaults to `debug` (-O0, asserts on), and the composite
+    # path runs per frame.
+    --buildtype=release
     -Ddrm_backend=enabled
     -Dsdl2_backend=disabled
     -Denable_openvr_support=false

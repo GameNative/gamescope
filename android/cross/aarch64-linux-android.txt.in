@@ -24,15 +24,15 @@ cpu        = 'armv8-a'
 endian     = 'little'
 
 [built-in options]
-c_args   = ['-g0', '-O2', '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES', '-Drindex=strrchr',
+# No -O2 here: the build directory's --buildtype decides the optimisation level,
+# and a flag fixed in this file would override it and make `--buildtype` a no-op.
+c_args   = ['-g0', '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES', '-Drindex=strrchr',
             '-idirafter', '@TERMUXFS@/include']
 # -D_LIBCPP_ENABLE_EXPERIMENTAL: NDK clang does not set __has_feature(experimental_library),
 #   so libc++ hides std::jthread/std::stop_token behind _LIBCPP_HAS_NO_EXPERIMENTAL_STOP_TOKEN
 #   (rendervulkan.hpp needs them; no API-level availability issue on Android).
-cpp_args = ['-g0', '-O2', '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES', '-Drindex=strrchr',
+cpp_args = ['-g0', '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES', '-Drindex=strrchr',
             '-D_LIBCPP_ENABLE_EXPERIMENTAL',
-            # dev-stage: upstream swapchain-override protocol tracing
-            '-DGAMESCOPE_SWAPCHAIN_DEBUG',
             '-idirafter', '@TERMUXFS@/include']
 c_link_args   = ['-L@TERMUXFS@/lib',
                  '-Wl,-rpath=/data/data/com.termux/files/usr/lib',
