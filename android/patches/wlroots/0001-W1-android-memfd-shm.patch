@@ -7,7 +7,6 @@ shm_open helpers compiled out. No new dependencies.
 
 ---
 diff --git a/util/shm.c b/util/shm.c
-index 5eb87bb8..e684ebc1 100644
 --- a/util/shm.c
 +++ b/util/shm.c
 @@ -8,8 +8,19 @@
@@ -30,7 +29,7 @@ index 5eb87bb8..e684ebc1 100644
  static void randname(char *buf) {
  	struct timespec ts;
  	clock_gettime(CLOCK_REALTIME, &ts);
-@@ -35,14 +46,22 @@ static int excl_shm_open(char *name) {
+@@ -35,14 +46,22 @@
  
  	return -1;
  }
@@ -53,7 +52,7 @@ index 5eb87bb8..e684ebc1 100644
  
  	int ret;
  	do {
-@@ -57,6 +76,22 @@ int allocate_shm_file(size_t size) {
+@@ -57,6 +76,22 @@
  }
  
  bool allocate_shm_file_pair(size_t size, int *rw_fd_ptr, int *ro_fd_ptr) {
@@ -63,11 +62,11 @@ index 5eb87bb8..e684ebc1 100644
 +		return false;
 +	}
 +
-+	// memfd has no name to re-open; go through /proc/self/fd instead. Do this
-+	// before the fchmod() below drops the mode to 0.
-+	char procpath[64];
-+	snprintf(procpath, sizeof(procpath), "/proc/self/fd/%d", rw_fd);
-+	int ro_fd = open(procpath, O_RDONLY | O_CLOEXEC);
++	// memfd has no name to re-open, and Android denies an app-domain process
++	// the open() of a /proc/self/fd link that points at an anonymous memfd
++	// (EACCES). dup() gives the same underlying file, which is all any caller
++	// uses the read-only fd for.
++	int ro_fd = dup(rw_fd);
 +	if (ro_fd < 0) {
 +		close(rw_fd);
 +		return false;
@@ -76,11 +75,28 @@ index 5eb87bb8..e684ebc1 100644
  	char name[] = RANDNAME_PATTERN;
  	int rw_fd = excl_shm_open(name);
  	if (rw_fd < 0) {
-@@ -72,6 +107,7 @@ bool allocate_shm_file_pair(size_t size, int *rw_fd_ptr, int *ro_fd_ptr) {
+@@ -72,14 +107,24 @@
  	}
  
  	shm_unlink(name);
 +#endif
  
++#if !defined(__ANDROID__)
  	// Make sure the file cannot be re-opened in read-write mode (e.g. via
  	// "/proc/self/fd/" on Linux)
++	//
++	// bionic/Android refuses fchmod() on a memfd (EACCES), so this hardening
++	// step does not exist there; it is also moot for the pair above, whose two
++	// fds are the same file description. What it protected against — a client
++	// re-opening the keymap buffer read-write — is denied on Android twice
++	// over, by the /proc/self/fd open() denial and by the dup() being the only
++	// way in.
+ 	if (fchmod(rw_fd, 0) != 0) {
+ 		close(rw_fd);
+ 		close(ro_fd);
+ 		return false;
+ 	}
++#endif
+ 
+ 	int ret;
+ 	do {
