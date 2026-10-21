@@ -1,0 +1,54 @@
+A41 — bound the composite constants UBO range
+
+The composite binds its push constants as a uniform buffer: the upload buffer
+at the offset uploadConstants staged them, with range VK_WHOLE_SIZE. That makes
+the descriptor's range the rest of the upload buffer, megabytes, which is past
+maxUniformBufferRange (64 KiB on Turnip and Mali) and so invalid usage.
+
+It went unnoticed while the buffer was 1920x1080x4 bytes. Since A39 the buffer
+is the output frame rounded up to whole MiB, which on a 1920x1080 output is
+exactly 8 MiB. Turnip stores a UBO's size in vec4s in a 15-bit field, so with
+the constants at offset 0 an 8 MiB range (0x80000 vec4s) wraps to zero, the
+shader reads all-zero constants, and every composited frame comes out black.
+Direct scanout never touches the UBO, which is why the picture only goes black
+once something forces the composite: a colour look (A31) or a ReShade effect.
+
+Bind at most maxUniformBufferRange from the constants' offset instead.
+
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -428,6 +428,7 @@
+ 	VkPhysicalDeviceProperties props;
+ 	vk.GetPhysicalDeviceProperties( m_physDev, &props );
+ 	vk_log.infof( "selecting physical device '%s': queue family %x (general queue family %x)", props.deviceName, m_queueFamily, m_generalQueueFamily );
++	m_uMaxUniformBufferRange = props.limits.maxUniformBufferRange;
+ 
+ 	return true;
+ }
+@@ -1851,7 +1852,7 @@
+ 
+ 	scratchDescriptor.buffer = m_device->m_uploadBuffer;
+ 	scratchDescriptor.offset = m_renderBufferOffset;
+-	scratchDescriptor.range = VK_WHOLE_SIZE;
++	scratchDescriptor.range = std::min<VkDeviceSize>( m_device->upload_buffer_size - m_renderBufferOffset, m_device->maxUniformBufferRange() );
+ 
+ 	for (uint32_t i = 0; i < VKR_SAMPLER_SLOTS; i++)
+ 	{
+--- a/src/rendervulkan.hpp
++++ b/src/rendervulkan.hpp
+@@ -866,6 +866,7 @@
+ 	uint64_t completedSeqNo();
+ 	inline uint32_t generalQueueFamily() {return m_generalQueueFamily;}
+ 	inline VkBuffer uploadBuffer() {return m_uploadBuffer;}
++	inline uint32_t maxUniformBufferRange() {return m_uMaxUniformBufferRange;}
+ 	bool createUploadBuffer( uint32_t size );
+ 	bool growUploadBuffer( uint32_t required );
+ 	inline VkPipelineLayout pipelineLayout() {return m_pipelineLayout;}
+@@ -963,6 +964,7 @@
+ 	VkDeviceMemory m_uploadBufferMemory;
+ 	void *m_uploadBufferData;
+ 	uint32_t m_uploadBufferOffset = 0;
++	uint32_t m_uMaxUniformBufferRange = 16384;
+ 	// Replaced upload buffers, kept instead of destroyed: a command buffer can
+ 	// still be recording a copy out of one when the size grows, so the old
+ 	// buffer outlives every reference it could have. Growth is bounded (it
