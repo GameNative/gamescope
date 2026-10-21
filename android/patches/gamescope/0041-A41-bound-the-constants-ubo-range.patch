@@ -1,8 +1,8 @@
 A41 — bound the composite constants UBO range
 
-The composite binds its push constants as a uniform buffer: the upload buffer
-at the offset uploadConstants staged them, with range VK_WHOLE_SIZE. That makes
-the descriptor's range the rest of the upload buffer, megabytes, which is past
+The composite binds its push constants as a uniform buffer: the upload buffer at
+the offset uploadConstants staged them, with range VK_WHOLE_SIZE. That makes the
+descriptor's range the rest of the upload buffer — megabytes — which is past
 maxUniformBufferRange (64 KiB on Turnip and Mali) and so invalid usage.
 
 It went unnoticed while the buffer was 1920x1080x4 bytes. Since A39 the buffer
@@ -13,7 +13,14 @@ shader reads all-zero constants, and every composited frame comes out black.
 Direct scanout never touches the UBO, which is why the picture only goes black
 once something forces the composite: a colour look (A31) or a ReShade effect.
 
-Bind at most maxUniformBufferRange from the constants' offset instead.
+Bind at most maxUniformBufferRange from the constants' offset, read once from
+the device properties.
+
+The accessor and the member are declared past the lines A39 adds (after
+supportsModifiers() and after m_submissionSeqNo) rather than next to the upload
+buffer declarations. Placing them in A39's own context makes this patch and A39
+each fail the other's reverse test, and then neither can be recognised as
+already applied and the train stops re-applying.
 
 --- a/src/rendervulkan.cpp
 +++ b/src/rendervulkan.cpp
@@ -25,30 +32,35 @@ Bind at most maxUniformBufferRange from the constants' offset instead.
  
  	return true;
  }
-@@ -1851,7 +1852,7 @@
+@@ -1851,7 +1852,12 @@
  
  	scratchDescriptor.buffer = m_device->m_uploadBuffer;
  	scratchDescriptor.offset = m_renderBufferOffset;
 -	scratchDescriptor.range = VK_WHOLE_SIZE;
++	// The constants live in the upload buffer, which is output-sized since A39
++	// (8 MiB on 1080p). VK_WHOLE_SIZE makes the range the rest of that buffer,
++	// past maxUniformBufferRange — invalid usage, and Turnip then wraps the
++	// UBO's 15-bit vec4 size field to zero, so the shader reads all-zero
++	// constants and every composited frame is black.
 +	scratchDescriptor.range = std::min<VkDeviceSize>( m_device->upload_buffer_size - m_renderBufferOffset, m_device->maxUniformBufferRange() );
  
  	for (uint32_t i = 0; i < VKR_SAMPLER_SLOTS; i++)
  	{
 --- a/src/rendervulkan.hpp
 +++ b/src/rendervulkan.hpp
-@@ -866,6 +866,7 @@
- 	uint64_t completedSeqNo();
- 	inline uint32_t generalQueueFamily() {return m_generalQueueFamily;}
- 	inline VkBuffer uploadBuffer() {return m_uploadBuffer;}
-+	inline uint32_t maxUniformBufferRange() {return m_uMaxUniformBufferRange;}
- 	bool createUploadBuffer( uint32_t size );
- 	bool growUploadBuffer( uint32_t required );
+@@ -871,6 +871,7 @@
  	inline VkPipelineLayout pipelineLayout() {return m_pipelineLayout;}
-@@ -963,6 +964,7 @@
- 	VkDeviceMemory m_uploadBufferMemory;
- 	void *m_uploadBufferData;
- 	uint32_t m_uploadBufferOffset = 0;
+ 	inline int drmRenderFd() {return m_drmRendererFd;}
+ 	inline bool supportsModifiers() {return m_bSupportsModifiers;}
++	inline uint32_t maxUniformBufferRange() {return m_uMaxUniformBufferRange;}
+ 	inline bool hasDrmPrimaryDevId() {return m_bHasDrmPrimaryDevId;}
+ 	inline dev_t primaryDevId() {return m_drmPrimaryDevId;}
+ 	inline bool supportsFp16() {return m_bSupportsFp16;}
+@@ -971,6 +972,7 @@
+ 
+ 	VkSemaphore m_scratchTimelineSemaphore;
+ 	std::atomic<uint64_t> m_submissionSeqNo = { 0 };
 +	uint32_t m_uMaxUniformBufferRange = 16384;
- 	// Replaced upload buffers, kept instead of destroyed: a command buffer can
- 	// still be recording a copy out of one when the size grows, so the old
- 	// buffer outlives every reference it could have. Growth is bounded (it
+ 	std::vector<std::unique_ptr<CVulkanCmdBuffer>> m_unusedCmdBufs;
+ 	std::map<uint64_t, std::unique_ptr<CVulkanCmdBuffer>> m_pendingCmdBufs;
+ 
