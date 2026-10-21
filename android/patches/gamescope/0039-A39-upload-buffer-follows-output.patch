@@ -1,0 +1,250 @@
+A39 — size the upload buffer from the session's output resolution
+
+The upload buffer was a constant 1920x1080x4, but everything staged through it
+is at most one output-sized image: since A33 the session blank is created at
+the full output size, so on any output wider than 1080p (2400x1080 phones,
+1440p handhelds) the staging request exceeded the buffer and tripped
+`assert(size <= upload_buffer_size)` in uploadBufferData, aborting gamescope
+before its first frame.
+
+The size is a property of the output, which the host already knows and passes
+as -W/-H, so seed the buffer from it: the DRM backend calls vulkan_init (and
+therefore CVulkanDevice::BInit) before it picks the mode, so the initial size
+comes from g_nPreferredOutputWidth/Height, falling back to the output size and
+then to 1080p. If the mode turns out larger anyway, uploadBufferData grows the
+buffer rather than asserting — doubling, waiting for the device first, and
+retiring the old buffer instead of destroying it, since a command buffer can
+still be recording a copy out of it (uploadConstants stages from inside a
+recording buffer) and the device has no destruction queue.
+
+The old overflow branch was worse than the assert: it waited and then kept the
+offset past the end of the buffer, writing out of bounds.
+
+A37 (android/patches/disabled/) avoided the abort by clearing flat textures
+instead of staging them; with the buffer sized correctly that workaround is no
+longer needed and is disabled.
+
+diff --git a/src/main.hpp b/src/main.hpp
+--- a/src/main.hpp
++++ b/src/main.hpp
+@@ -22,6 +22,8 @@ extern int g_nNestedDisplayIndex;
+ 
+ extern uint32_t g_nOutputWidth;
+ extern uint32_t g_nOutputHeight;
++extern int g_nPreferredOutputWidth;
++extern int g_nPreferredOutputHeight;
+ extern bool g_bForceRelativeMouse;
+ extern int g_nOutputRefresh; // mHz
+ extern bool g_bOutputHDREnabled;
+diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -1024,39 +1024,84 @@ bool CVulkanDevice::createScratchResources()
+ 		return false;
+ 	}
+ 
+-	// Make and map upload buffer
+-	
++	// Make and map upload buffer.
++	//
++	// Its size follows the session's output resolution: the largest thing ever
++	// staged through it is one output-sized image (the A33 session blank), so a
++	// fixed 1080p buffer is wrong on any bigger output. The host's request
++	// (-W/-H) is what we know before the DRM mode is picked — backend Init
++	// calls us first — so prefer it and fall back to whatever the output is,
++	// then to 1080p.
++	{
++		const uint32_t uWidth  = g_nPreferredOutputWidth  > 0 ? (uint32_t)g_nPreferredOutputWidth  : g_nOutputWidth;
++		const uint32_t uHeight = g_nPreferredOutputHeight > 0 ? (uint32_t)g_nPreferredOutputHeight : g_nOutputHeight;
++
++		uint32_t uUploadSize = 1920u * 1080u * 4u;
++		if ( uWidth > 0 && uHeight > 0 )
++			uUploadSize = uWidth * uHeight * 4u;
++
++		if ( !createUploadBuffer( uUploadSize ) )
++			return false;
++	}
++
++	VkSemaphoreTypeCreateInfo timelineCreateInfo = {
++		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
++		.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
++	};
++
++	VkSemaphoreCreateInfo semCreateInfo = {
++		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
++		.pNext = &timelineCreateInfo,
++	};
++
++	res = vk.CreateSemaphore( device(), &semCreateInfo, NULL, &m_scratchTimelineSemaphore );
++	if ( res != VK_SUCCESS )
++	{
++		vk_errorf( res, "vkCreateSemaphore failed" );
++		return false;
++	}
++
++	return true;
++}
++
++bool CVulkanDevice::createUploadBuffer( uint32_t size )
++{
++	// Whole MiB: growth is not a per-byte decision, and a rounded size keeps a
++	// single output frame (width*height*4) from landing a few bytes under the
++	// request it was computed for.
++	size = align( size, 1024u * 1024u );
++
+ 	VkBufferCreateInfo bufferCreateInfo = {
+ 		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+-		.size = upload_buffer_size,
++		.size = size,
+ 		.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+ 	};
+ 
+-	res = vk.CreateBuffer( device(), &bufferCreateInfo, nullptr, &m_uploadBuffer );
++	VkResult res = vk.CreateBuffer( device(), &bufferCreateInfo, nullptr, &m_uploadBuffer );
+ 	if ( res != VK_SUCCESS )
+ 	{
+ 		vk_errorf( res, "vkCreateBuffer failed" );
+ 		return false;
+ 	}
+-	
++
+ 	VkMemoryRequirements memRequirements;
+ 	vk.GetBufferMemoryRequirements(device(), m_uploadBuffer, &memRequirements);
+-	
++
+ 	uint32_t memTypeIndex =  findMemoryType(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT|VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, memRequirements.memoryTypeBits );
+ 	if ( memTypeIndex == ~0u )
+ 	{
+ 		vk_log.errorf( "findMemoryType failed" );
+ 		return false;
+ 	}
+-	
++
+ 	VkMemoryAllocateInfo allocInfo = {
+ 		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+ 		.allocationSize = memRequirements.size,
+ 		.memoryTypeIndex = memTypeIndex,
+ 	};
+-	
++
+ 	vk.AllocateMemory( device(), &allocInfo, nullptr, &m_uploadBufferMemory);
+-	
++
+ 	vk.BindBufferMemory( device(), m_uploadBuffer, m_uploadBufferMemory, 0 );
+ 
+ 	res = vk.MapMemory( device(), m_uploadBufferMemory, 0, VK_WHOLE_SIZE, 0, (void**)&m_uploadBufferData );
+@@ -1066,20 +1111,38 @@ bool CVulkanDevice::createScratchResources()
+ 		return false;
+ 	}
+ 
+-	VkSemaphoreTypeCreateInfo timelineCreateInfo = {
+-		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+-		.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+-	};
++	vk_log.infof( "upload buffer: %u bytes", size );
++	upload_buffer_size = size;
++	m_uploadBufferOffset = 0;
+ 
+-	VkSemaphoreCreateInfo semCreateInfo = {
+-		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+-		.pNext = &timelineCreateInfo,
+-	};
++	return true;
++}
+ 
+-	res = vk.CreateSemaphore( device(), &semCreateInfo, NULL, &m_scratchTimelineSemaphore );
+-	if ( res != VK_SUCCESS )
+-	{
+-		vk_errorf( res, "vkCreateSemaphore failed" );
++bool CVulkanDevice::growUploadBuffer( uint32_t required )
++{
++	// Only reachable when the output turns out bigger than the size the host
++	// asked for up front (the DRM mode is picked after this device is built).
++	// Wait for everything submitted before swapping the buffer out, and retire
++	// the old one instead of destroying it: a command buffer may still be
++	// recording a copy out of it — uploadConstants stages from inside a
++	// recording buffer — and this device has no destruction queue to hand it
++	// to. Growth doubles, so the list stays short, and with the initial size
++	// right it never grows at all.
++	waitIdle( true );
++
++	const uint32_t uNeeded = align( required, 1024u * 1024u );
++	uint32_t newSize = upload_buffer_size > 0 ? upload_buffer_size : 1024u * 1024u;
++	while ( newSize < uNeeded )
++		newSize *= 2;
++
++	m_retiredUploadBuffers.emplace_back( m_uploadBuffer, m_uploadBufferMemory );
++	m_uploadBuffer = VK_NULL_HANDLE;
++	m_uploadBufferMemory = VK_NULL_HANDLE;
++	m_uploadBufferData = nullptr;
++
++	if ( !createUploadBuffer( newSize ) )
++	{
++		vk_log.errorf( "growUploadBuffer: could not grow the upload buffer to %u bytes", newSize );
+ 		return false;
+ 	}
+ 
+diff --git a/src/rendervulkan.hpp b/src/rendervulkan.hpp
+--- a/src/rendervulkan.hpp
++++ b/src/rendervulkan.hpp
+@@ -846,7 +846,14 @@ public:
+ 	std::shared_ptr<VulkanTimelineSemaphore_t> CreateTimelineSemaphore( uint64_t ulStartingPoint, bool bShared = false );
+ 	std::shared_ptr<VulkanTimelineSemaphore_t> ImportTimelineSemaphore( gamescope::CTimeline *pTimeline );
+ 
+-	static const uint32_t upload_buffer_size = 1920 * 1080 * 4;
++	// One output frame at the session's output resolution, not a fixed 1080p
++	// frame. Everything staged through this buffer is at most one output
++	// frame (the A33 session blank at the output size, the cursor, the colour
++	// LUTs, the NIS coefficients), so a constant 1920x1080x4 buffer asserts in
++	// uploadBufferData on any wider output and gamescope dies before its first
++	// frame. Seeded from the size the host asked for (-W/-H); growUploadBuffer
++	// covers an output that turns out larger than that.
++	uint32_t upload_buffer_size = 1920 * 1080 * 4;
+ 
+ 	inline VkDevice device() { return m_device; }
+ 	inline VkPhysicalDevice physDev() {return m_physDev; }
+@@ -859,6 +866,8 @@ public:
+ 	uint64_t completedSeqNo();
+ 	inline uint32_t generalQueueFamily() {return m_generalQueueFamily;}
+ 	inline VkBuffer uploadBuffer() {return m_uploadBuffer;}
++	bool createUploadBuffer( uint32_t size );
++	bool growUploadBuffer( uint32_t required );
+ 	inline VkPipelineLayout pipelineLayout() {return m_pipelineLayout;}
+ 	inline int drmRenderFd() {return m_drmRendererFd;}
+ 	inline bool supportsModifiers() {return m_bSupportsModifiers;}
+@@ -869,15 +878,18 @@ public:
+ 
+ 	inline std::pair<void *, uint32_t> uploadBufferData(uint32_t size)
+ 	{
+-		assert(size <= upload_buffer_size);
+-
+ 		m_uploadBufferOffset = align(m_uploadBufferOffset, 16);
+-		if (m_uploadBufferOffset + size > upload_buffer_size)
++		if ( m_uploadBufferOffset + size > upload_buffer_size )
+ 		{
+-			fprintf(stderr, "Exceeded uploadBufferData\n");
+-			waitIdle(false);
++			// Grow instead of asserting: the buffer is only a staging area,
++			// and the size it needs is a property of the output, which the
++			// caller cannot always know before this point. A failed grow is
++			// an allocation failure, not a sizing bug.
++			growUploadBuffer( m_uploadBufferOffset + size );
+ 		}
+ 
++		assert(size <= upload_buffer_size);
++
+ 		uint32_t uOffset = m_uploadBufferOffset;
+ 
+ 		uint8_t *ptr = ((uint8_t*)m_uploadBufferData) + uOffset;
+@@ -951,6 +963,11 @@ protected:
+ 	VkDeviceMemory m_uploadBufferMemory;
+ 	void *m_uploadBufferData;
+ 	uint32_t m_uploadBufferOffset = 0;
++	// Replaced upload buffers, kept instead of destroyed: a command buffer can
++	// still be recording a copy out of one when the size grows, so the old
++	// buffer outlives every reference it could have. Growth is bounded (it
++	// doubles), so the list stays short.
++	std::vector<std::pair<VkBuffer, VkDeviceMemory>> m_retiredUploadBuffers;
+ 
+ 	VkSemaphore m_scratchTimelineSemaphore;
+ 	std::atomic<uint64_t> m_submissionSeqNo = { 0 };

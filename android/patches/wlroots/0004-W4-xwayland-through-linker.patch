@@ -1,0 +1,50 @@
+android: W4 — start Xwayland through the system linker
+
+Xwayland ships in the payload, i.e. in the GameNative app's data directory, and
+Android refuses an app-domain process the right to exec a file there (W^X:
+untrusted_app -> execute_no_trans on app_data_file is denied once targetSdk is
+29 or later). wlroots exec'd it directly, so the modern variant got
+"failed to exec .../gamescope/bin/Xwayland: Permission denied" and no X server:
+wine never connected and the session showed nothing.
+
+Go through /system/bin/linker64 instead, which loads the ELF with
+mmap(PROT_EXEC) and is exactly how the host application starts the same binary
+tree. The program argument is xwayland_path rather than argv[0] — the linker
+rejects a relative path, and wlroots does not guarantee argv[0] is the binary.
+
+diff --git a/xwayland/server.c b/xwayland/server.c
+--- a/xwayland/server.c
++++ b/xwayland/server.c
+@@ -130,6 +130,32 @@
+ 	}
+ 
+ 	// This returns if and only if the call fails
++#if defined( __ANDROID__ )
++	// Android refuses an app-domain process the right to exec a binary out of
++	// its own data directory (W^X, targetSdk >= 29), and the payload's
++	// Xwayland lives there. Go through the system linker, which loads the ELF
++	// with mmap(PROT_EXEC) instead: linker64 <Xwayland> <args...>. This is how
++	// the host application starts every binary in the same directory.
++	{
++		size_t n = 0;
++		while (argv[n] != NULL) {
++			n++;
++		}
++		// The program to load is xwayland_path, not argv[0]: wlroots keeps
++		// argv[0] as the bare name in some spawn paths, and the linker needs
++		// an absolute path to the ELF (a relative one is rejected outright).
++		char **linker_argv = calloc( n + 2, sizeof(char *) );
++		if (linker_argv) {
++			linker_argv[0] = (char *)"/system/bin/linker64";
++			linker_argv[1] = (char *)xwayland_path;
++			for (size_t i = 1; i <= n; i++) {
++				linker_argv[i + 1] = argv[i];
++			}
++			execv("/system/bin/linker64", linker_argv);
++		}
++	}
++#endif
++
+ 	execvp(xwayland_path, argv);
+ 
+ 	wlr_log_errno(WLR_ERROR, "failed to exec %s", xwayland_path);

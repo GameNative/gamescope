@@ -1,0 +1,147 @@
+A40 — start this session's children through the system linker
+
+Every binary in the payload lives in the app's data directory (filesDir), and
+Android refuses an app-domain process the right to exec a file there (W^X:
+untrusted_app -> execute_no_trans on app_data_file is denied once targetSdk is
+29 or later). The host application already works around this by prefixing
+/system/bin/linker64 for every binary it starts (ProcessHelper on the modern
+variant; 8c6e28d2b did the same for the gn-scaling-mode client), but gamescope
+spawns its own children and had no such path: the session reaper
+("gamescopereaper", resolved through PATH) and the game command after `--`
+failed with "Failed to start process ...: Permission denied" on modern builds,
+before any frame was presented.
+
+Run both through the linker the same way: resolve argv[0] the way execvp would
+(a bare name is looked up along PATH, since the linker needs an absolute path),
+then exec /system/bin/linker64 <resolved binary> <args...>. argv[0] of the child
+becomes the resolved path, and the plain execvp remains as the fallback so a
+failure still reports the real error.
+
+diff --git a/src/Utils/Process.cpp b/src/Utils/Process.cpp
+--- a/src/Utils/Process.cpp
++++ b/src/Utils/Process.cpp
+@@ -41,6 +41,98 @@
+ 
+ static LogScope s_ProcessLog( "process" );
+ 
++#if defined( __ANDROID__ )
++// Android denies an app-domain process the right to exec a binary out of its
++// own data directory (W^X: untrusted_app -> execute_no_trans on app_data_file
++// is refused once targetSdk >= 29), which is why the host application starts
++// every binary through the system linker instead of exec'ing it. Children
++// gamescope spawns -- Xwayland and the game itself -- live in that same data
++// directory, so a plain execvp() on them fails with EACCES ("Failed to start
++// process ...: Permission denied"). Go through the linker the same way the host
++// does: linker64 <binary> <args...> loads the ELF with mmap(PROT_EXEC), which
++// is allowed.
++//
++// The linker needs an absolute path to the ELF, so a bare argv[0] (the reaper
++// is spawned as "gamescopereaper" and resolved through PATH) is looked up the
++// way execvp would have, and that resolved path becomes the program argument.
++static bool ResolveExecutablePath( const char *pszName, std::string &strOut )
++{
++    if ( pszName == nullptr || *pszName == '\0' )
++        return false;
++
++    if ( strchr( pszName, '/' ) != nullptr )
++    {
++        strOut = pszName;
++        return access( strOut.c_str(), X_OK ) == 0;
++    }
++
++    const char *pszPath = getenv( "PATH" );
++    if ( pszPath == nullptr )
++        return false;
++
++    std::string strDirs( pszPath );
++    size_t pos = 0;
++    while ( pos <= strDirs.size() )
++    {
++        size_t nSep = strDirs.find( ':', pos );
++        const std::string strDir = strDirs.substr( pos, nSep == std::string::npos ? std::string::npos : nSep - pos );
++
++        if ( !strDir.empty() )
++        {
++            std::string strCandidate = strDir + "/" + pszName;
++            if ( access( strCandidate.c_str(), X_OK ) == 0 )
++            {
++                strOut = std::move( strCandidate );
++                return true;
++            }
++        }
++
++        if ( nSep == std::string::npos )
++            break;
++        pos = nSep + 1;
++    }
++
++    return false;
++}
++
++[[noreturn]] static void RunChildExec( char *const argv[] )
++{
++    static constexpr const char *kLinker = "/system/bin/linker64";
++
++    std::string strProgram;
++    if ( argv[0] != nullptr
++        && strcmp( argv[0], kLinker ) != 0
++        && ResolveExecutablePath( argv[0], strProgram ) )
++    {
++        std::vector<char *> linkerArgv;
++        linkerArgv.push_back( const_cast<char *>( kLinker ) );
++        linkerArgv.push_back( strProgram.data() );
++        for ( char *const *p = argv + 1; *p != nullptr; p++ )
++            linkerArgv.push_back( *p );
++        linkerArgv.push_back( nullptr );
++
++        execv( kLinker, linkerArgv.data() );
++        // Fall through: if the linker route is unavailable, try the plain exec
++        // so the failure reported is the real one.
++    }
++
++    execvp( argv[0], argv );
++
++    s_ProcessLog.errorf_errno( "Failed to start process \"%s\"", argv[0] ? argv[0] : "(null)" );
++    _exit( 0 );
++}
++#else
++[[noreturn]] static void RunChildExec( char *const argv[] )
++{
++    if ( execvp( argv[0], argv ) == -1 )
++    {
++        s_ProcessLog.errorf_errno( "Failed to start process \"%s\"", argv[0] );
++    }
++    _exit( 0 );
++}
++#endif
++
++
+ namespace gamescope::Process
+ {
+     static bool IsDigit( char chChar )
+@@ -537,11 +629,7 @@
+                 {
+                     CloseFd( nPidPipe[1] );
+ 
+-                    if ( execvp( argv[0], argv ) == -1 )
+-                    {
+-                        s_ProcessLog.errorf_errno( "Failed to start process \"%s\"", argv[0] );
+-                    }
+-                    _exit( 0 );
++                    RunChildExec( argv );
+                 }
+                 else if ( nGrandChild < 0 )
+                 {
+@@ -556,11 +644,7 @@
+             }
+             else
+             {
+-                if ( execvp( argv[0], argv ) == -1 )
+-                {
+-                    s_ProcessLog.errorf_errno( "Failed to start process \"%s\"", argv[0] );
+-                }
+-                _exit( 0 );
++                RunChildExec( argv );
+             }
+         }
+ 
