@@ -1,0 +1,62 @@
+A42 — exec children directly, take the linker only when exec is refused
+
+A40 routes every child through /system/bin/linker64 because the modern host
+variant (targetSdk >= 29) may not exec a binary out of its own data directory.
+The legacy variant may, and does for everything it starts itself. Under
+gamescope it still got the linker route, and wine does not survive that
+without help: its loader derives the library directory from /proc/self/exe,
+which is the linker's path, so it dies at startup with
+
+    wine: could not load ntdll.so: dlopen failed: library
+    "/apex/com.android.runtime/bin/../lib/wine/aarch64-unix/ntdll.so" not found
+
+The modern host hides this by redirecting /proc/self/exe for wine; the legacy
+host has never needed to. Every gamescope session on a legacy build died this
+way on a Retroid Pocket 6 (Proton 9 and Proton 10), while the same games on X11
+on the same build ran.
+
+Exec the child directly first, exactly as before A40, and go through the
+linker only when the kernel answers EACCES. The modern variant's behaviour is
+unchanged; the legacy variant gets its direct exec back.
+
+diff --git a/src/Utils/Process.cpp b/src/Utils/Process.cpp
+index cd133e7..67c42c7 100644
+--- a/src/Utils/Process.cpp
++++ b/src/Utils/Process.cpp
+@@ -99,6 +99,21 @@ static bool ResolveExecutablePath( const char *pszName, std::string &strOut )
+ {
+     static constexpr const char *kLinker = "/system/bin/linker64";
+ 
++    // The plain exec comes first. A host that may exec its own data directory
++    // (the legacy variant, targetSdk < 29) gets the child started the way it
++    // starts everything else, which matters for wine: started through the
++    // linker, its /proc/self/exe is the linker's and it looks for ntdll.so
++    // beside that ("/apex/com.android.runtime/bin/../lib/wine") unless the host
++    // redirects the path, which only the modern variant does. The linker route
++    // is taken only when the kernel refuses the exec, which is the modern
++    // variant's W^X denial.
++    execvp( argv[0], argv );
++    if ( errno != EACCES )
++    {
++        s_ProcessLog.errorf_errno( "Failed to start process \"%s\"", argv[0] ? argv[0] : "(null)" );
++        _exit( 0 );
++    }
++
+     std::string strProgram;
+     if ( argv[0] != nullptr
+         && strcmp( argv[0], kLinker ) != 0
+@@ -112,13 +127,9 @@ static bool ResolveExecutablePath( const char *pszName, std::string &strOut )
+         linkerArgv.push_back( nullptr );
+ 
+         execv( kLinker, linkerArgv.data() );
+-        // Fall through: if the linker route is unavailable, try the plain exec
+-        // so the failure reported is the real one.
+     }
+ 
+-    execvp( argv[0], argv );
+-
+-    s_ProcessLog.errorf_errno( "Failed to start process \"%s\"", argv[0] ? argv[0] : "(null)" );
++    s_ProcessLog.errorf_errno( "Failed to start process \"%s\" through %s", argv[0] ? argv[0] : "(null)", kLinker );
+     _exit( 0 );
+ }
+ #else
