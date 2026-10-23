@@ -132,7 +132,7 @@ build_lib() {
     local name="$1" version="$2" pc="$3" url="$4"
     [ -f "$PREFIX/lib/pkgconfig/$pc" ] && return 0
     log "$name-$version"
-    local src="$name-$version" tar="$WORK/src/$name-$version.tar.gz"
+    local src="$name-$version" tar="$WORK/src/$(basename "$url")"
     [ -f "$tar" ] || curl -fL --retry 3 -o "$tar" "$url"
     rm -rf "${WORK:?}/src/$src"
     tar -xf "$tar" -C "$WORK/src"
@@ -151,6 +151,40 @@ build_lib() {
     )
 }
 
+# libxcvt has no configure script; it is a meson project
+build_lib_meson() {
+    local name="$1" version="$2" pc="$3" url="$4"
+    [ -f "$PREFIX/lib/pkgconfig/$pc" ] && return 0
+    log "$name-$version"
+    local src="$name-$version" tar="$WORK/src/$(basename "$url")"
+    [ -f "$tar" ] || curl -fL --retry 3 -o "$tar" "$url"
+    rm -rf "${WORK:?}/src/$src"
+    tar -xf "$tar" -C "$WORK/src"
+    cat > "$WORK/cross-$name.txt" <<CROSS
+[binaries]
+c = '$TOOLCHAIN/aarch64-linux-android28-clang'
+cpp = '$TOOLCHAIN/aarch64-linux-android28-clang++'
+ar = '$TOOLCHAIN/llvm-ar'
+strip = '$TOOLCHAIN/llvm-strip'
+pkgconfig = '$(command -v pkg-config)'
+
+[host_machine]
+system = 'linux'
+cpu_family = 'aarch64'
+cpu = 'armv8-a'
+endian = 'little'
+
+[properties]
+pkg_config_libdir = ['$PREFIX/lib/pkgconfig', '$PREFIX/share/pkgconfig']
+CROSS
+    (
+        cd "$WORK/src/$src"
+        meson setup build --cross-file "$WORK/cross-$name.txt" \
+            --prefix="$PREFIX" --buildtype=release >/dev/null
+        meson install -C build >/dev/null
+    )
+}
+
 build_lib libXres 1.2.2 xres.pc \
     https://xorg.freedesktop.org/releases/individual/lib/libXres-1.2.2.tar.gz
 # xkbcomp is exec'd by Xwayland and links libxkbfile
@@ -159,6 +193,29 @@ build_lib libxkbfile 1.1.3 xkbfile.pc \
 # wlroots' xwayland support requires xcb-ewmh and xcb-icccm
 build_lib xcb-util-wm 0.4.2 xcb-ewmh.pc \
     https://xcb.freedesktop.org/dist/xcb-util-wm-0.4.2.tar.gz
+# Xwayland requires xfont2 and libxcvt at configure time
+build_lib libfontenc 1.1.9 fontenc.pc \
+    https://xorg.freedesktop.org/releases/individual/lib/libfontenc-1.1.9.tar.gz
+# xtrans is header-only and ships in neither prefix; libXfont2 requires it
+if [ ! -f "$PREFIX/include/X11/Xtrans/Xtrans.h" ]; then
+    log "xtrans-1.6.0"
+    tar="$WORK/src/xtrans-1.6.0.tar.xz"
+    [ -f "$tar" ] || curl -fL --retry 3 -o "$tar" \
+        "https://xorg.freedesktop.org/releases/individual/lib/xtrans-1.6.0.tar.xz"
+    rm -rf "${WORK:?}/src/xtrans-1.6.0"
+    tar -xf "$tar" -C "$WORK/src"
+    mkdir -p "$PREFIX/include/X11/Xtrans" "$PREFIX/lib/pkgconfig"
+    cp "$WORK/src/xtrans-1.6.0"/*.h "$WORK/src/xtrans-1.6.0"/*.c \
+        "$PREFIX/include/X11/Xtrans/"
+    sed -e "s|@prefix@|$PREFIX|;s|@exec_prefix@|\${prefix}|" \
+        -e "s|@libdir@|\${exec_prefix}/lib|;s|@includedir@|\${prefix}/include|" \
+        -e "s|@PACKAGE_VERSION@|1.6.0|;s|@fchown_define@||;s|@sticky_bit_define@||" \
+        "$WORK/src/xtrans-1.6.0/xtrans.pc.in" > "$PREFIX/lib/pkgconfig/xtrans.pc"
+fi
+build_lib libXfont2 2.0.9 xfont2.pc \
+    https://xorg.freedesktop.org/releases/individual/lib/libXfont2-2.0.9.tar.gz
+build_lib_meson libxcvt 0.1.3 libxcvt.pc \
+    https://xorg.freedesktop.org/releases/individual/lib/libxcvt-0.1.3.tar.xz
 
 normalize_pc
 
