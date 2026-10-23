@@ -18,7 +18,7 @@ NDK="${ANDROID_NDK_ROOT:-${ANDROID_NDK_HOME:-$HOME/Android/Sdk/ndk/$NDK_VERSION}
 TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
 TERMUXFS_URL="https://github.com/GameNative/termux-on-gha/releases/download/build-20260218/termuxfs-aarch64.tar"
 TERMUX_REPO="https://packages-cf.termux.dev/apt/termux-main"
-WAYLAND_PROTOCOLS_VERSION="1.48"
+WAYLAND_PROTOCOLS_VERSION="1.49"
 
 # Same layout the workflow provisions (and proton-wine uses).
 ROOT="$HOME/termuxfs/aarch64"
