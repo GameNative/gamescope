@@ -1,25 +1,25 @@
-A43 — report an X11-drawn game window to the daemon
+A43 — send the game window note on the first top-level map
 
 The daemon clears the app's booting splash when it receives a GameWindowNote on
 the scan-out channel. Only the guest ICD shim sends one, from its swapchain
 present path, so a game that never presents through the shim's WSI proxy keeps
 the splash up while it runs behind it: an OpenGL game whose zink output reaches
-X as plain drawing (Balatro), or a GDI game.
+X as plain drawing (Balatro), a GDI game, or a static dialog such as an assert
+MessageBox.
 
-Such a game draws into a child of wine's desktop window, and Xwayland commits
-the desktop window's own surface for every frame. So while no override surface
-is bound on the focused window, its main-surface commits are counted per
-second; when a second carries at least 20 of them and the desktop window has a
-game child (the shim's own rule: viewable, InputOutput, larger than 1x1, a
-readable WM_CLASS instance that differs from the desktop's), the compositor
-sends the note itself on a fresh GAMENATIVE_DRM_SOCKET connection. At most three
-notes are sent, one per qualifying second, so a note dropped by a racing
-connection is sent again; the daemon latches the first.
+The note was first sent on a commit-rate gate: while no override surface was
+bound, the focused wine desktop window's main-surface commits were counted, and
+a second with at least 20 of them and a game child mapped sent it. A static
+dialog never reaches that rate, so it stayed hidden behind the splash. The note
+now follows the X11 server's rule, where the app hides the splash on the first
+mapped window, whatever it is: the compositor sends it on the first map of a
+top-level window (in practice wine's desktop window), on a fresh
+GAMENATIVE_DRM_SOCKET connection.
 
-A game that presents through the shim is not affected: once its override
-surface is bound its frames no longer land on the main surface and the count is
-reset, and before its first present a mapped, still window commits far below
-the threshold, so the splash is not lifted over it early.
+The daemon serves only the newest scan-out connection, so a note can be dropped
+when another client connects right after it. It is sent again on a later
+commit, at most once a second and at most three times in all; the daemon
+latches the first.
 
 --- a/src/steamcompmgr.cpp
 +++ b/src/steamcompmgr.cpp
@@ -31,80 +31,45 @@ the threshold, so the splash is not lifted over it early.
  #include <sys/resource.h>
  #include <time.h>
  #include <unistd.h>
-@@ -8710,6 +8711,161 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
- 	w->commit_queue.push_back( std::move(newCommit) );
+@@ -5918,6 +5919,9 @@
+ 		}
+ 	}
  }
- 
-+// gamenative A43: the booting splash is cleared by the daemon when it hears the
-+// game's window is up. The ICD shim reports that from its swapchain present, so a
-+// game that never presents through the shim (OpenGL drawn through X, GDI) never
-+// clears it. While no override surface is bound, a wine desktop window that
-+// keeps committing its own surface with a game child mapped is that game
-+// drawing through X, and the compositor sends the same note itself.
-+static LogScope s_GameWindowLogScope( "game-window" );
 +
-+static constexpr uint64_t k_ulX11GameWindowSampleNs = 1'000'000'000ull;
-+static constexpr uint32_t k_unX11GameWindowMinCommits = 20;
++static void
++x11_top_level_mapped( steamcompmgr_win_t *w );
+ 
+ static void
+ map_win(xwayland_ctx_t* ctx, Window id, unsigned long sequence)
+@@ -6025,6 +6029,8 @@
+ 	}
+ 
+ 	handle_desktop_window( w );
++
++	x11_top_level_mapped( w );
+ 
+ 	MakeFocusDirty();
+ 
+@@ -8708,8 +8714,99 @@
+ 	}
+ 
+ 	w->commit_queue.push_back( std::move(newCommit) );
++}
++
++// gamenative A43/A44: the booting splash is cleared by the daemon when it hears
++// the game's window is up. The ICD shim reports that from its swapchain present,
++// which a game drawn through X (OpenGL, GDI) or a static dialog never reaches.
++// So the compositor follows the X11 server's rule and sends the same note
++// itself on the first top-level map.
++static constexpr uint64_t k_ulX11GameWindowResendNs = 1'000'000'000ull;
 +static constexpr uint32_t k_unX11GameWindowMaxNotes = 3;
 +
 +static struct
 +{
-+	uint64_t ulSampleStart = 0;
-+	uint32_t unCommits = 0;
++	Window firstMapped = None;
++	uint64_t ulLastAttempt = 0;
 +	uint32_t unNotes = 0;
 +} s_X11GameWindow;
-+
-+static std::string
-+x11_window_instance( Display *dpy, Window win )
-+{
-+	std::string instance;
-+	XClassHint hint = {};
-+	if ( !XGetClassHint( dpy, win, &hint ) )
-+		return instance;
-+	if ( hint.res_name )
-+	{
-+		instance = hint.res_name;
-+		XFree( hint.res_name );
-+	}
-+	if ( hint.res_class )
-+		XFree( hint.res_class );
-+	return instance;
-+}
-+
-+// Same rule as the shim's child scan: a viewable, InputOutput, non-degenerate
-+// child of the desktop window whose WM_CLASS instance is readable and differs
-+// from the desktop's own.
-+static bool
-+x11_game_child_present( Display *dpy, Window desktop )
-+{
-+	std::string desktopInstance = x11_window_instance( dpy, desktop );
-+	if ( desktopInstance.empty() )
-+		return false;
-+
-+	Window root = None, parent = None;
-+	Window *children = nullptr;
-+	unsigned int nchildren = 0;
-+	if ( !XQueryTree( dpy, desktop, &root, &parent, &children, &nchildren ) )
-+		return false;
-+
-+	bool bFound = false;
-+	for ( unsigned int i = 0; i < nchildren && !bFound; i++ )
-+	{
-+		XWindowAttributes attribs;
-+		if ( !XGetWindowAttributes( dpy, children[ i ], &attribs ) )
-+			continue;
-+		if ( attribs.map_state != IsViewable || attribs.c_class != InputOutput )
-+			continue;
-+		if ( attribs.width <= 1 || attribs.height <= 1 )
-+			continue;
-+		std::string childInstance = x11_window_instance( dpy, children[ i ] );
-+		bFound = !childInstance.empty() && childInstance != desktopInstance;
-+	}
-+
-+	if ( children )
-+		XFree( children );
-+	return bFound;
-+}
 +
 +// One GameWindowNote (gndrm-uapi wire.rs: "GNW1", present = 1, 16 reserved
 +// bytes) on a fresh scan-out connection. The daemon serves the newest
@@ -144,60 +109,54 @@ the threshold, so the splash is not lifted over it early.
 +	}
 +	close( fd );
 +	return bSent;
-+}
-+
+ }
+ 
++// The daemon serves only the newest scan-out connection, so a note can be
++// dropped when another client connects right after it. Notes are sent at most
++// once a second and at most three in all; the daemon latches the first.
 +static void
-+x11_game_window_commit( xwayland_ctx_t *ctx, steamcompmgr_win_t *w, struct wlr_surface *surf )
++x11_game_window_note( const char *pszReason )
 +{
 +	auto &s = s_X11GameWindow;
 +	if ( s.unNotes >= k_unX11GameWindowMaxNotes )
 +		return;
-+	if ( w == nullptr || w->type != steamcompmgr_win_type_t::XWAYLAND )
-+		return;
-+
-+	global_focus_t *pFocus = GetCurrentFocus();
-+	if ( !pFocus || pFocus->focusWindow != w )
-+		return;
-+
-+	if ( w->xwayland().surface.override_surface != nullptr || w->bSessionSawGameWindow )
-+	{
-+		s.ulSampleStart = 0;
-+		s.unCommits = 0;
-+		return;
-+	}
-+
-+	if ( surf != w->xwayland().surface.main_surface )
-+		return;
 +
 +	uint64_t ulNow = get_time_in_nanos();
-+	if ( s.ulSampleStart == 0 )
-+		s.ulSampleStart = ulNow;
-+	s.unCommits++;
-+	if ( ulNow - s.ulSampleStart < k_ulX11GameWindowSampleNs )
++	if ( s.ulLastAttempt != 0 && ulNow - s.ulLastAttempt < k_ulX11GameWindowResendNs )
 +		return;
-+
-+	bool bRendering = s.unCommits >= k_unX11GameWindowMinCommits;
-+	uint32_t unCommits = s.unCommits;
-+	s.ulSampleStart = ulNow;
-+	s.unCommits = 0;
-+	if ( !bRendering || !x11_game_child_present( ctx->dpy, w->xwayland().id ) )
-+		return;
++	s.ulLastAttempt = ulNow;
 +
 +	bool bSent = send_game_window_note();
 +	if ( bSent )
++	{
 +		s.unNotes++;
-+	s_GameWindowLogScope.infof( "X11 game window drawing on 0x%lx (%u commits/s): note %s (%u/%u)",
-+		w->xwayland().id, unCommits, bSent ? "sent" : "failed", s.unNotes, k_unX11GameWindowMaxNotes );
++		hasRepaint = true;
++	}
++	xwm_log.infof( "%s 0x%lx: game window note %s (%u/%u)",
++		pszReason, s.firstMapped, bSent ? "sent" : "failed", s.unNotes, k_unX11GameWindowMaxNotes );
++}
++
++static void
++x11_top_level_mapped( steamcompmgr_win_t *w )
++{
++	auto &s = s_X11GameWindow;
++	if ( s.firstMapped != None )
++		return;
++
++	s.firstMapped = w->xwayland().id;
++	x11_game_window_note( "first top-level map" );
 +}
 +
  void check_new_xwayland_res(xwayland_ctx_t *ctx)
  {
  	// When importing buffer, we'll potentially need to perform operations with
-@@ -8720,6 +8876,7 @@ void check_new_xwayland_res(xwayland_ctx_t *ctx)
- 	for ( uint32_t i = 0; i < tmp_queue.size(); i++ )
- 	{
+@@ -8722,6 +8819,9 @@
  		steamcompmgr_win_t	*w = find_win( ctx, tmp_queue[ i ].surf );
-+		x11_game_window_commit( ctx, w, tmp_queue[ i ].surf );
  		update_wayland_res( &ctx->doneCommits, w, tmp_queue[ i ]);
  	}
++
++	if ( !tmp_queue.empty() && s_X11GameWindow.firstMapped != None )
++		x11_game_window_note( "resend after first map of" );
  }
+ 
+ void check_new_xdg_res()
