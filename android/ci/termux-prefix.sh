@@ -34,6 +34,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+CI_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="$ROOT/data/data/com.termux/files/usr"
 JOBS="$(nproc)"
 mkdir -p "$WORK/src"
@@ -42,30 +43,9 @@ mkdir -p "$WORK/src"
 
 log() { echo "=== $*"; }
 
-# The tree names the on-device path in its .pc files. Point them at the
-# extracted copy, and drop ${pc_sysrootdir} (pkgconf would prepend its own
-# prefix to it, doubling the path).
 normalize_pc() {
     find "$PREFIX/lib/pkgconfig" "$PREFIX/share/pkgconfig" -name '*.pc' -print0 |
-        python3 -c '
-import re, sys
-
-prefix = sys.argv[1].rstrip("/")
-dev = "/data/data/com.termux/files/usr"
-root = prefix[: -len(dev)] if prefix.endswith(dev) else ""
-
-for path in sys.stdin.read().split("\0"):
-    if not path:
-        continue
-    text = open(path, encoding="utf-8", errors="surrogateescape").read()
-    text = text.replace("${pc_sysrootdir}", "")
-    if root:
-        # collapse /root/root/...: re-running this script must not stack roots
-        text = re.sub(re.escape(root) + "(?:" + re.escape(root) + ")+", root, text)
-        # rewrite the on-device path, but leave an already-rewritten one alone
-        text = re.sub("(?<!" + re.escape(root) + ")" + re.escape(dev), prefix, text)
-    open(path, "w", encoding="utf-8", errors="surrogateescape").write(text)
-' "$PREFIX"
+        xargs -0 -r python3 "$CI_DIR/normalize-pc.py" "$PREFIX"
 }
 
 # --- 1. the Termux userland -------------------------------------------------
