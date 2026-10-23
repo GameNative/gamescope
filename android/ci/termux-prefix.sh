@@ -122,6 +122,7 @@ build_lib() {
         grep -q "enable-malloc0returnsnull" configure &&
             extra+=(--enable-malloc0returnsnull=no)
         PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig" \
+        CPPFLAGS="-I$PREFIX/include" \
         CC="$TOOLCHAIN/aarch64-linux-android28-clang" \
         AR="$TOOLCHAIN/llvm-ar" STRIP="$TOOLCHAIN/llvm-strip" \
         ./configure --host=aarch64-linux-android --prefix="$PREFIX" \
