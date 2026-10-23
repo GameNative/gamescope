@@ -120,6 +120,9 @@ jobs:
       - name: Build Xwayland
         working-directory: xserver
         run: |
+          # xkbcomp links against the prefix's X11 headers, and the prefix's own
+          # pkg-config files no longer name their include root.
+          export CPPFLAGS="-I$HOME/termuxfs/aarch64/data/data/com.termux/files/usr/include"
           bash android/build-xwayland.sh
           DESTDIR=/tmp/xwayland-stage ninja -C build-android install
           cp /tmp/xwayland-stage/data/user/0/app.gamenative/files/gamescope/lib/pkgconfig/xwayland.pc \
