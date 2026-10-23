@@ -120,7 +120,7 @@ jobs:
             --prefix=/tmp/host-wayland -Ddocumentation=false -Dtests=false
           ninja -C /tmp/wayland-1.24.0/build install
           sudo ln -sf /tmp/host-wayland/bin/wayland-scanner /usr/bin/wayland-scanner
-          sudo cp /tmp/host-wayland/lib/pkgconfig/wayland-scanner.pc \
+          sudo cp "$(find /tmp/host-wayland -name wayland-scanner.pc | head -1)" \
             /usr/lib/x86_64-linux-gnu/pkgconfig/wayland-scanner.pc
           wayland-scanner --version
 
