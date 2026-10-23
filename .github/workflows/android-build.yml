@@ -108,6 +108,22 @@ jobs:
           cp /tmp/xwayland-stage/data/user/0/app.gamenative/files/gamescope/lib/pkgconfig/xwayland.pc \
             "$HOME/termuxfs/aarch64/data/data/com.termux/files/usr/lib/pkgconfig/"
 
+      # wlroots requires a build-machine wayland-scanner of 1.24 or newer, and
+      # the runner image ships 1.22.
+      - name: Install a current wayland-scanner
+        run: |
+          sudo apt-get install -y libffi-dev
+          curl -fsSL -o /tmp/wayland.tar.xz \
+            https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.24.0/downloads/wayland-1.24.0.tar.xz
+          tar -xf /tmp/wayland.tar.xz -C /tmp
+          meson setup /tmp/wayland-1.24.0/build --prefix=/tmp/host-wayland \
+            -Ddocumentation=false -Dtests=false
+          ninja -C /tmp/wayland-1.24.0/build install
+          sudo ln -sf /tmp/host-wayland/bin/wayland-scanner /usr/bin/wayland-scanner
+          sudo cp /tmp/host-wayland/lib/pkgconfig/wayland-scanner.pc \
+            /usr/lib/x86_64-linux-gnu/pkgconfig/wayland-scanner.pc
+          wayland-scanner --version
+
       - name: Cache ccache
         uses: actions/cache@v4
         with:
