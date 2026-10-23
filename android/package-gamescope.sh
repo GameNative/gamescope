@@ -443,8 +443,8 @@ echo "bins: $(ls "$STAGE/bin" | tr '\n' ' ')"
 echo "libs: $(ls "$STAGE/lib" | wc -l) files"
 ls -lh "$OUT_ASSETS/$ASSET_NAME" "$OUT_JNILIBS/libgamenative_drm.so"
 echo
-echo "NOTE: XServerScreen.kt hardcodes the dated asset name (pulseaudio pattern)."
-grep -oE "gamescope-gamenative-[0-9a-z]*\.tzst" \
-    "$GN_DIR/app/src/main/java/app/gamenative/ui/screen/xserver/XServerScreen.kt" \
+echo "NOTE: GamescopePayload.kt names the archive this build must match."
+grep -oE "gamescope-gamenative-[0-9a-zA-Z._-]*\.tzst" \
+    "$GN_DIR/app/src/main/java/app/gamenative/display/GamescopePayload.kt" \
     | sort -u || true
-echo "If that differs from $ASSET_NAME, update refreshComponentsFiles."
+echo "If that differs from $ASSET_NAME, update GamescopePayload.VERSION."
