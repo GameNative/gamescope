@@ -1,0 +1,128 @@
+# Cross-compiles Android gamescope for aarch64-linux-android. A test build:
+# nothing is packaged or uploaded.
+#
+# Toolchain and userland setup mirror proton-wine: NDK r27d plus the prebuilt
+# Termux tree from GameNative/termux-on-gha, which supplies the bionic dev
+# packages (cairo, pixman, lcms2, libdrm, xkbcommon, wayland, X11/xcb,
+# EGL/GLES/GBM, Vulkan) that android/build-gamescope.sh links against.
+#
+# Xwayland is built first because wlroots resolves its xwayland dependency
+# from the xwayland.pc that build installs.
+name: Android build (test)
+
+on:
+  pull_request:
+    paths:
+      - 'android/**'
+      - 'src/**'
+      - 'meson.build'
+      - 'subprojects/**'
+      - '.github/workflows/android-build.yml'
+  workflow_dispatch:
+
+jobs:
+  gamescope:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up build environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            autoconf \
+            automake \
+            libtool \
+            pkg-config \
+            meson \
+            ninja-build \
+            python3 \
+            ccache \
+            wget \
+            unzip \
+            libwayland-bin \
+            glslang-tools
+
+      - name: Cache termuxfs download
+        uses: actions/cache@v4
+        with:
+          path: ~/termuxfs-aarch64.tar
+          key: termuxfs-build-20260218
+
+      - name: Download and extract termuxfs
+        run: |
+          [ -f "$HOME/termuxfs-aarch64.tar" ] || \
+            wget -O "$HOME/termuxfs-aarch64.tar" \
+              https://github.com/GameNative/termux-on-gha/releases/download/build-20260218/termuxfs-aarch64.tar
+          mkdir -p "$HOME/termuxfs/aarch64"
+          tar -xf "$HOME/termuxfs-aarch64.tar" -C "$HOME/termuxfs/aarch64"
+
+      - name: Cache Android NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ~/Android/Sdk/ndk/27.3.13750724
+          key: android-ndk-r27d
+
+      - name: Set up Android NDK
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/Android/Sdk/ndk"
+          cd "$HOME/Android/Sdk/ndk"
+          wget https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q android-ndk-r27d-linux.zip
+          mv android-ndk-r27d 27.3.13750724
+
+      # wayland-protocols (>= 1.47 for wlroots), libXres, libxkbfile,
+      # xcb-util-wm, luajit and hwdata are not in the termux tree.
+      - name: Install the missing build dependencies
+        run: bash android/ci/termux-prefix.sh
+
+      # wlroots' xwayland dependency resolves from xwayland.pc, which the
+      # Xwayland build installs.
+      - name: Check out Xwayland
+        uses: actions/checkout@v4
+        with:
+          repository: GameNative/xserver
+          ref: gamenative
+          path: xserver
+
+      - name: Build Xwayland
+        working-directory: xserver
+        run: |
+          bash android/build-xwayland.sh
+          DESTDIR=/tmp/xwayland-stage ninja -C build-android install
+          cp /tmp/xwayland-stage/data/user/0/app.gamenative/files/gamescope/lib/pkgconfig/xwayland.pc \
+            "$HOME/termuxfs/aarch64/data/data/com.termux/files/usr/lib/pkgconfig/"
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-gamescope-${{ github.sha }}
+          restore-keys: |
+            ccache-gamescope-
+
+      - name: Configure
+        run: bash android/build-gamescope.sh --clean --setup-only
+
+      - name: Build
+        run: bash android/build-gamescope.sh
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s || true
+
