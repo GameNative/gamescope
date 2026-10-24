@@ -1,0 +1,461 @@
+A46 — composite through a storage shadow when the scan-out modifier cannot be a storage image
+
+gamescope writes its composite straight into the flippable scan-out image,
+so the DRM backend only accepts a primary-plane format whose DRM modifier
+offers sampled, storage and transfer-src support. The PowerVR driver on the
+Pixel 10 (24.3) offers no such modifier for any of XRGB2101010, XBGR2101010
+or XRGB8888 with the LINEAR modifier the gamenative-drm daemon scans out,
+so drm_initialize failed with "Primary plane doesn't support any formats
+>= 8888" and gamescope died.
+
+When the first pick finds nothing, the backend logs each plane format's
+optimal, linear and per-modifier tiling features, picks again asking only
+for transfer-dst and blit-dst from the modifier plus a storage-capable
+shadow format, and sets g_bOutputStorageShadow. The shadow format is the
+scan-out format itself when its optimal tiling can be a storage image, else
+the same layout with red and blue swapped, which is blitted rather than
+copied into the scan-out image (the PowerVR driver has storage only on
+RGBA8, never on BGRA8, while the daemon's pool is BGRA: XRGB8888 scan-out,
+XBGR8888 shadow, one blit). XBGR8888/ABGR8888 is also the last pair tried
+for the primary and overlay planes, and the no-overlay mapping knows them. The output images are
+then created as plain copy destinations and each gets an optimal-tiled
+shadow with the storage, sampled and transfer-src usage; vulkan_composite
+targets the shadow and copies it into the scan-out image on the same
+command buffer, so the present-layout and foreign-queue barriers on the
+scan-out image stay as they were. Drivers where the first pick succeeds
+take the old path unchanged.
+
+--- a/src/Backends/DRMBackend.cpp
++++ b/src/Backends/DRMBackend.cpp
+@@ -719,9 +719,14 @@ static bool get_plane_formats( struct drm_t *drm, gamescope::CDRMPlane *pPlane,
+ 	return true;
+ }
+ 
+-static uint32_t pick_plane_format( const struct wlr_drm_format_set *formats, uint32_t Xformat, uint32_t Aformat )
++// What the composite shaders need from the image they write; without it the
++// output goes through a storage shadow and the scan-out image only has to be
++// a copy destination (g_bOutputStorageShadow).
++static constexpr VkFormatFeatureFlags k_uScanoutStorageFeatures = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
++static constexpr VkFormatFeatureFlags k_uScanoutCopyFeatures = VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
++
++static uint32_t pick_plane_format( const struct wlr_drm_format_set *formats, uint32_t Xformat, uint32_t Aformat, VkFormatFeatureFlags neededFeatures, bool bNeedsStorageShadow = false )
+ {
+-	const VkFormatFeatureFlags neededFeatures = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+ 	uint32_t result = DRM_FORMAT_INVALID;
+ 	for ( size_t i = 0; i < formats->len; i++ ) {
+ 		uint32_t fmt = formats->formats[i].format;
+@@ -730,6 +735,11 @@ static uint32_t pick_plane_format( const struct wlr_drm_format_set *formats, uin
+ 		if ( !vulkan_format_supports_features( DRMFormatToVulkan(fmt, false), neededFeatures ) )
+ 			continue;
+ 
++		// The composite shaders write an optimal-tiled shadow that is copied or
++		// blitted into this format, so a storage-capable shadow format must exist.
++		if ( bNeedsStorageShadow && vulkan_storage_shadow_format( fmt ) == DRM_FORMAT_INVALID )
++			continue;
++
+ 		if ( fmt == Xformat ) {
+ 			// Prefer formats without alpha channel for main plane
+ 			result = fmt;
+@@ -740,6 +750,27 @@ static uint32_t pick_plane_format( const struct wlr_drm_format_set *formats, uin
+ 	return result;
+ }
+ 
++static uint32_t pick_primary_format( const struct wlr_drm_format_set *formats, VkFormatFeatureFlags neededFeatures, bool bNeedsStorageShadow = false )
++{
++	// Pick a 10-bit format at first for our composition buffer, for a couple of reasons:
++	//
++	// 1. Many game engines automatically render to 10-bit formats such as UE4 which means
++	// that when we have to composite, we can keep the same HW dithering that we would get if
++	// we just scanned them out directly.
++	//
++	// 2. When compositing HDR content as a fallback when we undock, it avoids introducing
++	// a bunch of horrible banding when going to G2.2 curve.
++	// It ensures that we can dither that.
++	uint32_t uFormat = pick_plane_format( formats, DRM_FORMAT_XRGB2101010, DRM_FORMAT_ARGB2101010, neededFeatures, bNeedsStorageShadow );
++	if ( uFormat == DRM_FORMAT_INVALID )
++		uFormat = pick_plane_format( formats, DRM_FORMAT_XBGR2101010, DRM_FORMAT_ABGR2101010, neededFeatures, bNeedsStorageShadow );
++	if ( uFormat == DRM_FORMAT_INVALID )
++		uFormat = pick_plane_format( formats, DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888, neededFeatures, bNeedsStorageShadow );
++	if ( uFormat == DRM_FORMAT_INVALID )
++		uFormat = pick_plane_format( formats, DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR8888, neededFeatures, bNeedsStorageShadow );
++	return uFormat;
++}
++
+ /* Pick a primary plane that can be connected to the chosen CRTC. */
+ static gamescope::CDRMPlane *find_primary_plane(struct drm_t *drm)
+ {
+@@ -1665,34 +1696,31 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
+ 		return false;
+ 	}
+ 
+-	// Pick a 10-bit format at first for our composition buffer, for a couple of reasons:
+-	//
+-	// 1. Many game engines automatically render to 10-bit formats such as UE4 which means
+-	// that when we have to composite, we can keep the same HW dithering that we would get if
+-	// we just scanned them out directly.
+-	//
+-	// 2. When compositing HDR content as a fallback when we undock, it avoids introducing
+-	// a bunch of horrible banding when going to G2.2 curve.
+-	// It ensures that we can dither that.
+-	g_nDRMFormat = pick_plane_format(&drm->primary_formats, DRM_FORMAT_XRGB2101010, DRM_FORMAT_ARGB2101010);
++	g_nDRMFormat = pick_primary_format(&drm->primary_formats, k_uScanoutStorageFeatures);
+ 	if ( g_nDRMFormat == DRM_FORMAT_INVALID ) {
+-		g_nDRMFormat = pick_plane_format(&drm->primary_formats, DRM_FORMAT_XBGR2101010, DRM_FORMAT_ABGR2101010);
++		for ( size_t i = 0; i < drm->primary_formats.len; i++ )
++			vulkan_log_format_modifiers( drm->primary_formats.formats[i].format );
++		g_nDRMFormat = pick_primary_format(&drm->primary_formats, k_uScanoutCopyFeatures, true);
+ 		if ( g_nDRMFormat == DRM_FORMAT_INVALID ) {
+-			g_nDRMFormat = pick_plane_format(&drm->primary_formats, DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888);
+-			if ( g_nDRMFormat == DRM_FORMAT_INVALID ) {
+-				drm_log.errorf("Primary plane doesn't support any formats >= 8888");
+-				return false;
+-			}
++			drm_log.errorf("Primary plane doesn't support any formats >= 8888");
++			return false;
+ 		}
++		g_bOutputStorageShadow = true;
++		drm_log.infof("no primary plane format can be a storage image on this driver; compositing through a storage shadow and copying into the scan-out image (%c%c%c%c)",
++			char( g_nDRMFormat & 0xff ), char( ( g_nDRMFormat >> 8 ) & 0xff ), char( ( g_nDRMFormat >> 16 ) & 0xff ), char( ( g_nDRMFormat >> 24 ) & 0xff ));
+ 	}
+ 
++	const VkFormatFeatureFlags uOverlayFeatures = g_bOutputStorageShadow ? k_uScanoutCopyFeatures : k_uScanoutStorageFeatures;
++	const bool bOverlayShadow = g_bOutputStorageShadow;
+ 	if (have_overlay_planes(drm)) {
+ 		// ARGB8888 is the Xformat and AFormat here in this function as we want transparent overlay
+-		g_nDRMFormatOverlay = pick_plane_format(&drm->formats, DRM_FORMAT_ARGB2101010, DRM_FORMAT_ARGB2101010);
++		g_nDRMFormatOverlay = pick_plane_format(&drm->formats, DRM_FORMAT_ARGB2101010, DRM_FORMAT_ARGB2101010, uOverlayFeatures, bOverlayShadow);
+ 		if ( g_nDRMFormatOverlay == DRM_FORMAT_INVALID ) {
+-			g_nDRMFormatOverlay = pick_plane_format(&drm->formats, DRM_FORMAT_ABGR2101010, DRM_FORMAT_ABGR2101010);
++			g_nDRMFormatOverlay = pick_plane_format(&drm->formats, DRM_FORMAT_ABGR2101010, DRM_FORMAT_ABGR2101010, uOverlayFeatures, bOverlayShadow);
+ 			if ( g_nDRMFormatOverlay == DRM_FORMAT_INVALID ) {
+-				g_nDRMFormatOverlay = pick_plane_format(&drm->formats, DRM_FORMAT_ARGB8888, DRM_FORMAT_ARGB8888);
++				g_nDRMFormatOverlay = pick_plane_format(&drm->formats, DRM_FORMAT_ARGB8888, DRM_FORMAT_ARGB8888, uOverlayFeatures, bOverlayShadow);
++				if ( g_nDRMFormatOverlay == DRM_FORMAT_INVALID )
++					g_nDRMFormatOverlay = pick_plane_format(&drm->formats, DRM_FORMAT_ABGR8888, DRM_FORMAT_ABGR8888, uOverlayFeatures, bOverlayShadow);
+ 				if ( g_nDRMFormatOverlay == DRM_FORMAT_INVALID ) {
+ 					drm_log.errorf("Overlay plane doesn't support any formats >= 8888");
+ 					return false;
+@@ -1713,7 +1741,12 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
+ 		case DRM_FORMAT_ARGB8888:
+ 			g_nDRMFormatOverlay = DRM_FORMAT_ARGB8888;
+ 			break;
++		case DRM_FORMAT_XBGR8888:
++		case DRM_FORMAT_ABGR8888:
++			g_nDRMFormatOverlay = DRM_FORMAT_ABGR8888;
++			break;
+ 		default:
++			drm_log.errorf("no overlay format for primary format 0x%08x", g_nDRMFormat);
+ 			return false;
+ 		}
+ 	}
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -59,6 +59,7 @@
+ 
+ extern bool g_bWasPartialComposite;
+ extern bool g_bAllowDeferredBackend;
++bool g_bOutputStorageShadow = false;
+ 
+ static constexpr mat3x4 g_rgb2yuv_srgb_to_bt601_limited = {{
+   { 0.257f, 0.504f, 0.098f, 0.0625f },
+@@ -2478,6 +2479,34 @@ void CVulkanCmdBuffer::copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::R
+ 	m_textureRefs.emplace_back(std::move(dst));
+ }
+ 
++void CVulkanCmdBuffer::blitImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst)
++{
++	assert(src->width() == dst->width());
++	assert(src->height() == dst->height());
++	prepareSrcImage(src.get());
++	prepareDestImage(dst.get());
++	insertBarrier();
++
++	VkImageBlit region = {
++		.srcSubresource = {
++			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++			.layerCount = 1
++		},
++		.srcOffsets = { { 0, 0, 0 }, { int32_t( src->width() ), int32_t( src->height() ), 1 } },
++		.dstSubresource = {
++			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++			.layerCount = 1
++		},
++		.dstOffsets = { { 0, 0, 0 }, { int32_t( dst->width() ), int32_t( dst->height() ), 1 } },
++	};
++
++	m_device->vk.CmdBlitImage(m_cmdBuffer, src->vkImage(), VK_IMAGE_LAYOUT_GENERAL, dst->vkImage(), VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_NEAREST);
++
++	markDirty(dst.get());
++	m_textureRefs.emplace_back(std::move(src));
++	m_textureRefs.emplace_back(std::move(dst));
++}
++
+ void CVulkanCmdBuffer::copyBufferToImage(VkBuffer buffer, VkDeviceSize offset, uint32_t stride, gamescope::Rc<CVulkanTexture> dst)
+ {
+ 	prepareDestImage(dst.get());
+@@ -3949,13 +3978,29 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
+ {
+ 	CVulkanTexture::createFlags outputImageflags;
+ 	outputImageflags.bFlippable = true;
+-	outputImageflags.bStorage = true;
+-	outputImageflags.bTransferSrc = true; // for screenshots
+-	outputImageflags.bSampled = true; // for pipewire blits
+ 	outputImageflags.bOutputImage = true;
++	if ( g_bOutputStorageShadow )
++	{
++		// The scan-out modifier cannot be a storage image here: the shadow
++		// is the compute target and the flippable image only receives a copy.
++		outputImageflags.bTransferDst = true;
++	}
++	else
++	{
++		outputImageflags.bStorage = true;
++		outputImageflags.bTransferSrc = true; // for screenshots
++		outputImageflags.bSampled = true; // for pipewire blits
++	}
++
++	CVulkanTexture::createFlags shadowImageFlags;
++	shadowImageFlags.bStorage = true;
++	shadowImageFlags.bTransferSrc = true;
++	shadowImageFlags.bSampled = true;
+ 
+ 	pOutput->outputImages.resize(3); // extra image for partial composition.
+ 	pOutput->outputImagesPartialOverlay.resize(3);
++	pOutput->outputShadowImages.resize(3);
++	pOutput->outputShadowImagesPartialOverlay.resize(3);
+ 
+ 	pOutput->outputImages[0] = nullptr;
+ 	pOutput->outputImages[1] = nullptr;
+@@ -3963,6 +4008,12 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
+ 	pOutput->outputImagesPartialOverlay[0] = nullptr;
+ 	pOutput->outputImagesPartialOverlay[1] = nullptr;
+ 	pOutput->outputImagesPartialOverlay[2] = nullptr;
++	pOutput->outputShadowImages[0] = nullptr;
++	pOutput->outputShadowImages[1] = nullptr;
++	pOutput->outputShadowImages[2] = nullptr;
++	pOutput->outputShadowImagesPartialOverlay[0] = nullptr;
++	pOutput->outputShadowImagesPartialOverlay[1] = nullptr;
++	pOutput->outputShadowImagesPartialOverlay[2] = nullptr;
+ 
+ 	uint32_t uDRMFormat = pOutput->uOutputFormat;
+ 
+@@ -3996,6 +4047,27 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
+ 		return false;
+ 	}
+ 
++	if ( g_bOutputStorageShadow )
++	{
++		const uint32_t uShadowFormat = vulkan_storage_shadow_format( uDRMFormat );
++		if ( uShadowFormat == DRM_FORMAT_INVALID )
++		{
++			vk_log.errorf( "no storage-capable shadow format for the KMS buffer format 0x%08x", uDRMFormat );
++			return false;
++		}
++		for ( uint32_t i = 0; i < 3; i++ )
++		{
++			pOutput->outputShadowImages[i] = new CVulkanTexture();
++			if ( !pOutput->outputShadowImages[i]->BInit( uOutputWidth, uOutputHeight, 1u, uShadowFormat, shadowImageFlags ) )
++			{
++				vk_log.errorf( "failed to allocate the storage shadow of the KMS buffer" );
++				return false;
++			}
++		}
++		vk_log.infof( "compositing into storage shadow images (format 0x%08x, %s); the scan-out images (0x%08x) receive a %s",
++			uShadowFormat, uShadowFormat == uDRMFormat ? "same layout" : "red/blue swapped", uDRMFormat, uShadowFormat == uDRMFormat ? "copy" : "blit" );
++	}
++
+ 	// Oh no.
+ 	pOutput->temporaryHackyBlankImage = vulkan_create_debug_blank_texture();
+ 
+@@ -4026,6 +4098,25 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
+ 			vk_log.errorf( "failed to allocate buffer for KMS" );
+ 			return false;
+ 		}
++
++		if ( g_bOutputStorageShadow )
++		{
++			const uint32_t uShadowFormat = vulkan_storage_shadow_format( uPartialDRMFormat );
++			if ( uShadowFormat == DRM_FORMAT_INVALID )
++			{
++				vk_log.errorf( "no storage-capable shadow format for the partial KMS buffer format 0x%08x", uPartialDRMFormat );
++				return false;
++			}
++			for ( uint32_t i = 0; i < 3; i++ )
++			{
++				pOutput->outputShadowImagesPartialOverlay[i] = new CVulkanTexture();
++				if ( !pOutput->outputShadowImagesPartialOverlay[i]->BInit( uOutputWidth, uOutputHeight, 1u, uShadowFormat, shadowImageFlags ) )
++				{
++					vk_log.errorf( "failed to allocate the storage shadow of the partial KMS buffer" );
++					return false;
++				}
++			}
++		}
+ 	}
+ 
+ 	return true;
+@@ -4951,10 +5042,18 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
+ 		return std::nullopt;
+ 
+ 	gamescope::Rc<CVulkanTexture> compositeImage;
++	gamescope::Rc<CVulkanTexture> pScanoutImage;
+ 	if ( pOutputOverride )
+ 		compositeImage = pOutputOverride;
+ 	else
++	{
+ 		compositeImage = partial ? g_output.outputImagesPartialOverlay[ g_output.nOutImage ] : g_output.outputImages[ g_output.nOutImage ];
++		if ( g_bOutputStorageShadow )
++		{
++			pScanoutImage = compositeImage;
++			compositeImage = partial ? g_output.outputShadowImagesPartialOverlay[ g_output.nOutImage ] : g_output.outputShadowImages[ g_output.nOutImage ];
++		}
++	}
+ 
+ 	// Overrides (screenshots, upscale cache) are logical-sized, so never rotated.
+ 	const uint32_t uOutputRotation = pOutputOverride ? 0u : g_uOutputRotation;
+@@ -5175,6 +5274,14 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
+ 		CompositeTimingEnd( cmdBuffer.get(), *oTimingSlot, pszKey, pszKeyPre, pszKeyPost );
+ 	}
+ 
++	if ( pScanoutImage )
++	{
++		if ( compositeImage->format() == pScanoutImage->format() )
++			cmdBuffer->copyImage( compositeImage, pScanoutImage );
++		else
++			cmdBuffer->blitImage( compositeImage, pScanoutImage );
++	}
++
+ 	uint64_t sequence = g_device.submit(std::move(cmdBuffer));
+ 	if ( oTimingSlot )
+ 		g_CompositeTiming.pending.back().ulSeqNo = sequence;
+@@ -5233,6 +5340,84 @@ bool vulkan_format_supports_features(VkFormat format, VkFormatFeatureFlags featu
+ 	return false;
+ }
+ 
++bool vulkan_format_supports_optimal_features(VkFormat format, VkFormatFeatureFlags features)
++{
++	VkFormatProperties formatProps = {};
++	g_device.vk.GetPhysicalDeviceFormatProperties( g_device.physDev(), format, &formatProps );
++	return ( formatProps.optimalTilingFeatures & features ) == features;
++}
++
++static uint32_t DRMFormatSwapRedBlue( uint32_t drmFormat )
++{
++	switch ( drmFormat )
++	{
++		case DRM_FORMAT_XRGB8888: return DRM_FORMAT_XBGR8888;
++		case DRM_FORMAT_XBGR8888: return DRM_FORMAT_XRGB8888;
++		case DRM_FORMAT_ARGB8888: return DRM_FORMAT_ABGR8888;
++		case DRM_FORMAT_ABGR8888: return DRM_FORMAT_ARGB8888;
++		case DRM_FORMAT_XRGB2101010: return DRM_FORMAT_XBGR2101010;
++		case DRM_FORMAT_XBGR2101010: return DRM_FORMAT_XRGB2101010;
++		case DRM_FORMAT_ARGB2101010: return DRM_FORMAT_ABGR2101010;
++		case DRM_FORMAT_ABGR2101010: return DRM_FORMAT_ARGB2101010;
++		default: return DRM_FORMAT_INVALID;
++	}
++}
++
++uint32_t vulkan_storage_shadow_format(uint32_t drmFormat)
++{
++	const VkFormatFeatureFlags uShadowFeatures = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
++	VkFormat format = DRMFormatToVulkan( drmFormat, false );
++	if ( format != VK_FORMAT_UNDEFINED && vulkan_format_supports_optimal_features( format, uShadowFeatures ) )
++		return drmFormat;
++
++	uint32_t uSwapped = DRMFormatSwapRedBlue( drmFormat );
++	VkFormat swapped = DRMFormatToVulkan( uSwapped, false );
++	if ( swapped != VK_FORMAT_UNDEFINED && vulkan_format_supports_optimal_features( swapped, uShadowFeatures | VK_FORMAT_FEATURE_BLIT_SRC_BIT ) )
++		return uSwapped;
++
++	return DRM_FORMAT_INVALID;
++}
++
++void vulkan_log_format_modifiers(uint32_t drmFormat)
++{
++	const char szFourcc[5] = { char( drmFormat & 0xff ), char( ( drmFormat >> 8 ) & 0xff ), char( ( drmFormat >> 16 ) & 0xff ), char( ( drmFormat >> 24 ) & 0xff ), 0 };
++	VkFormat format = DRMFormatToVulkan( drmFormat, false );
++	if ( format == VK_FORMAT_UNDEFINED )
++	{
++		vk_log.infof( "plane format %s: no Vulkan format", szFourcc );
++		return;
++	}
++
++	VkDrmFormatModifierPropertiesListEXT modifierPropList = {
++		.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
++	};
++	VkFormatProperties2 formatProps = {
++		.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
++		.pNext = g_device.supportsModifiers() ? &modifierPropList : nullptr,
++	};
++	g_device.vk.GetPhysicalDeviceFormatProperties2( g_device.physDev(), format, &formatProps );
++
++	std::vector<VkDrmFormatModifierPropertiesEXT> modifierProps( modifierPropList.drmFormatModifierCount );
++	if ( modifierPropList.drmFormatModifierCount )
++	{
++		modifierPropList.pDrmFormatModifierProperties = modifierProps.data();
++		g_device.vk.GetPhysicalDeviceFormatProperties2( g_device.physDev(), format, &formatProps );
++	}
++
++	char szMods[ 1024 ] = {};
++	size_t uOff = 0;
++	for ( const auto &mod : modifierProps )
++	{
++		if ( uOff >= sizeof( szMods ) - 1 )
++			break;
++		uOff += snprintf( szMods + uOff, sizeof( szMods ) - uOff, " 0x%" PRIx64 ":features=0x%x,planes=%u",
++			mod.drmFormatModifier, mod.drmFormatModifierTilingFeatures, mod.drmFormatModifierPlaneCount );
++	}
++	vk_log.infof( "plane format %s (vk %u): optimal=0x%x linear=0x%x modifiers=%u%s",
++		szFourcc, uint32_t( format ), formatProps.formatProperties.optimalTilingFeatures,
++		formatProps.formatProperties.linearTilingFeatures, modifierPropList.drmFormatModifierCount, szMods );
++}
++
+ gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool defer )
+ {
+ 	// Get previous image ( +2 )
+--- a/src/rendervulkan.hpp
++++ b/src/rendervulkan.hpp
+@@ -591,6 +591,10 @@ struct VulkanOutput_t
+ 	uint32_t nOutImage; // swapchain index in nested mode, or ping/pong between two RTs
+ 	std::vector<gamescope::OwningRc<CVulkanTexture>> outputImages;
+ 	std::vector<gamescope::OwningRc<CVulkanTexture>> outputImagesPartialOverlay;
++	// Storage-capable copies of the output images on drivers whose scan-out
++	// modifier cannot be a storage image (g_bOutputStorageShadow).
++	std::vector<gamescope::OwningRc<CVulkanTexture>> outputShadowImages;
++	std::vector<gamescope::OwningRc<CVulkanTexture>> outputShadowImagesPartialOverlay;
+ 	gamescope::OwningRc<CVulkanTexture> temporaryHackyBlankImage;
+ 
+ 	uint32_t uOutputFormat = DRM_FORMAT_INVALID;
+@@ -743,6 +747,7 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
+ 	VK_FUNC(CmdClearColorImage) \
+ 	VK_FUNC(CmdCopyBufferToImage) \
+ 	VK_FUNC(CmdCopyImage) \
++	VK_FUNC(CmdBlitImage) \
+ 	VK_FUNC(CmdDispatch) \
+ 	VK_FUNC(CmdDraw) \
+ 	VK_FUNC(CmdEndRendering) \
+@@ -1054,6 +1059,7 @@ public:
+ 	void bindPipeline(VkPipeline pipeline);
+ 	void dispatch(uint32_t x, uint32_t y = 1, uint32_t z = 1);
+ 	void copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst);
++	void blitImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst);
+ 	void copyBufferToImage(VkBuffer buffer, VkDeviceSize offset, uint32_t stride, gamescope::Rc<CVulkanTexture> dst);
+ 
+ 
+@@ -1118,5 +1124,17 @@ void vulkan_wait_idle();
+ bool vulkan_has_drm_props();
+ 
+ bool vulkan_format_supports_features(VkFormat format, VkFormatFeatureFlags features);
++bool vulkan_format_supports_optimal_features(VkFormat format, VkFormatFeatureFlags features);
++// The DRM format of the optimal-tiled storage shadow for a scan-out format:
++// the format itself when its optimal tiling can be a storage image, else the
++// same layout with red and blue swapped (the shadow is then blitted, not
++// copied), else DRM_FORMAT_INVALID.
++uint32_t vulkan_storage_shadow_format(uint32_t drmFormat);
++void vulkan_log_format_modifiers(uint32_t drmFormat);
++
++// Set by the backend when no scan-out format has a modifier with storage,
++// sampled and transfer-src support: compositing then targets an optimal-tiled
++// shadow image that is copied into the flippable image.
++extern bool g_bOutputStorageShadow;
+ 
+ extern CVulkanDevice g_device;

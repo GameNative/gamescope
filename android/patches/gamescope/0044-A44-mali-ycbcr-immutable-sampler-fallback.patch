@@ -1,0 +1,349 @@
+A44 — fall back to a layout without immutable YCbCr samplers
+
+Binding 4 of the composite descriptor set carries 16 immutable YCbCr samplers.
+The Arm driver r38p1 on Mali-G68 (Galaxy A35) accepts the conversion, the
+sampler, the set layout and the pipeline layout, and then returns
+VK_ERROR_INITIALIZATION_FAILED from vkCreateComputePipelines for every real
+composite shader on that layout: 141 of 144 precompiled pipelines fail. The same
+BLIT shader compiles with binding 4 declared without immutable samplers, and
+trivial shaders compile with the full layout, so the immutable samplers are the
+trigger. The failed pipelines were then bound as VK_NULL_HANDLE and the session
+crashed.
+
+After the shaders are created, and before the descriptor sets are allocated and
+the pipeline thread starts, compile the first precompiled variant (BLIT, one
+layer, no YCbCr, one blur layer) once. If it compiles it is destroyed and
+nothing else changes, so Adreno and the Mali drivers that already work keep the
+existing path. If it fails, rebuild the set layout and the pipeline layout with
+binding 4 as plain combined image samplers and write the regular sampler into
+those descriptors at dispatch. GAMESCOPE_MALI_NO_IMMUTABLE_YCBCR=1 forces the
+fallback layout.
+
+A pipeline that still failed to compile is no longer bound: the bind and the
+dispatch are skipped and the missing key is logged (the first 32 times, then
+every 600th). The precompile logs its ok/failed totals, and if the first BLIT
+variant is still missing gamescope exits with status 86 instead of drawing
+nothing. Each failed vkCreateComputePipelines logs the full variant key, and the
+device name, driver and descriptor limits are logged once at device creation.
+
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -154,6 +154,23 @@
+ 	vk_log.errorf("%s (VkResult: %d)", buf, result);
+ }
+ 
++static const char *shaderTypeName(ShaderType type)
++{
++	switch (type)
++	{
++		case SHADER_TYPE_BLIT: return "BLIT";
++		case SHADER_TYPE_BLUR: return "BLUR";
++		case SHADER_TYPE_BLUR_COND: return "BLUR_COND";
++		case SHADER_TYPE_BLUR_FIRST_PASS: return "BLUR_FIRST_PASS";
++		case SHADER_TYPE_EASU: return "EASU";
++		case SHADER_TYPE_RCAS: return "RCAS";
++		case SHADER_TYPE_NIS: return "NIS";
++		case SHADER_TYPE_RGB_TO_NV12: return "RGB_TO_NV12";
++		case SHADER_TYPE_SGSR: return "SGSR";
++		default: return "UNKNOWN";
++	}
++}
++
+ // For when device is up and it would be totally fatal to fail
+ #define vk_check( x ) \
+ 	do \
+@@ -315,6 +332,8 @@
+ 	if (!createPools())
+ 		return false;
+ 	if (!createShaders())
++		return false;
++	if (!ensureUsableLayouts())
+ 		return false;
+ 	if (!createScratchResources())
+ 		return false;
+@@ -538,6 +557,8 @@
+ 		m_uVendorID = deviceProperties.vendorID;
+ 	}
+ 
++	logDeviceLimits();
++
+ 	float queuePriorities = 1.0f;
+ 
+ 	VkDeviceQueueGlobalPriorityCreateInfoEXT queueCreateInfoEXT = {
+@@ -755,6 +776,12 @@
+ 
+ bool CVulkanDevice::createLayouts()
+ {
++	if ( !m_bNoImmutableYcbcr && env_to_bool( getenv( "GAMESCOPE_MALI_NO_IMMUTABLE_YCBCR" ) ) )
++	{
++		m_bNoImmutableYcbcr = true;
++		vk_log.infof( "GAMESCOPE_MALI_NO_IMMUTABLE_YCBCR is set; building the descriptor set layout without immutable YCbCr samplers" );
++	}
++
+ 	VkFormatProperties nv12Properties;
+ 	vk.GetPhysicalDeviceFormatProperties(physDev(), VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, &nv12Properties);
+ 	bool cosited = nv12Properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT;
+@@ -791,6 +818,11 @@
+ 	
+ 	vk.CreateSampler( device(), &ycbcrSamplerInfo, nullptr, &m_ycbcrSampler );
+ 
++	return createDescriptorLayouts();
++}
++
++bool CVulkanDevice::createDescriptorLayouts()
++{
+ 	// Create an array of our ycbcrSampler to fill up
+ 	std::array<VkSampler, VKR_SAMPLER_SLOTS> ycbcrSamplers;
+ 	for (auto& sampler : ycbcrSamplers)
+@@ -826,7 +858,7 @@
+ 			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+ 			.descriptorCount = VKR_SAMPLER_SLOTS,
+ 			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+-			.pImmutableSamplers = ycbcrSamplers.data(),
++			.pImmutableSamplers = m_bNoImmutableYcbcr ? nullptr : ycbcrSamplers.data(),
+ 		},
+ 		VkDescriptorSetLayoutBinding {
+ 			.binding = 5,
+@@ -870,6 +902,30 @@
+ 	}
+ 
+ 	return true;
++}
++
++bool CVulkanDevice::ensureUsableLayouts()
++{
++	if ( m_bNoImmutableYcbcr )
++		return true;
++
++	VkResult res = VK_SUCCESS;
++	VkPipeline probe = compilePipeline( 1, 0, SHADER_TYPE_BLIT, 1, 0, 0, 0, false, &res );
++	if ( probe != VK_NULL_HANDLE )
++	{
++		vk.DestroyPipeline( device(), probe, nullptr );
++		return true;
++	}
++
++	vk_log.errorf( "this driver rejects compute pipelines with immutable YCbCr samplers (VkResult %d); rebuilding the descriptor set layout without them", res );
++
++	vk.DestroyPipelineLayout( device(), m_pipelineLayout, nullptr );
++	vk.DestroyDescriptorSetLayout( device(), m_descriptorSetLayout, nullptr );
++	m_pipelineLayout = VK_NULL_HANDLE;
++	m_descriptorSetLayout = VK_NULL_HANDLE;
++
++	m_bNoImmutableYcbcr = true;
++	return createDescriptorLayouts();
+ }
+ 
+ bool CVulkanDevice::createPools()
+@@ -1175,7 +1231,7 @@
+ 	return ret;
+ }
+ 
+-VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable)
++VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable, VkResult *pResult)
+ {
+ 	const std::array<VkSpecializationMapEntry, 7> specializationEntries = {{
+ 		{
+@@ -1257,8 +1313,12 @@
+ 	VkPipeline result;
+ 
+ 	VkResult res = vk.CreateComputePipelines(device(), VK_NULL_HANDLE, 1, &computePipelineCreateInfo, nullptr, &result);
++	if (pResult)
++		*pResult = res;
+ 	if (res != VK_SUCCESS) {
+-		vk_errorf( res, "vkCreateComputePipelines failed" );
++		vk_log.errorf( "vkCreateComputePipelines failed (VkResult: %d): type=%s(%u) layerCount=%u ycbcrMask=0x%x blurLayers=%u compositeDebug=0x%x colorspaceMask=0x%x outputEOTF=%u itm=%u shaderModule=%s",
++			res, shaderTypeName(type), (uint32_t)type, layerCount, ycbcrMask, blur_layer_count, composite_debug, colorspace_mask, output_eotf, (uint32_t)itm_enable,
++			m_shaderModules[type] != VK_NULL_HANDLE ? "ok" : "NULL" );
+ 		return VK_NULL_HANDLE;
+ 	}
+ 
+@@ -1282,6 +1342,9 @@
+ 	SHADER(SGSR, 1, 1, 1);
+ #undef SHADER
+ 
++	uint32_t compiledOk = 0;
++	uint32_t compiledFailed = 0;
++
+ 	for (auto& info : pipelineInfos) {
+ 		for (uint32_t layerCount = 1; layerCount <= info.layerCount; layerCount++) {
+ 			for (uint32_t ycbcrMask = 0; ycbcrMask < info.ycbcrMask; ycbcrMask++) {
+@@ -1292,20 +1355,86 @@
+ 						continue;
+ 
+ 					VkPipeline newPipeline = compilePipeline(layerCount, ycbcrMask, info.shaderType, blur_layers, info.compositeDebug, info.colorspaceMask, info.outputEOTF, info.itmEnable);
++					if (newPipeline != VK_NULL_HANDLE)
++						compiledOk++;
++					else
++						compiledFailed++;
+ 					{
+ 						std::lock_guard<std::mutex> lock(m_pipelineMutex);
+ 						PipelineInfo_t key = {info.shaderType, layerCount, ycbcrMask, blur_layers, info.compositeDebug};
+ 						if (st.stop_requested()) return;
+ 						auto result = m_pipelineMap.emplace(std::make_pair(key, newPipeline));
+-						if (!result.second)
++						if (!result.second && newPipeline != VK_NULL_HANDLE)
+ 							vk.DestroyPipeline(device(), newPipeline, nullptr);
+ 					}
+ 				}
+ 			}
+ 		}
++	}
++
++	vk_log.infof( "pipeline precompile done: %u ok, %u failed", compiledOk, compiledFailed );
++
++	bool bHaveBlit;
++	{
++		std::lock_guard<std::mutex> lock(m_pipelineMutex);
++		PipelineInfo_t key = {SHADER_TYPE_BLIT, 1, 0, 1, 0};
++		auto search = m_pipelineMap.find(key);
++		bHaveBlit = search != m_pipelineMap.end() && search->second != VK_NULL_HANDLE;
+ 	}
++
++	if ( !bHaveBlit )
++	{
++		vk_log.errorf( "no usable BLIT pipeline (%u of %u precompiled pipelines failed), exiting with status 86", compiledFailed, compiledOk + compiledFailed );
++		fflush( stderr );
++		_exit( 86 );
++	}
+ }
+ 
++void CVulkanDevice::logDeviceLimits()
++{
++	VkPhysicalDeviceDriverProperties driverProps = {
++		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
++	};
++	VkPhysicalDeviceMaintenance3Properties maintenance3Props = {
++		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES,
++		.pNext = &driverProps,
++	};
++	VkPhysicalDeviceProperties2 props2 = {
++		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
++		.pNext = &maintenance3Props,
++	};
++	vk.GetPhysicalDeviceProperties2( physDev(), &props2 );
++	const VkPhysicalDeviceProperties &props = props2.properties;
++	const VkPhysicalDeviceLimits &l = props.limits;
++
++	VkPhysicalDeviceVulkan12Features features12 = {
++		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
++	};
++	VkPhysicalDeviceVulkan11Features features11 = {
++		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
++		.pNext = &features12,
++	};
++	VkPhysicalDeviceFeatures2 features2 = {
++		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
++		.pNext = &features11,
++	};
++	vk.GetPhysicalDeviceFeatures2( physDev(), &features2 );
++
++	vk_log.infof( "limits: device=\"%s\" vendorID=0x%04x deviceID=0x%04x api=%u.%u.%u driverVersion=0x%08x driverID=%d driverName=\"%s\" driverInfo=\"%s\"",
++		props.deviceName, props.vendorID, props.deviceID,
++		VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion), VK_API_VERSION_PATCH(props.apiVersion),
++		props.driverVersion, (int)driverProps.driverID, driverProps.driverName, driverProps.driverInfo );
++	vk_log.infof( "limits: maxPerStageDescriptorSamplers=%u maxPerStageDescriptorSampledImages=%u maxPerStageDescriptorStorageImages=%u maxPerStageDescriptorUniformBuffers=%u maxPerStageResources=%u maxDescriptorSetSamplers=%u maxDescriptorSetSampledImages=%u maxDescriptorSetStorageImages=%u maxBoundDescriptorSets=%u maxPerSetDescriptors=%u maxComputeWorkGroupInvocations=%u maxComputeWorkGroupSize=%ux%ux%u maxComputeSharedMemorySize=%u maxUniformBufferRange=%u",
++		l.maxPerStageDescriptorSamplers, l.maxPerStageDescriptorSampledImages, l.maxPerStageDescriptorStorageImages, l.maxPerStageDescriptorUniformBuffers,
++		l.maxPerStageResources, l.maxDescriptorSetSamplers, l.maxDescriptorSetSampledImages, l.maxDescriptorSetStorageImages, l.maxBoundDescriptorSets,
++		maintenance3Props.maxPerSetDescriptors, l.maxComputeWorkGroupInvocations,
++		l.maxComputeWorkGroupSize[0], l.maxComputeWorkGroupSize[1], l.maxComputeWorkGroupSize[2],
++		l.maxComputeSharedMemorySize, l.maxUniformBufferRange );
++	vk_log.infof( "limits: features scalarBlockLayout=%u samplerYcbcrConversion=%u shaderFloat16=%u shaderInt16=%u uniformBufferStandardLayout=%u shaderStorageImageWriteWithoutFormat=%u",
++		features12.scalarBlockLayout, features11.samplerYcbcrConversion, features12.shaderFloat16, features2.features.shaderInt16,
++		features12.uniformBufferStandardLayout, features2.features.shaderStorageImageWriteWithoutFormat );
++}
++
+ extern bool g_bSteamIsActiveWindow;
+ 
+ VkPipeline CVulkanDevice::pipeline(ShaderType type, uint32_t layerCount, uint32_t ycbcrMask, uint32_t blur_layers, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable)
+@@ -1317,16 +1446,27 @@
+ 	std::lock_guard<std::mutex> lock(m_pipelineMutex);
+ 	PipelineInfo_t key = {type, layerCount, ycbcrMask, blur_layers, effective_debug, colorspace_mask, output_eotf, itm_enable};
+ 	auto search = m_pipelineMap.find(key);
++	VkPipeline result;
+ 	if (search == m_pipelineMap.end())
+ 	{
+-		VkPipeline result = compilePipeline(layerCount, ycbcrMask, type, blur_layers, effective_debug, colorspace_mask, output_eotf, itm_enable);
++		result = compilePipeline(layerCount, ycbcrMask, type, blur_layers, effective_debug, colorspace_mask, output_eotf, itm_enable);
+ 		m_pipelineMap[key] = result;
+-		return result;
+ 	}
+ 	else
+ 	{
+-		return search->second;
++		result = search->second;
++	}
++
++	if (result == VK_NULL_HANDLE)
++	{
++		static uint32_t s_uMissingCount = 0;
++		uint32_t uCount = ++s_uMissingCount;
++		if (uCount <= 32 || uCount % 600 == 0)
++			vk_log.errorf( "pipeline missing at bind (count %u): type=%s(%u) layerCount=%u ycbcrMask=0x%x blurLayers=%u compositeDebug=0x%x colorspaceMask=0x%x outputEOTF=%u itm=%u, skipping the dispatch",
++				uCount, shaderTypeName(type), (uint32_t)type, layerCount, ycbcrMask, blur_layers, effective_debug, colorspace_mask, output_eotf, (uint32_t)itm_enable );
+ 	}
++
++	return result;
+ }
+ 
+ 
+@@ -1756,6 +1896,9 @@
+ 
+ void CVulkanCmdBuffer::bindPipeline(VkPipeline pipeline)
+ {
++	m_bPipelineMissing = pipeline == VK_NULL_HANDLE;
++	if (m_bPipelineMissing)
++		return;
+ 	m_device->vk.CmdBindPipeline(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+ }
+ 
+@@ -1864,6 +2007,8 @@
+ 		imageDescriptors[i].sampler = m_device->sampler(m_samplerState[i]);
+ 		imageDescriptors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+ 		ycbcrImageDescriptors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++		if (m_device->m_bNoImmutableYcbcr)
++			ycbcrImageDescriptors[i].sampler = imageDescriptors[i].sampler;
+ 		if (m_boundTextures[i] == nullptr)
+ 			continue;
+ 
+@@ -1913,6 +2058,9 @@
+ 
+ 	m_device->vk.CmdBindDescriptorSets(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_device->pipelineLayout(), 0, 1, &descriptorSet, 0, nullptr);
+ 
++	if (m_bPipelineMissing)
++		return;
++
+ 	m_device->vk.CmdDispatch(m_cmdBuffer, x, y, z);
+ 
+ 	markDirty(m_target);
+--- a/src/rendervulkan.hpp
++++ b/src/rendervulkan.hpp
+@@ -917,8 +917,11 @@
+ 	bool createPools();
+ 	bool createShaders();
+ 	bool createScratchResources();
+-	VkPipeline compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable);
++	VkPipeline compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable, VkResult *pResult = nullptr);
+ 	void compileAllPipelines(std::stop_token st);
++	bool createDescriptorLayouts();
++	bool ensureUsableLayouts();
++	void logDeviceLimits();
+ 
+ 	VkDevice m_device = nullptr;
+ 	VkPhysicalDevice m_physDev = nullptr;
+@@ -927,6 +930,7 @@
+ 	VkQueue m_generalQueue = nullptr;
+ 	VkSamplerYcbcrConversion m_ycbcrConversion = VK_NULL_HANDLE;
+ 	VkSampler m_ycbcrSampler = VK_NULL_HANDLE;
++	bool m_bNoImmutableYcbcr = false;
+ 	VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
+ 	VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
+ 	VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
+@@ -1072,6 +1076,7 @@
+ 	std::vector<VulkanTimelinePoint_t> m_ExternalSignals;
+ 
+ 	uint32_t m_renderBufferOffset = 0;
++	bool m_bPipelineMissing = false;
+ };
+ 
+ uint32_t VulkanFormatToDRM( VkFormat vkFormat, std::optional<bool> obHasAlphaOverride = std::nullopt );

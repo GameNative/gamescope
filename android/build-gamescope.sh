@@ -112,32 +112,42 @@ if [ "$DO_CLEAN" = 1 ]; then
 fi
 
 # --- 1. patch train -------------------------------------------------------
+# Every patch applied here is recorded in an untracked stamp (name + blob hash),
+# so a second run skips it by the stamp instead of a reverse-apply check: a
+# later patch that edits lines inside an earlier hunk makes that check fail
+# although the tree is right. --clean removes the stamp with the other
+# untracked build state; a patch whose content changed falls back to the
+# apply / reverse-apply checks.
+PATCH_STAMP="$GS_DIR/.gn-patches-applied"
+apply_patch_once() {
+    local p="$1" label="$2"
+    local sig
+    sig="$(basename "$p") $(git -C "$GS_DIR" hash-object "$p")"
+    if [ -f "$PATCH_STAMP" ] && grep -qxF "$sig" "$PATCH_STAMP"; then
+        echo "already applied: $label"
+        return 0
+    fi
+    if git -C "$GS_DIR" apply --check "$p" 2>/dev/null; then
+        git -C "$GS_DIR" apply "$p"
+        echo "applied $label"
+    elif git -C "$GS_DIR" apply -R --check "$p" 2>/dev/null; then
+        echo "already applied: $label"
+    else
+        echo "PATCH DOES NOT APPLY: $p" >&2
+        exit 1
+    fi
+    echo "$sig" >> "$PATCH_STAMP"
+}
 if [ "$SKIP_PATCHES" = 0 ]; then
     for p in "$GS_DIR"/android/patches/gamescope/*.patch; do
-        if git -C "$GS_DIR" apply --check "$p" 2>/dev/null; then
-            git -C "$GS_DIR" apply "$p"
-            echo "applied $(basename "$p")"
-        elif git -C "$GS_DIR" apply -R --check "$p" 2>/dev/null; then
-            echo "already applied: $(basename "$p")"
-        else
-            echo "PATCH DOES NOT APPLY: $p" >&2
-            exit 1
-        fi
+        apply_patch_once "$p" "$(basename "$p")"
     done
     # opt-in diagnostics train (android/patches/diagnostics/) — same apply
     # idiom, on top of the train, only when --include-diagnostics is given.
     if [ "$INCLUDE_DIAGNOSTICS" = 1 ]; then
         for p in "$GS_DIR"/android/patches/diagnostics/*.patch; do
             [ -e "$p" ] || continue
-            if git -C "$GS_DIR" apply --check "$p" 2>/dev/null; then
-                git -C "$GS_DIR" apply "$p"
-                echo "applied diagnostics/$(basename "$p")"
-            elif git -C "$GS_DIR" apply -R --check "$p" 2>/dev/null; then
-                echo "already applied: diagnostics/$(basename "$p")"
-            else
-                echo "PATCH DOES NOT APPLY: $p" >&2
-                exit 1
-            fi
+            apply_patch_once "$p" "diagnostics/$(basename "$p")"
         done
     fi
     # wlroots submodule
