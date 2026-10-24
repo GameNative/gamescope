@@ -45,6 +45,11 @@ DEPS="${GAMESCOPE_TERMUX_PREFIX:-$HOME/termuxfs/aarch64/data/data/com.termux/fil
 # libxml2/libicu). libglvnd's loader/GLES libs and everything else still come
 # from the prefix.
 GN_MESA_GLAMOR_STAGE="${GN_MESA_GLAMOR_STAGE:-$WS_DIR/mesa/build-android-glamor/stage}"
+# macOS writes an AppleDouble "._name" sibling for every file it copies or
+# archives, which lands in the payload as a thousand extra members. BSD cp and
+# tar honour this; on Linux it is inert.
+export COPYFILE_DISABLE=1
+
 DATE="${1:-$(date +%Y%m%d)}"
 ASSET_NAME="gamescope-gamenative-$DATE.tzst"
 OUT_ASSETS="$GN_DIR/app/src/main/assets"
@@ -71,19 +76,41 @@ DMTEST_BIN="$GNDRM_REL/gn-dmabuf-test"
 WSITEST_BIN="$GNDRM_REL/gn-wsi-test"
 XTREE_BIN="$GNDRM_REL/gn-xtree-probe"
 SCALE_BIN="$GNDRM_REL/gn-scaling-mode"
+LSFG_SO="$GNDRM_REL/liblsfg_engine.so"
 
-# --- prerequisites (build whatever is missing) ------------------------------
+# --- prerequisites ----------------------------------------------------------
 [ -x "$GAMESCOPE_BIN" ] || bash "$GS_DIR/android/build-gamescope.sh"
-[ -f "$SHIM_SO" ] || "$GNDRM_DIR/tools/build-shim.sh" android
-# build-android.sh produces the gamenative-drm artifacts (cargo cdylibs + the
-# guest clients, incl. gn-xtree-probe) in one invocation — run it if any is
-# missing.
-for f in "$DRM_SO" "$ICD_SO" "$DMTEST_BIN" "$WSITEST_BIN" "$XTREE_BIN" "$SCALE_BIN"; do
-    [ -f "$f" ] || { "$GNDRM_DIR/tools/build-android.sh"; break; }
-done
-for f in "$GAMESCOPE_BIN" "$REAPER_BIN" "$SHIM_SO" "$DRM_SO" "$ICD_SO" "$DMTEST_BIN" "$WSITEST_BIN" "$XTREE_BIN" "$SCALE_BIN"; do
+
+# Every gamenative-drm artifact is rebuilt, always. They are read from the drm
+# tree's target directory, and a file that exists says nothing about whether it
+# is current: a stale libgndrm_shim.so once shipped with a libandroid.so NEEDED
+# that its source had already dropped, and nothing in the payload showed it. The
+# scripts are incremental, so a current tree costs a few seconds; a stale one
+# costs a rebuild.
+bash "$GNDRM_DIR/tools/build-lsfg.sh" android
+bash "$GNDRM_DIR/tools/build-shim.sh" android
+bash "$GNDRM_DIR/tools/build-android.sh"
+
+for f in "$GAMESCOPE_BIN" "$REAPER_BIN" "$SHIM_SO" "$DRM_SO" "$ICD_SO" "$LSFG_SO" "$DMTEST_BIN" "$WSITEST_BIN" "$XTREE_BIN" "$SCALE_BIN"; do
     [ -e "$f" ] || { echo "error: missing $f" >&2; exit 1; }
 done
+# An up-to-date build keeps the old file, so its age alone proves nothing. What
+# must not happen is a source newer than the artifact built from it: that is the
+# stale file, and the package would carry it.
+# Each artifact is checked against the sources it is built from, not the whole
+# tree: an untouched crate keeps its library, and that is not staleness.
+check_fresh() {
+    local f="$1"; shift
+    local stale
+    stale="$(find "$@" -type f \
+        \( -name '*.rs' -o -name '*.c' -o -name '*.h' -o -name 'Cargo.toml' -o -name '*.map' \) \
+        -newer "$f" -print -quit)"
+    [ -z "$stale" ] || { echo "error: $f is older than $stale" >&2; exit 1; }
+}
+check_fresh "$DRM_SO"  "$GNDRM_DIR/modules" "$GNDRM_DIR/Cargo.toml"
+check_fresh "$ICD_SO"  "$GNDRM_DIR/icd_shim"
+check_fresh "$SHIM_SO" "$GNDRM_DIR/modules/gndrm-shim"
+check_fresh "$LSFG_SO" "$GNDRM_DIR/modules/gndrm-lsfg"
 
 # --- staging ----------------------------------------------------------------
 WORK="$(mktemp -d)"
@@ -430,10 +457,19 @@ find "$STAGE" -type f ! -perm /111 -exec chmod 0644 {} +
 # uid/gid 0, so identical staged content packs to identical bytes regardless of
 # build timing or filesystem readdir order. --mtime overrides every member's
 # mtime; --sort=name fixes the directory walk order.
+find "$STAGE" \( -name '._*' -o -name '.DS_Store' \) -delete
+
 tar --owner=0 --group=0 --numeric-owner --sort=name \
     --mtime="@$SOURCE_DATE_EPOCH" \
+    --exclude='._*' --exclude='.DS_Store' \
     -C "$STAGE" -cf - bin lib share tmp \
     | zstd -19 -T0 -o "$OUT_ASSETS/$ASSET_NAME"
+
+# The archive is the only thing that matters: check it, not the staging tree.
+if zstd -dc "$OUT_ASSETS/$ASSET_NAME" | tar -tf - | grep -qE '(^|/)\._|\.DS_Store'; then
+    echo "error: $ASSET_NAME carries macOS AppleDouble files" >&2
+    exit 1
+fi
 cp "$DRM_SO" "$OUT_JNILIBS/libgamenative_drm.so"
 
 # --- report ------------------------------------------------------------------
