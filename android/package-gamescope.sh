@@ -45,6 +45,11 @@ DEPS="${GAMESCOPE_TERMUX_PREFIX:-$HOME/termuxfs/aarch64/data/data/com.termux/fil
 # libxml2/libicu). libglvnd's loader/GLES libs and everything else still come
 # from the prefix.
 GN_MESA_GLAMOR_STAGE="${GN_MESA_GLAMOR_STAGE:-$WS_DIR/mesa/build-android-glamor/stage}"
+# macOS writes an AppleDouble "._name" sibling for every file it copies or
+# archives, which lands in the payload as a thousand extra members. BSD cp and
+# tar honour this; on Linux it is inert.
+export COPYFILE_DISABLE=1
+
 DATE="${1:-$(date +%Y%m%d)}"
 ASSET_NAME="gamescope-gamenative-$DATE.tzst"
 OUT_ASSETS="$GN_DIR/app/src/main/assets"
@@ -452,10 +457,19 @@ find "$STAGE" -type f ! -perm /111 -exec chmod 0644 {} +
 # uid/gid 0, so identical staged content packs to identical bytes regardless of
 # build timing or filesystem readdir order. --mtime overrides every member's
 # mtime; --sort=name fixes the directory walk order.
+find "$STAGE" \( -name '._*' -o -name '.DS_Store' \) -delete
+
 tar --owner=0 --group=0 --numeric-owner --sort=name \
     --mtime="@$SOURCE_DATE_EPOCH" \
+    --exclude='._*' --exclude='.DS_Store' \
     -C "$STAGE" -cf - bin lib share tmp \
     | zstd -19 -T0 -o "$OUT_ASSETS/$ASSET_NAME"
+
+# The archive is the only thing that matters: check it, not the staging tree.
+if zstd -dc "$OUT_ASSETS/$ASSET_NAME" | tar -tf - | grep -qE '(^|/)\._|\.DS_Store'; then
+    echo "error: $ASSET_NAME carries macOS AppleDouble files" >&2
+    exit 1
+fi
 cp "$DRM_SO" "$OUT_JNILIBS/libgamenative_drm.so"
 
 # --- report ------------------------------------------------------------------
