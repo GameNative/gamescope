@@ -1,0 +1,761 @@
+diff --git a/src/meson.build b/src/meson.build
+index 4e489ae..14057d0 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -73,6 +73,8 @@ shader_src = [
+   'shaders/cs_nis_fp16.comp',
+   'shaders/cs_rgb_to_nv12.comp',
+   'shaders/cs_sgsr.comp',
++  'shaders/cs_probe_trivial.comp',
++  'shaders/cs_probe_scalar.comp',
+ ]
+ 
+ spirv_shaders = glsl_generator.process(shader_src)
+diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
+index 1ef2427..8201cfa 100644
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -50,6 +50,8 @@
+ #include "cs_nis_fp16.h"
+ #include "cs_rgb_to_nv12.h"
+ #include "cs_sgsr.h"
++#include "cs_probe_trivial.h"
++#include "cs_probe_scalar.h"
+ 
+ #define A_CPU
+ #include "shaders/ffx_a.h"
+@@ -154,6 +156,29 @@ static void vk_errorf(VkResult result, const char *fmt, ...) {
+ 	vk_log.errorf("%s (VkResult: %d)", buf, result);
+ }
+ 
++static void log_probe(const char *name, VkResult res)
++{
++	fprintf(stderr, "[gamescope] probe %s: VkResult %d\n", name, res);
++	fflush(stderr);
++}
++
++static const char *shaderTypeName(ShaderType type)
++{
++	switch (type)
++	{
++		case SHADER_TYPE_BLIT: return "BLIT";
++		case SHADER_TYPE_BLUR: return "BLUR";
++		case SHADER_TYPE_BLUR_COND: return "BLUR_COND";
++		case SHADER_TYPE_BLUR_FIRST_PASS: return "BLUR_FIRST_PASS";
++		case SHADER_TYPE_EASU: return "EASU";
++		case SHADER_TYPE_RCAS: return "RCAS";
++		case SHADER_TYPE_NIS: return "NIS";
++		case SHADER_TYPE_RGB_TO_NV12: return "RGB_TO_NV12";
++		case SHADER_TYPE_SGSR: return "SGSR";
++		default: return "UNKNOWN";
++	}
++}
++
+ // For when device is up and it would be totally fatal to fail
+ #define vk_check( x ) \
+ 	do \
+@@ -319,6 +344,8 @@ bool CVulkanDevice::BInit(VkInstance instance, VkSurfaceKHR surface)
+ 	if (!createScratchResources())
+ 		return false;
+ 
++	runPipelineProbes();
++
+ 	m_bInitialized = true;
+ 
+ 	m_pipelineThread = std::jthread([this](std::stop_token st){compileAllPipelines(st);});
+@@ -538,6 +565,8 @@ bool CVulkanDevice::createDevice()
+ 		m_uVendorID = deviceProperties.vendorID;
+ 	}
+ 
++	logDeviceLimits();
++
+ 	float queuePriorities = 1.0f;
+ 
+ 	VkDeviceQueueGlobalPriorityCreateInfoEXT queueCreateInfoEXT = {
+@@ -753,14 +782,9 @@ static VkSamplerYcbcrRange colorspaceToYCBCRRange( EStreamColorspace colorspace
+ 	}
+ }
+ 
+-bool CVulkanDevice::createLayouts()
++static VkSamplerYcbcrConversionCreateInfo makeYcbcrConversionInfo( bool cosited )
+ {
+-	VkFormatProperties nv12Properties;
+-	vk.GetPhysicalDeviceFormatProperties(physDev(), VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, &nv12Properties);
+-	bool cosited = nv12Properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT;
+-
+-	VkSamplerYcbcrConversionCreateInfo ycbcrSamplerConversionCreateInfo = 
+-	{
++	return VkSamplerYcbcrConversionCreateInfo {
+ 		.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO,
+ 		.format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
+ 		.ycbcrModel = colorspaceToYCBCRModel( g_ForcedNV12ColorSpace ),
+@@ -770,17 +794,13 @@ bool CVulkanDevice::createLayouts()
+ 		.chromaFilter = VK_FILTER_LINEAR,
+ 		.forceExplicitReconstruction = VK_FALSE,
+ 	};
++}
+ 
+-	vk.CreateSamplerYcbcrConversion( device(), &ycbcrSamplerConversionCreateInfo, nullptr, &m_ycbcrConversion );
+-
+-	VkSamplerYcbcrConversionInfo ycbcrSamplerConversionInfo = {
+-		.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
+-		.conversion = m_ycbcrConversion,
+-	};
+-
+-	VkSamplerCreateInfo ycbcrSamplerInfo = {
++static VkSamplerCreateInfo makeYcbcrSamplerInfo( const VkSamplerYcbcrConversionInfo *pConversionInfo )
++{
++	return VkSamplerCreateInfo {
+ 		.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+-		.pNext = &ycbcrSamplerConversionInfo,
++		.pNext = pConversionInfo,
+ 		.magFilter = VK_FILTER_LINEAR,
+ 		.minFilter = VK_FILTER_LINEAR,
+ 		.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+@@ -788,15 +808,11 @@ bool CVulkanDevice::createLayouts()
+ 		.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+ 		.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK,
+ 	};
+-	
+-	vk.CreateSampler( device(), &ycbcrSamplerInfo, nullptr, &m_ycbcrSampler );
+-
+-	// Create an array of our ycbcrSampler to fill up
+-	std::array<VkSampler, VKR_SAMPLER_SLOTS> ycbcrSamplers;
+-	for (auto& sampler : ycbcrSamplers)
+-		sampler = m_ycbcrSampler;
++}
+ 
+-	std::array<VkDescriptorSetLayoutBinding, 7 > layoutBindings = {
++static std::array<VkDescriptorSetLayoutBinding, 7> makeLayoutBindings( const VkSampler *pYcbcrImmutableSamplers )
++{
++	return std::array<VkDescriptorSetLayoutBinding, 7> {
+ 		VkDescriptorSetLayoutBinding {
+ 			.binding = 0,
+ 			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+@@ -826,7 +842,7 @@ bool CVulkanDevice::createLayouts()
+ 			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+ 			.descriptorCount = VKR_SAMPLER_SLOTS,
+ 			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+-			.pImmutableSamplers = ycbcrSamplers.data(),
++			.pImmutableSamplers = pYcbcrImmutableSamplers,
+ 		},
+ 		VkDescriptorSetLayoutBinding {
+ 			.binding = 5,
+@@ -841,6 +857,39 @@ bool CVulkanDevice::createLayouts()
+ 			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+ 		},
+ 	};
++}
++
++bool CVulkanDevice::createLayouts()
++{
++	VkFormatProperties nv12Properties;
++	vk.GetPhysicalDeviceFormatProperties(physDev(), VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, &nv12Properties);
++	bool cosited = nv12Properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT;
++	fprintf(stderr, "[gamescope] limits: nv12 optimalTilingFeatures=0x%x cosited=%d\n", nv12Properties.optimalTilingFeatures, cosited);
++
++	VkSamplerYcbcrConversionCreateInfo ycbcrSamplerConversionCreateInfo = makeYcbcrConversionInfo( cosited );
++
++	VkResult res = vk.CreateSamplerYcbcrConversion( device(), &ycbcrSamplerConversionCreateInfo, nullptr, &m_ycbcrConversion );
++	log_probe( "ycbcr_conversion", res );
++
++	VkSamplerYcbcrConversionInfo ycbcrSamplerConversionInfo = {
++		.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
++		.conversion = m_ycbcrConversion,
++	};
++
++	VkSamplerCreateInfo ycbcrSamplerInfo = makeYcbcrSamplerInfo( &ycbcrSamplerConversionInfo );
++
++	res = vk.CreateSampler( device(), &ycbcrSamplerInfo, nullptr, &m_ycbcrSampler );
++	log_probe( "ycbcr_sampler", res );
++
++	// Create an array of our ycbcrSampler to fill up
++	std::array<VkSampler, VKR_SAMPLER_SLOTS> ycbcrSamplers;
++	for (auto& sampler : ycbcrSamplers)
++		sampler = m_ycbcrSampler;
++
++	m_bNoImmutableYcbcr = env_to_bool( getenv( "GAMESCOPE_MALI_NO_IMMUTABLE_YCBCR" ) );
++	fprintf(stderr, "[gamescope] probe config: GAMESCOPE_MALI_NO_IMMUTABLE_YCBCR=%d\n", m_bNoImmutableYcbcr);
++
++	std::array<VkDescriptorSetLayoutBinding, 7> layoutBindings = makeLayoutBindings( m_bNoImmutableYcbcr ? nullptr : ycbcrSamplers.data() );
+ 
+ 	VkDescriptorSetLayoutCreateInfo descriptorSetLayoutCreateInfo =
+ 	{
+@@ -849,7 +898,8 @@ bool CVulkanDevice::createLayouts()
+ 		.pBindings = layoutBindings.data()
+ 	};
+ 
+-	VkResult res = vk.CreateDescriptorSetLayout(device(), &descriptorSetLayoutCreateInfo, 0, &m_descriptorSetLayout);
++	res = vk.CreateDescriptorSetLayout(device(), &descriptorSetLayoutCreateInfo, 0, &m_descriptorSetLayout);
++	log_probe( "descriptor_set_layout", res );
+ 	if ( res != VK_SUCCESS )
+ 	{
+ 		vk_errorf( res, "vkCreateDescriptorSetLayout failed" );
+@@ -863,6 +913,7 @@ bool CVulkanDevice::createLayouts()
+ 	};
+ 	
+ 	res = vk.CreatePipelineLayout(device(), &pipelineLayoutCreateInfo, nullptr, &m_pipelineLayout);
++	log_probe( "pipeline_layout", res );
+ 	if ( res != VK_SUCCESS )
+ 	{
+ 		vk_errorf( res, "vkCreatePipelineLayout failed" );
+@@ -918,6 +969,7 @@ bool CVulkanDevice::createPools()
+ 	};
+ 
+ 	res = vk.GetPhysicalDeviceImageFormatProperties2( physDev(), &imageFormatInfo, &imageFormatProps );
++	fprintf(stderr, "[gamescope] limits: nv12 combinedImageSamplerDescriptorCount=%u (VkResult %d)\n", ycbcrProps.combinedImageSamplerDescriptorCount, res);
+ 
+ 	VkDescriptorPoolSize poolSizes[3] {
+ 		{
+@@ -1258,7 +1310,9 @@ VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMas
+ 
+ 	VkResult res = vk.CreateComputePipelines(device(), VK_NULL_HANDLE, 1, &computePipelineCreateInfo, nullptr, &result);
+ 	if (res != VK_SUCCESS) {
+-		vk_errorf( res, "vkCreateComputePipelines failed" );
++		vk_log.errorf( "vkCreateComputePipelines failed (VkResult: %d): type=%s(%u) layerCount=%u ycbcrMask=0x%x blurLayers=%u compositeDebug=0x%x colorspaceMask=0x%x outputEOTF=%u itm=%u shaderModule=%s",
++			res, shaderTypeName(type), (uint32_t)type, layerCount, ycbcrMask, blur_layer_count, composite_debug, colorspace_mask, output_eotf, (uint32_t)itm_enable,
++			m_shaderModules[type] != VK_NULL_HANDLE ? "ok" : "NULL" );
+ 		return VK_NULL_HANDLE;
+ 	}
+ 
+@@ -1282,6 +1336,10 @@ void CVulkanDevice::compileAllPipelines(std::stop_token st)
+ 	SHADER(SGSR, 1, 1, 1);
+ #undef SHADER
+ 
++	VkPipeline firstBlit = VK_NULL_HANDLE;
++	uint32_t compiledOk = 0;
++	uint32_t compiledFailed = 0;
++
+ 	for (auto& info : pipelineInfos) {
+ 		for (uint32_t layerCount = 1; layerCount <= info.layerCount; layerCount++) {
+ 			for (uint32_t ycbcrMask = 0; ycbcrMask < info.ycbcrMask; ycbcrMask++) {
+@@ -1292,18 +1350,398 @@ void CVulkanDevice::compileAllPipelines(std::stop_token st)
+ 						continue;
+ 
+ 					VkPipeline newPipeline = compilePipeline(layerCount, ycbcrMask, info.shaderType, blur_layers, info.compositeDebug, info.colorspaceMask, info.outputEOTF, info.itmEnable);
++					if (newPipeline != VK_NULL_HANDLE)
++						compiledOk++;
++					else
++						compiledFailed++;
++					if (info.shaderType == SHADER_TYPE_BLIT && layerCount == 1 && ycbcrMask == 0 && blur_layers == 1)
++						firstBlit = newPipeline;
+ 					{
+ 						std::lock_guard<std::mutex> lock(m_pipelineMutex);
+ 						PipelineInfo_t key = {info.shaderType, layerCount, ycbcrMask, blur_layers, info.compositeDebug};
+ 						if (st.stop_requested()) return;
+ 						auto result = m_pipelineMap.emplace(std::make_pair(key, newPipeline));
+-						if (!result.second)
++						if (!result.second && newPipeline != VK_NULL_HANDLE)
+ 							vk.DestroyPipeline(device(), newPipeline, nullptr);
+ 					}
+ 				}
+ 			}
+ 		}
+ 	}
++
++	vk_log.infof( "pipeline precompile done: %u ok, %u failed", compiledOk, compiledFailed );
++
++	if ( firstBlit == VK_NULL_HANDLE )
++	{
++		vk_log.errorf( "no usable BLIT pipeline (%u of %u precompiled pipelines failed), exiting with status 86", compiledFailed, compiledOk + compiledFailed );
++		fflush( stderr );
++		_exit( 86 );
++	}
++}
++
++void CVulkanDevice::logDeviceLimits()
++{
++	VkPhysicalDeviceDriverProperties driverProps = {
++		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
++	};
++	VkPhysicalDeviceMaintenance3Properties maintenance3Props = {
++		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES,
++		.pNext = &driverProps,
++	};
++	VkPhysicalDeviceProperties2 props2 = {
++		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
++		.pNext = &maintenance3Props,
++	};
++	vk.GetPhysicalDeviceProperties2( physDev(), &props2 );
++	const VkPhysicalDeviceProperties &props = props2.properties;
++	const VkPhysicalDeviceLimits &l = props.limits;
++
++	VkPhysicalDeviceVulkan12Features features12 = {
++		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
++	};
++	VkPhysicalDeviceVulkan11Features features11 = {
++		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
++		.pNext = &features12,
++	};
++	VkPhysicalDeviceFeatures2 features2 = {
++		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
++		.pNext = &features11,
++	};
++	vk.GetPhysicalDeviceFeatures2( physDev(), &features2 );
++
++	fprintf(stderr, "[gamescope] limits: device=\"%s\" vendorID=0x%04x deviceID=0x%04x api=%u.%u.%u driverVersion=0x%08x driverID=%d driverName=\"%s\" driverInfo=\"%s\"\n",
++		props.deviceName, props.vendorID, props.deviceID,
++		VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion), VK_API_VERSION_PATCH(props.apiVersion),
++		props.driverVersion, (int)driverProps.driverID, driverProps.driverName, driverProps.driverInfo);
++	fprintf(stderr, "[gamescope] limits: maxPerStageDescriptorSamplers=%u maxPerStageDescriptorSampledImages=%u maxPerStageDescriptorStorageImages=%u maxPerStageDescriptorUniformBuffers=%u maxPerStageResources=%u maxDescriptorSetSamplers=%u maxDescriptorSetSampledImages=%u maxDescriptorSetStorageImages=%u maxBoundDescriptorSets=%u maxPerSetDescriptors=%u maxComputeWorkGroupInvocations=%u maxComputeWorkGroupSize=%ux%ux%u maxComputeSharedMemorySize=%u maxUniformBufferRange=%u\n",
++		l.maxPerStageDescriptorSamplers, l.maxPerStageDescriptorSampledImages, l.maxPerStageDescriptorStorageImages, l.maxPerStageDescriptorUniformBuffers,
++		l.maxPerStageResources, l.maxDescriptorSetSamplers, l.maxDescriptorSetSampledImages, l.maxDescriptorSetStorageImages, l.maxBoundDescriptorSets,
++		maintenance3Props.maxPerSetDescriptors, l.maxComputeWorkGroupInvocations,
++		l.maxComputeWorkGroupSize[0], l.maxComputeWorkGroupSize[1], l.maxComputeWorkGroupSize[2],
++		l.maxComputeSharedMemorySize, l.maxUniformBufferRange);
++	fprintf(stderr, "[gamescope] limits: features scalarBlockLayout=%u samplerYcbcrConversion=%u shaderFloat16=%u shaderInt16=%u uniformBufferStandardLayout=%u shaderStorageImageWriteWithoutFormat=%u\n",
++		features12.scalarBlockLayout, features11.samplerYcbcrConversion, features12.shaderFloat16, features2.features.shaderInt16,
++		features12.uniformBufferStandardLayout, features2.features.shaderStorageImageWriteWithoutFormat);
++	fflush(stderr);
++}
++
++static VkResult probeComputePipeline( VkDevice dev, PFN_vkCreateComputePipelines pfnCreate, PFN_vkDestroyPipeline pfnDestroy, VkShaderModule module, VkPipelineLayout layout )
++{
++	const uint32_t specData[7] = { 1, 0, 0, 1, 0, 0, 0 };
++	std::array<VkSpecializationMapEntry, 7> specEntries;
++	for ( uint32_t i = 0; i < specEntries.size(); i++ )
++		specEntries[i] = { .constantID = i, .offset = uint32_t(sizeof(uint32_t) * i), .size = sizeof(uint32_t) };
++
++	VkSpecializationInfo specInfo = {
++		.mapEntryCount = uint32_t(specEntries.size()),
++		.pMapEntries = specEntries.data(),
++		.dataSize = sizeof(specData),
++		.pData = specData,
++	};
++
++	VkComputePipelineCreateInfo createInfo = {
++		.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
++		.stage = {
++			.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++			.stage = VK_SHADER_STAGE_COMPUTE_BIT,
++			.module = module,
++			.pName = "main",
++			.pSpecializationInfo = &specInfo,
++		},
++		.layout = layout,
++	};
++
++	VkPipeline pipeline = VK_NULL_HANDLE;
++	VkResult res = pfnCreate( dev, VK_NULL_HANDLE, 1, &createInfo, nullptr, &pipeline );
++	if ( res == VK_SUCCESS && pipeline != VK_NULL_HANDLE )
++		pfnDestroy( dev, pipeline, nullptr );
++	return res;
++}
++
++void CVulkanDevice::runPipelineProbes()
++{
++	auto pfnGetLayoutSupport = (PFN_vkGetDescriptorSetLayoutSupport) vk.GetDeviceProcAddr( device(), "vkGetDescriptorSetLayoutSupport" );
++	auto pfnDestroyShaderModule = (PFN_vkDestroyShaderModule) vk.GetDeviceProcAddr( device(), "vkDestroyShaderModule" );
++
++	std::array<VkSampler, VKR_SAMPLER_SLOTS> ycbcrSamplers;
++	ycbcrSamplers.fill( m_ycbcrSampler );
++	std::array<VkDescriptorSetLayoutBinding, 7> fullBindings = makeLayoutBindings( ycbcrSamplers.data() );
++	std::array<VkDescriptorSetLayoutBinding, 7> plainBindings = makeLayoutBindings( nullptr );
++
++	std::array<VkDescriptorSetLayoutBinding, 3> minimalBindings = {
++		VkDescriptorSetLayoutBinding { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
++		VkDescriptorSetLayoutBinding { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
++		VkDescriptorSetLayoutBinding { .binding = 3, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
++	};
++	std::array<VkDescriptorSetLayoutBinding, 4> minimalYcbcrBindings = {
++		minimalBindings[0], minimalBindings[1], minimalBindings[2],
++		VkDescriptorSetLayoutBinding { .binding = 4, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .pImmutableSamplers = &m_ycbcrSampler },
++	};
++
++	struct ProbeLayout
++	{
++		const char *name;
++		const VkDescriptorSetLayoutBinding *pBindings;
++		uint32_t uBindingCount;
++		VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
++		VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
++	};
++	std::array<ProbeLayout, 4> layouts = {
++		ProbeLayout { "full", fullBindings.data(), uint32_t(fullBindings.size()) },
++		ProbeLayout { "no_immutable_ycbcr", plainBindings.data(), uint32_t(plainBindings.size()) },
++		ProbeLayout { "minimal", minimalBindings.data(), uint32_t(minimalBindings.size()) },
++		ProbeLayout { "minimal_1ycbcr", minimalYcbcrBindings.data(), uint32_t(minimalYcbcrBindings.size()) },
++	};
++
++	char name[128];
++	for ( auto &layout : layouts )
++	{
++		VkDescriptorSetLayoutCreateInfo setLayoutInfo = {
++			.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
++			.bindingCount = layout.uBindingCount,
++			.pBindings = layout.pBindings,
++		};
++
++		if ( pfnGetLayoutSupport )
++		{
++			VkDescriptorSetLayoutSupport support = {
++				.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT,
++			};
++			pfnGetLayoutSupport( device(), &setLayoutInfo, &support );
++			fprintf( stderr, "[gamescope] probe layout_support_%s: supported %u\n", layout.name, support.supported );
++		}
++
++		VkResult res = vk.CreateDescriptorSetLayout( device(), &setLayoutInfo, nullptr, &layout.setLayout );
++		snprintf( name, sizeof(name), "set_layout_%s", layout.name );
++		log_probe( name, res );
++		if ( res != VK_SUCCESS )
++		{
++			layout.setLayout = VK_NULL_HANDLE;
++			continue;
++		}
++
++		VkPipelineLayoutCreateInfo pipelineLayoutInfo = {
++			.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
++			.setLayoutCount = 1,
++			.pSetLayouts = &layout.setLayout,
++		};
++		res = vk.CreatePipelineLayout( device(), &pipelineLayoutInfo, nullptr, &layout.pipelineLayout );
++		snprintf( name, sizeof(name), "pipeline_layout_%s", layout.name );
++		log_probe( name, res );
++		if ( res != VK_SUCCESS )
++			layout.pipelineLayout = VK_NULL_HANDLE;
++	}
++
++	auto createModule = [&]( const char *moduleName, const uint32_t *pCode, size_t size ) -> VkShaderModule
++	{
++		VkShaderModuleCreateInfo moduleInfo = {
++			.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
++			.codeSize = size,
++			.pCode = pCode,
++		};
++		VkShaderModule module = VK_NULL_HANDLE;
++		VkResult res = vk.CreateShaderModule( device(), &moduleInfo, nullptr, &module );
++		snprintf( name, sizeof(name), "shader_module_%s", moduleName );
++		log_probe( name, res );
++		return res == VK_SUCCESS ? module : VK_NULL_HANDLE;
++	};
++
++	VkShaderModule trivialModule = createModule( "trivial", cs_probe_trivial, sizeof(cs_probe_trivial) );
++	VkShaderModule scalarModule = createModule( "scalar_ubo", cs_probe_scalar, sizeof(cs_probe_scalar) );
++	VkShaderModule blitModule = m_shaderModules[SHADER_TYPE_BLIT];
++
++	struct PipelineProbe
++	{
++		const char *name;
++		VkShaderModule module;
++		VkPipelineLayout layout;
++	};
++	const std::array<PipelineProbe, 8> probes = {
++		PipelineProbe { "trivial_device_layout", trivialModule, m_pipelineLayout },
++		PipelineProbe { "trivial_full_layout", trivialModule, layouts[0].pipelineLayout },
++		PipelineProbe { "trivial_minimal_layout", trivialModule, layouts[2].pipelineLayout },
++		PipelineProbe { "trivial_minimal_1ycbcr_layout", trivialModule, layouts[3].pipelineLayout },
++		PipelineProbe { "scalar_ubo_minimal_layout", scalarModule, layouts[2].pipelineLayout },
++		PipelineProbe { "scalar_ubo_full_layout", scalarModule, layouts[0].pipelineLayout },
++		PipelineProbe { "blit_full_layout", blitModule, layouts[0].pipelineLayout },
++		PipelineProbe { "blit_no_immutable_ycbcr", blitModule, layouts[1].pipelineLayout },
++	};
++
++	for ( const auto &probe : probes )
++	{
++		if ( probe.module == VK_NULL_HANDLE || probe.layout == VK_NULL_HANDLE )
++		{
++			fprintf( stderr, "[gamescope] probe %s: skipped (module %s, layout %s)\n", probe.name,
++				probe.module ? "ok" : "NULL", probe.layout ? "ok" : "NULL" );
++			continue;
++		}
++		log_probe( probe.name, probeComputePipeline( device(), vk.CreateComputePipelines, vk.DestroyPipeline, probe.module, probe.layout ) );
++	}
++
++	if ( pfnDestroyShaderModule )
++	{
++		if ( trivialModule )
++			pfnDestroyShaderModule( device(), trivialModule, nullptr );
++		if ( scalarModule )
++			pfnDestroyShaderModule( device(), scalarModule, nullptr );
++	}
++	for ( auto &layout : layouts )
++	{
++		if ( layout.pipelineLayout )
++			vk.DestroyPipelineLayout( device(), layout.pipelineLayout, nullptr );
++		if ( layout.setLayout )
++			vk.DestroyDescriptorSetLayout( device(), layout.setLayout, nullptr );
++	}
++
++	if ( env_to_bool( getenv( "GAMESCOPE_MALI_SKIP_SECOND_DEVICE" ) ) )
++	{
++		fprintf( stderr, "[gamescope] probe second_device: skipped (GAMESCOPE_MALI_SKIP_SECOND_DEVICE=1)\n" );
++	}
++	else
++	{
++		runSecondDeviceProbe( "blit_second_device_scalar_on", true );
++		runSecondDeviceProbe( "blit_second_device_scalar_off", false );
++	}
++	fflush( stderr );
++}
++
++void CVulkanDevice::runSecondDeviceProbe( const char *probeName, bool scalarBlockLayout )
++{
++	char name[160];
++	float queuePriority = 1.0f;
++	VkDeviceQueueCreateInfo queueInfo = {
++		.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++		.queueFamilyIndex = m_queueFamily,
++		.queueCount = 1,
++		.pQueuePriorities = &queuePriority,
++	};
++	VkPhysicalDeviceVulkan12Features features12 = {
++		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
++		.scalarBlockLayout = scalarBlockLayout ? VK_TRUE : VK_FALSE,
++	};
++	VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcrFeatures = {
++		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
++		.pNext = &features12,
++		.samplerYcbcrConversion = VK_TRUE,
++	};
++	VkDeviceCreateInfo deviceInfo = {
++		.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++		.pNext = &ycbcrFeatures,
++		.queueCreateInfoCount = 1,
++		.pQueueCreateInfos = &queueInfo,
++	};
++
++	VkDevice dev = VK_NULL_HANDLE;
++	VkResult res = vk.CreateDevice( physDev(), &deviceInfo, nullptr, &dev );
++	snprintf( name, sizeof(name), "%s_create_device", probeName );
++	log_probe( name, res );
++	if ( res != VK_SUCCESS )
++		return;
++
++	#define PROBE_DEV_FUNC(x) auto pfn##x = (PFN_vk##x) vk.GetDeviceProcAddr( dev, "vk" #x )
++	PROBE_DEV_FUNC(DestroyDevice);
++	PROBE_DEV_FUNC(CreateSamplerYcbcrConversion);
++	PROBE_DEV_FUNC(DestroySamplerYcbcrConversion);
++	PROBE_DEV_FUNC(CreateSampler);
++	PROBE_DEV_FUNC(DestroySampler);
++	PROBE_DEV_FUNC(CreateDescriptorSetLayout);
++	PROBE_DEV_FUNC(DestroyDescriptorSetLayout);
++	PROBE_DEV_FUNC(CreatePipelineLayout);
++	PROBE_DEV_FUNC(DestroyPipelineLayout);
++	PROBE_DEV_FUNC(CreateShaderModule);
++	PROBE_DEV_FUNC(DestroyShaderModule);
++	PROBE_DEV_FUNC(CreateComputePipelines);
++	PROBE_DEV_FUNC(DestroyPipeline);
++	#undef PROBE_DEV_FUNC
++
++	VkSamplerYcbcrConversion conversion = VK_NULL_HANDLE;
++	VkSampler sampler = VK_NULL_HANDLE;
++	VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
++	VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
++	VkShaderModule module = VK_NULL_HANDLE;
++
++	do
++	{
++		VkFormatProperties nv12Properties;
++		vk.GetPhysicalDeviceFormatProperties( physDev(), VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, &nv12Properties );
++		VkSamplerYcbcrConversionCreateInfo conversionInfo = makeYcbcrConversionInfo( nv12Properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT );
++		res = pfnCreateSamplerYcbcrConversion( dev, &conversionInfo, nullptr, &conversion );
++		if ( res != VK_SUCCESS )
++		{
++			snprintf( name, sizeof(name), "%s_ycbcr_conversion", probeName );
++			log_probe( name, res );
++			break;
++		}
++
++		VkSamplerYcbcrConversionInfo samplerConversionInfo = {
++			.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
++			.conversion = conversion,
++		};
++		VkSamplerCreateInfo samplerInfo = makeYcbcrSamplerInfo( &samplerConversionInfo );
++		res = pfnCreateSampler( dev, &samplerInfo, nullptr, &sampler );
++		if ( res != VK_SUCCESS )
++		{
++			snprintf( name, sizeof(name), "%s_ycbcr_sampler", probeName );
++			log_probe( name, res );
++			break;
++		}
++
++		std::array<VkSampler, VKR_SAMPLER_SLOTS> samplers;
++		samplers.fill( sampler );
++		std::array<VkDescriptorSetLayoutBinding, 7> bindings = makeLayoutBindings( samplers.data() );
++		VkDescriptorSetLayoutCreateInfo setLayoutInfo = {
++			.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
++			.bindingCount = uint32_t(bindings.size()),
++			.pBindings = bindings.data(),
++		};
++		res = pfnCreateDescriptorSetLayout( dev, &setLayoutInfo, nullptr, &setLayout );
++		if ( res != VK_SUCCESS )
++		{
++			snprintf( name, sizeof(name), "%s_set_layout", probeName );
++			log_probe( name, res );
++			break;
++		}
++
++		VkPipelineLayoutCreateInfo pipelineLayoutInfo = {
++			.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
++			.setLayoutCount = 1,
++			.pSetLayouts = &setLayout,
++		};
++		res = pfnCreatePipelineLayout( dev, &pipelineLayoutInfo, nullptr, &pipelineLayout );
++		if ( res != VK_SUCCESS )
++		{
++			snprintf( name, sizeof(name), "%s_pipeline_layout", probeName );
++			log_probe( name, res );
++			break;
++		}
++
++		VkShaderModuleCreateInfo moduleInfo = {
++			.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
++			.codeSize = sizeof(cs_composite_blit),
++			.pCode = cs_composite_blit,
++		};
++		res = pfnCreateShaderModule( dev, &moduleInfo, nullptr, &module );
++		if ( res != VK_SUCCESS )
++		{
++			snprintf( name, sizeof(name), "%s_shader_module", probeName );
++			log_probe( name, res );
++			break;
++		}
++
++		log_probe( probeName, probeComputePipeline( dev, pfnCreateComputePipelines, pfnDestroyPipeline, module, pipelineLayout ) );
++	} while ( false );
++
++	if ( module )
++		pfnDestroyShaderModule( dev, module, nullptr );
++	if ( pipelineLayout )
++		pfnDestroyPipelineLayout( dev, pipelineLayout, nullptr );
++	if ( setLayout )
++		pfnDestroyDescriptorSetLayout( dev, setLayout, nullptr );
++	if ( sampler )
++		pfnDestroySampler( dev, sampler, nullptr );
++	if ( conversion )
++		pfnDestroySamplerYcbcrConversion( dev, conversion, nullptr );
++	pfnDestroyDevice( dev, nullptr );
+ }
+ 
+ extern bool g_bSteamIsActiveWindow;
+@@ -1317,16 +1755,27 @@ VkPipeline CVulkanDevice::pipeline(ShaderType type, uint32_t layerCount, uint32_
+ 	std::lock_guard<std::mutex> lock(m_pipelineMutex);
+ 	PipelineInfo_t key = {type, layerCount, ycbcrMask, blur_layers, effective_debug, colorspace_mask, output_eotf, itm_enable};
+ 	auto search = m_pipelineMap.find(key);
++	VkPipeline result;
+ 	if (search == m_pipelineMap.end())
+ 	{
+-		VkPipeline result = compilePipeline(layerCount, ycbcrMask, type, blur_layers, effective_debug, colorspace_mask, output_eotf, itm_enable);
++		result = compilePipeline(layerCount, ycbcrMask, type, blur_layers, effective_debug, colorspace_mask, output_eotf, itm_enable);
+ 		m_pipelineMap[key] = result;
+-		return result;
+ 	}
+ 	else
+ 	{
+-		return search->second;
++		result = search->second;
++	}
++
++	if (result == VK_NULL_HANDLE)
++	{
++		static uint32_t s_uMissingCount = 0;
++		uint32_t uCount = ++s_uMissingCount;
++		if (uCount <= 32 || uCount % 600 == 0)
++			vk_log.errorf( "pipeline missing at bind (count %u): type=%s(%u) layerCount=%u ycbcrMask=0x%x blurLayers=%u compositeDebug=0x%x colorspaceMask=0x%x outputEOTF=%u itm=%u, skipping the dispatch",
++				uCount, shaderTypeName(type), (uint32_t)type, layerCount, ycbcrMask, blur_layers, effective_debug, colorspace_mask, output_eotf, (uint32_t)itm_enable );
+ 	}
++
++	return result;
+ }
+ 
+ 
+@@ -1756,6 +2205,9 @@ void CVulkanCmdBuffer::uploadConstants(Args&&... args)
+ 
+ void CVulkanCmdBuffer::bindPipeline(VkPipeline pipeline)
+ {
++	m_bPipelineMissing = pipeline == VK_NULL_HANDLE;
++	if (m_bPipelineMissing)
++		return;
+ 	m_device->vk.CmdBindPipeline(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+ }
+ 
+@@ -1864,6 +2316,8 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
+ 		imageDescriptors[i].sampler = m_device->sampler(m_samplerState[i]);
+ 		imageDescriptors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+ 		ycbcrImageDescriptors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++		if (m_device->m_bNoImmutableYcbcr)
++			ycbcrImageDescriptors[i].sampler = imageDescriptors[i].sampler;
+ 		if (m_boundTextures[i] == nullptr)
+ 			continue;
+ 
+@@ -1913,6 +2367,9 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
+ 
+ 	m_device->vk.CmdBindDescriptorSets(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_device->pipelineLayout(), 0, 1, &descriptorSet, 0, nullptr);
+ 
++	if (m_bPipelineMissing)
++		return;
++
+ 	m_device->vk.CmdDispatch(m_cmdBuffer, x, y, z);
+ 
+ 	markDirty(m_target);
+diff --git a/src/rendervulkan.hpp b/src/rendervulkan.hpp
+index 92b2cc5..ddd3a2c 100644
+--- a/src/rendervulkan.hpp
++++ b/src/rendervulkan.hpp
+@@ -919,6 +919,9 @@ protected:
+ 	bool createScratchResources();
+ 	VkPipeline compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable);
+ 	void compileAllPipelines(std::stop_token st);
++	void logDeviceLimits();
++	void runPipelineProbes();
++	void runSecondDeviceProbe(const char *name, bool scalarBlockLayout);
+ 
+ 	VkDevice m_device = nullptr;
+ 	VkPhysicalDevice m_physDev = nullptr;
+@@ -927,6 +930,7 @@ protected:
+ 	VkQueue m_generalQueue = nullptr;
+ 	VkSamplerYcbcrConversion m_ycbcrConversion = VK_NULL_HANDLE;
+ 	VkSampler m_ycbcrSampler = VK_NULL_HANDLE;
++	bool m_bNoImmutableYcbcr = false;
+ 	VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
+ 	VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
+ 	VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
+@@ -1072,6 +1076,7 @@ private:
+ 	std::vector<VulkanTimelinePoint_t> m_ExternalSignals;
+ 
+ 	uint32_t m_renderBufferOffset = 0;
++	bool m_bPipelineMissing = false;
+ };
+ 
+ uint32_t VulkanFormatToDRM( VkFormat vkFormat, std::optional<bool> obHasAlphaOverride = std::nullopt );
+diff --git a/src/shaders/cs_probe_scalar.comp b/src/shaders/cs_probe_scalar.comp
+new file mode 100644
+index 0000000..8bc2dfc
+--- /dev/null
++++ b/src/shaders/cs_probe_scalar.comp
+@@ -0,0 +1,19 @@
++#version 450
++
++#extension GL_GOOGLE_include_directive : require
++#extension GL_EXT_scalar_block_layout : require
++
++#include "descriptor_set_constants.h"
++
++layout(
++  local_size_x = 8,
++  local_size_y = 8,
++  local_size_z = 1) in;
++
++#include "blit_push_data.h"
++
++layout(binding = 1, rgba8) writeonly uniform image2D dst;
++
++void main() {
++    imageStore(dst, ivec2(gl_GlobalInvocationID.xy), vec4(u_opacity[0], u_scale[0], float(u_frameId)));
++}
+diff --git a/src/shaders/cs_probe_trivial.comp b/src/shaders/cs_probe_trivial.comp
+new file mode 100644
+index 0000000..a442c08
+--- /dev/null
++++ b/src/shaders/cs_probe_trivial.comp
+@@ -0,0 +1,9 @@
++#version 450
++
++layout(
++  local_size_x = 8,
++  local_size_y = 8,
++  local_size_z = 1) in;
++
++void main() {
++}
