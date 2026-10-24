@@ -329,7 +329,38 @@ feature chain and the same code paths as before.
  	vk.GetDeviceQueue(device(), m_queueFamily, 0, &m_queue);
  	if ( m_queueFamily == m_generalQueueFamily )
  		m_generalQueue = m_queue;
-@@ -1121,6 +1296,172 @@ bool CVulkanDevice::createScratchResources()
+@@ -1121,6 +1296,30 @@ bool CVulkanDevice::createScratchResources()
+ 	return true;
+ }
+ 
++VkImageView CVulkanDevice::nullImageView( VkImageViewType eViewType )
++{
++	if ( m_bNullDescriptor )
++		return VK_NULL_HANDLE;
++
++	switch ( eViewType )
++	{
++		case VK_IMAGE_VIEW_TYPE_1D: return m_pNullTexture1D->srgbView();
++		case VK_IMAGE_VIEW_TYPE_3D: return m_pNullTexture3D->srgbView();
++		default: return m_pNullTexture2D->srgbView();
++	}
++}
++
++VkImageView CVulkanDevice::nullYcbcrImageView()
++{
++	if ( m_bNullDescriptor )
++		return VK_NULL_HANDLE;
++
++	if ( !m_bNoImmutableYcbcr && m_nullYcbcrView != VK_NULL_HANDLE )
++		return m_nullYcbcrView;
++
++	return m_pNullTexture2D->srgbView();
++}
++
+ bool CVulkanDevice::createUploadBuffer( uint32_t size )
+ {
+ 	// Whole MiB: growth is not a per-byte decision, and a rounded size keeps a
+@@ -1175,6 +1374,148 @@ bool CVulkanDevice::createUploadBuffer( uint32_t size )
  	return true;
  }
  
@@ -475,33 +506,9 @@ feature chain and the same code paths as before.
 +	return true;
 +}
 +
-+VkImageView CVulkanDevice::nullImageView( VkImageViewType eViewType )
-+{
-+	if ( m_bNullDescriptor )
-+		return VK_NULL_HANDLE;
-+
-+	switch ( eViewType )
-+	{
-+		case VK_IMAGE_VIEW_TYPE_1D: return m_pNullTexture1D->srgbView();
-+		case VK_IMAGE_VIEW_TYPE_3D: return m_pNullTexture3D->srgbView();
-+		default: return m_pNullTexture2D->srgbView();
-+	}
-+}
-+
-+VkImageView CVulkanDevice::nullYcbcrImageView()
-+{
-+	if ( m_bNullDescriptor )
-+		return VK_NULL_HANDLE;
-+
-+	if ( !m_bNoImmutableYcbcr && m_nullYcbcrView != VK_NULL_HANDLE )
-+		return m_nullYcbcrView;
-+
-+	return m_pNullTexture2D->srgbView();
-+}
-+
- bool CVulkanDevice::createUploadBuffer( uint32_t size )
+ bool CVulkanDevice::growUploadBuffer( uint32_t required )
  {
- 	// Whole MiB: growth is not a per-byte decision, and a rounded size keeps a
+ 	// Only reachable when the output turns out bigger than the size the host
 @@ -1403,6 +1744,8 @@ void CVulkanDevice::logDeviceLimits()
  		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
  		.pNext = &maintenance3Props,
