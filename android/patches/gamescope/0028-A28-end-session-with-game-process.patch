@@ -1,3 +1,5 @@
+diff --git a/src/Apps/gamescopereaper.cpp b/src/Apps/gamescopereaper.cpp
+index 083aaf6..0a8af57 100644
 --- a/src/Apps/gamescopereaper.cpp
 +++ b/src/Apps/gamescopereaper.cpp
 @@ -2,8 +2,10 @@
@@ -11,32 +13,28 @@
  
  #include <getopt.h>
  #include <pthread.h>
-@@ -16,6 +18,51 @@
+@@ -16,6 +18,47 @@ namespace gamescope
  {
      static LogScope s_ReaperLog( "reaper" );
  
 +    // Cleared by the signal handler when the parent (gamescope) dies.
 +    static bool s_bRun = true;
 +
-+    // The primary child is wine's wrapper chain (explorer -> winhandler), which
-+    // outlives the game, so waiting on it alone would keep the session alive
-+    // after the game quits. The launcher hands us the game's image name in
-+    // GAMENATIVE_GAME_PROCESS; when set, end the session as soon as that process
-+    // is gone -- but only after it has been seen once, so a game that has not
-+    // started yet (or a pre-install step) never ends the session early, and only
-+    // after two consecutive misses, so a process briefly between images is not
-+    // mistaken for an exit. Without the name we fall back to the primary child.
++    // The session is over when no guest image is left. Wine's own processes --
++    // the wrapper chain that started the game, explorer, services -- outlive the
++    // game, so waiting on the primary child alone would keep the session alive
++    // after it quits; the guest watch ignores them by living in drive_c/windows.
++    //
++    // The idle window covers a launcher handing off: it exits before the game's
++    // process appears, and ending the session in that gap kills the game as it
++    // starts (Batman: Arkham Asylum GOTY). It also absorbs a process briefly
++    // between images.
 +    static void WaitForSessionEnd( pid_t nPrimaryChild )
 +    {
-+        const char *pszGameImage = getenv( "GAMENATIVE_GAME_PROCESS" );
-+        if ( !pszGameImage || !*pszGameImage )
-+        {
-+            Process::WaitForAllChildren( nPrimaryChild );
-+            return;
-+        }
-+
++        const int nIdlePollsToEnd = 8;   // 2 s at the 250 ms poll below
 +        bool bSeen = false;
-+        int nMisses = 0;
++        int nIdlePolls = 0;
++
 +        while ( s_bRun )
 +        {
 +            int nStatus = 0;
@@ -44,14 +42,14 @@
 +            if ( nDeadChild == nPrimaryChild || ( nDeadChild == -1 && errno == ECHILD ) )
 +                return;
 +
-+            if ( Process::IsProcessImageRunning( pszGameImage ) )
++            if ( Process::IsGuestProcessRunning() )
 +            {
 +                bSeen = true;
-+                nMisses = 0;
++                nIdlePolls = 0;
 +            }
-+            else if ( bSeen && ++nMisses >= 2 )
++            else if ( bSeen && ++nIdlePolls >= nIdlePollsToEnd )
 +            {
-+                s_ReaperLog.infof( "\"%s\" exited. Ending session.", pszGameImage );
++                s_ReaperLog.infof( "No guest process left. Ending session." );
 +                return;
 +            }
 +
@@ -63,15 +61,16 @@
      // Watches over a PID and waits for all the children to die.
      // It sets itself up as a subreaper so any children get reparented ti oti.
      // If the primary process dies, it kills all the children.
-@@ -37,7 +84,6 @@
+@@ -37,8 +80,6 @@ namespace gamescope
  
          bool bRespawn = false;
          bool bNewSession = false;
 -        static bool s_bRun = true;
- 
+-
          int nOptIndex = -1;
          int nOption = -1;
-@@ -140,7 +186,7 @@
+         while ( ( nOption = getopt_long(argc, argv, "", k_ReaperOptions, &nOptIndex ) ) != -1 )
+@@ -140,7 +181,7 @@ namespace gamescope
              // Wait for the primary child to die, then forward the death signal to
              // all of the other children, if we aren't in a PID namespace.
              if ( s_bRun )
@@ -80,21 +79,8 @@
  
              if ( bRespawn )
              {
---- a/src/Utils/Process.h
-+++ b/src/Utils/Process.h
-@@ -16,6 +16,12 @@
-     // Matches against comm, which the kernel truncates to 15 chars.
-     bool IsProcessRunning( const char *pszComm );
- 
-+    // True while a process is running whose command line names pszImageName as
-+    // its own image (argv[0]) or as wine's argument (argv[1]) -- i.e. the game
-+    // the session is hosting. Wrapper processes that merely carry the name as a
-+    // later argument do not count.
-+    bool IsProcessImageRunning( const char *pszImageName );
-+
-     void KillAllChildren( pid_t nParentPid, int nSignal );
-     void KillProcess( pid_t nPid, int nSignal );
- 
+diff --git a/src/Utils/Process.cpp b/src/Utils/Process.cpp
+index 7333229..49b582c 100644
 --- a/src/Utils/Process.cpp
 +++ b/src/Utils/Process.cpp
 @@ -11,6 +11,7 @@
@@ -105,56 +91,49 @@
  #include <vector>
  
  #include <errno.h>
-@@ -139,6 +140,85 @@
-                 return true;
-         }
+@@ -142,6 +143,85 @@ namespace gamescope::Process
+         return false;
+     }
  
++    // The final component of a path, with both '/' and '\\' as separators
++    // (Windows paths in a wine command line).
++    static const char *Basename( const char *pszValue )
++    {
++        const char *pszBase = pszValue;
++        for ( const char *p = pszValue; *p; p++ )
++        {
++            if ( *p == '/' || *p == '\\' )
++                pszBase = p + 1;
++        }
++        return pszBase;
++    }
++
++    // Wine's own programs live in the prefix's windows directory.
++    static bool IsUnderWindowsDirectory( const char *pszValue )
++    {
++        for ( const char *p = pszValue; *p; p++ )
++        {
++            if ( strncasecmp( p, "windows\\", 8 ) == 0 || strncasecmp( p, "windows/", 8 ) == 0 )
++                return true;
++        }
 +        return false;
 +    }
 +
-+    // Case-insensitive comparison of two paths' final components, treating both
-+    // '/' and '\\' as separators (Windows paths).
-+    static bool BasenameEquals( const char *pszPath, const char *pszName )
++    static bool IsGuestImage( const char *pszValue )
 +    {
-+        auto basename = []( const char *pszValue ) -> const char *
-+        {
-+            const char *pszBase = pszValue;
-+            for ( const char *p = pszValue; *p; p++ )
-+            {
-+                if ( *p == '/' || *p == '\\' )
-+                    pszBase = p + 1;
-+            }
-+            return pszBase;
-+        };
-+
-+        const char *pszBase = basename( pszPath );
-+        const char *pszWant = basename( pszName );
-+        return *pszBase && *pszWant && strcasecmp( pszBase, pszWant ) == 0;
-+    }
-+
-+    // True when the command line names the guest image as the process's own
-+    // program (argv[0]) or as wine's argument (argv[1]). Wine execs a guest as
-+    // "<wine-loader> <guest-image> [args]", and depending on how the guest was
-+    // started either slot holds its Windows path. Nothing deeper is examined:
-+    // gamescope, the session reaper, and the top-level wine that starts
-+    // explorer carry the guest path only in later arguments, so a wider match
-+    // makes the reaper match its own command line whenever the launcher hands
-+    // the guest exe straight to wine (Dave the Diver) and it then never sees
-+    // the guest leave. The compare is case-insensitive because Windows paths are.
-+    static bool ImageNameMatches( const char *pszCmdline, size_t nLength, const char *pszImageName )
-+    {
-+        if ( BasenameEquals( pszCmdline, pszImageName ) )
-+            return true;
-+
-+        // argv[1] is the field after the first NUL, if it lies within the read data.
-+        const char *pszNul = (const char *) memchr( pszCmdline, '\0', nLength );
-+        if ( !pszNul || pszNul + 1 >= pszCmdline + nLength )
++        if ( !*pszValue || IsUnderWindowsDirectory( pszValue ) )
 +            return false;
 +
-+        return BasenameEquals( pszNul + 1, pszImageName );
++        // The guest is started by path; a bare image name is wine's own doing.
++        if ( !strpbrk( pszValue, "/\\" ) )
++            return false;
++
++        const char *pszBase = Basename( pszValue );
++        size_t nLength = strlen( pszBase );
++        return nLength > 4 && strcasecmp( pszBase + nLength - 4, ".exe" ) == 0;
 +    }
 +
-+    bool IsProcessImageRunning( const char *pszImageName )
++    bool IsGuestProcessRunning()
 +    {
 +        DIR *pProcDir = opendir( "/proc" );
 +        if ( !pProcDir )
@@ -184,10 +163,36 @@
 +            size_t nRead = fread( szCmdline, 1, sizeof( szCmdline ) - 1, pCmdlineFile );
 +            szCmdline[ nRead ] = '\0';
 +
-+            if ( ImageNameMatches( szCmdline, nRead, pszImageName ) )
++            if ( IsGuestImage( szCmdline ) )
++                return true;
++
++            const char *pszNul = (const char *) memchr( szCmdline, '\0', nRead );
++            if ( pszNul && pszNul + 1 < szCmdline + nRead && IsGuestImage( pszNul + 1 ) )
 +                return true;
 +        }
 +
-         return false;
-     }
++        return false;
++    }
++
+     void KillProcessTree( std::vector<pid_t> nPids, int nSignal )
+     {
+         for ( pid_t nPid : nPids )
+diff --git a/src/Utils/Process.h b/src/Utils/Process.h
+index 2208dae..262eaf8 100644
+--- a/src/Utils/Process.h
++++ b/src/Utils/Process.h
+@@ -16,6 +16,14 @@ namespace gamescope::Process
+     // Matches against comm, which the kernel truncates to 15 chars.
+     bool IsProcessRunning( const char *pszComm );
+ 
++    // True while a guest image is running: a process whose command line names a
++    // .exe outside wine's own windows directory as its program (argv[0]) or as
++    // wine's argument (argv[1]). Wine's builtins (explorer, services, and the
++    // rest of drive_c/windows) do not count, so the shell that outlives the game
++    // cannot hold the session open, and a launcher handing off to a differently
++    // named game image is followed rather than mistaken for an exit.
++    bool IsGuestProcessRunning();
++
+     void KillAllChildren( pid_t nParentPid, int nSignal );
+     void KillProcess( pid_t nPid, int nSignal );
  
