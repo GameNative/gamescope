@@ -1,0 +1,674 @@
+A45 — run on Vulkan 1.1 drivers
+
+The Arm drivers on the Pixel 7 (Mali-G710 r36p0, 1.1.201), the Pixel 6 and the
+Galaxy A34 (Mali-G78 and Mali-G68 r32p1, 1.1.177) report apiVersion 1.1, so
+selectPhysDev skipped them and gamescope exited with "failed to find physical
+device". Those drivers ship most of the 1.2 features as extensions.
+
+A 1.1 device is now accepted. On it the device is created with the extension
+feature structures instead of VkPhysicalDeviceVulkan12Features and 13Features:
+VK_KHR_timeline_semaphore and VK_EXT_scalar_block_layout (both required, with
+an error naming the missing one), VK_KHR_shader_float16_int8 (else the fp32
+FSR and NIS shaders), VK_KHR_image_format_list when present (else DRM format
+modifiers are turned off, since the modifier extension needs it on 1.1), and
+VK_KHR_dynamic_rendering with its create_renderpass2 and depth_stencil_resolve
+dependencies (else ReShade effects are not loaded). The timeline and dynamic
+rendering entry points are loaded by their KHR names. The device-limits log
+reads the same values from the extension structures.
+
+VK_EXT_robustness2 is optional on every device. Without nullDescriptor, empty
+descriptor slots get 1x1 zero placeholders (2D RGBA8 sampled and storage, 1D
+and 3D RGBA16 for the LUTs, and a 2x2 NV12 image with the YCbCr conversion
+for the immutable-sampler slots, or the 2D placeholder in the A44 fallback
+layout). On the swapchain backends VK_KHR_swapchain_mutable_format,
+VK_KHR_present_id and VK_KHR_present_wait are optional: without the first the
+swapchain is created with one view format, without the others presents carry
+no id and the present-wait thread is not started. Each missing extension logs
+one "<extension> not available, ..." line.
+
+A 1.2 or newer device with these extensions takes the same extensions, the same
+feature chain and the same code paths as before.
+
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -337,6 +337,8 @@ bool CVulkanDevice::BInit(VkInstance instance, VkSurfaceKHR surface)
+ 		return false;
+ 	if (!createScratchResources())
+ 		return false;
++	if (!createNullDescriptorFallback())
++		return false;
+ 
+ 	m_bInitialized = true;
+ 
+@@ -372,7 +374,7 @@ bool CVulkanDevice::selectPhysDev(VkSurfaceKHR surface)
+ 		VkPhysicalDeviceProperties deviceProperties;
+ 		vk.GetPhysicalDeviceProperties(cphysDev, &deviceProperties);
+ 
+-		if (deviceProperties.apiVersion < VK_API_VERSION_1_2)
++		if (deviceProperties.apiVersion < VK_API_VERSION_1_1)
+ 			continue;
+ 
+ 		uint32_t queueFamilyCount = 0;
+@@ -460,6 +462,19 @@ bool CVulkanDevice::createDevice()
+ 	m_supportedExts.resize(supportedExtensionCount);
+ 	vk.EnumerateDeviceExtensionProperties( physDev(), NULL, &supportedExtensionCount, m_supportedExts.data() );
+ 
++	{
++		VkPhysicalDeviceProperties deviceProperties;
++		vk.GetPhysicalDeviceProperties( physDev(), &deviceProperties );
++		m_bVulkan11 = deviceProperties.apiVersion < VK_API_VERSION_1_2;
++		if ( m_bVulkan11 )
++		{
++			vk_log.infof( "Vulkan 1.1 driver (%u.%u.%u): using extension feature structures",
++				VK_API_VERSION_MAJOR( deviceProperties.apiVersion ),
++				VK_API_VERSION_MINOR( deviceProperties.apiVersion ),
++				VK_API_VERSION_PATCH( deviceProperties.apiVersion ) );
++		}
++	}
++
+ 	if ( !GetBackend()->ValidPhysicalDevice( physDev() ) ) {
+ 		vk_log.errorf( "not a valid physical device" );
+ 		return false;
+@@ -538,6 +553,7 @@ bool CVulkanDevice::createDevice()
+ 		m_bSupportsModifiers = false;
+ 	}
+ 
++	if ( !m_bVulkan11 )
+ 	{
+ 		VkPhysicalDeviceVulkan12Features vulkan12Features = {
+ 			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+@@ -549,6 +565,82 @@ bool CVulkanDevice::createDevice()
+ 		vk.GetPhysicalDeviceFeatures2( physDev(), &features2 );
+ 
+ 		m_bSupportsFp16 = vulkan12Features.shaderFloat16 && features2.features.shaderInt16;
++		m_bDynamicRendering = true;
++	}
++	else
++	{
++		VkPhysicalDeviceFeatures2 features2 = {
++			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
++		};
++		VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeatures = {
++			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
++		};
++		VkPhysicalDeviceScalarBlockLayoutFeatures scalarFeatures = {
++			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES,
++		};
++		VkPhysicalDeviceShaderFloat16Int8Features float16Features = {
++			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
++		};
++		VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamicRenderingFeatures = {
++			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR,
++		};
++
++		const bool bHasTimeline = hasDeviceExtension( VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME );
++		const bool bHasScalar = hasDeviceExtension( VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME );
++		const bool bHasFloat16 = hasDeviceExtension( VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME );
++		const bool bHasDynamicRendering = hasDeviceExtension( VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME ) &&
++			hasDeviceExtension( VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME ) &&
++			hasDeviceExtension( VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME );
++
++		if ( bHasTimeline )
++			timelineFeatures.pNext = std::exchange( features2.pNext, &timelineFeatures );
++		if ( bHasScalar )
++			scalarFeatures.pNext = std::exchange( features2.pNext, &scalarFeatures );
++		if ( bHasFloat16 )
++			float16Features.pNext = std::exchange( features2.pNext, &float16Features );
++		if ( bHasDynamicRendering )
++			dynamicRenderingFeatures.pNext = std::exchange( features2.pNext, &dynamicRenderingFeatures );
++		vk.GetPhysicalDeviceFeatures2( physDev(), &features2 );
++
++		if ( !timelineFeatures.timelineSemaphore )
++		{
++			vk_log.errorf( "Vulkan 1.1 driver without VK_KHR_timeline_semaphore (timelineSemaphore): gamescope cannot synchronise its submissions" );
++			return false;
++		}
++		if ( !scalarFeatures.scalarBlockLayout )
++		{
++			vk_log.errorf( "Vulkan 1.1 driver without VK_EXT_scalar_block_layout (scalarBlockLayout): the composite shaders cannot be used" );
++			return false;
++		}
++
++		m_bSupportsFp16 = float16Features.shaderFloat16 && features2.features.shaderInt16;
++		if ( !m_bSupportsFp16 )
++			vk_log.infof( "VK_KHR_shader_float16_int8 not available, using the fp32 FSR and NIS shaders" );
++
++		m_bDynamicRendering = dynamicRenderingFeatures.dynamicRendering;
++		if ( !m_bDynamicRendering )
++			vk_log.infof( "VK_KHR_dynamic_rendering not available, ReShade effects are disabled" );
++	}
++
++	if ( hasDeviceExtension( VK_EXT_ROBUSTNESS_2_EXTENSION_NAME ) )
++	{
++		VkPhysicalDeviceRobustness2FeaturesEXT robustness2Features = {
++			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
++		};
++		VkPhysicalDeviceFeatures2 features2 = {
++			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
++			.pNext = &robustness2Features,
++		};
++		vk.GetPhysicalDeviceFeatures2( physDev(), &features2 );
++		m_bNullDescriptor = robustness2Features.nullDescriptor;
++	}
++	if ( !m_bNullDescriptor )
++		vk_log.infof( "VK_EXT_robustness2 not available, binding placeholder images to empty descriptor slots" );
++
++	if ( m_bVulkan11 && m_bSupportsModifiers && !hasDeviceExtension( VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME ) )
++	{
++		vk_log.infof( "VK_KHR_image_format_list not available, disabling DRM format modifier support" );
++		m_bSupportsModifiers = false;
+ 	}
+ 
+ 	{
+@@ -590,10 +682,23 @@ bool CVulkanDevice::createDevice()
+ 	if ( GetBackend()->UsesVulkanSwapchain() )
+ 	{
+ 		enabledExtensions.push_back( VK_KHR_SWAPCHAIN_EXTENSION_NAME );
+-		enabledExtensions.push_back( VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME );
+ 
+-		enabledExtensions.push_back( VK_KHR_PRESENT_ID_EXTENSION_NAME );
+-		enabledExtensions.push_back( VK_KHR_PRESENT_WAIT_EXTENSION_NAME );
++		m_bSwapchainMutableFormat = hasDeviceExtension( VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME );
++		if ( m_bSwapchainMutableFormat )
++			enabledExtensions.push_back( VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME );
++		else
++			vk_log.infof( "VK_KHR_swapchain_mutable_format not available, swapchain images get a single view format" );
++
++		m_bPresentId = hasDeviceExtension( VK_KHR_PRESENT_ID_EXTENSION_NAME );
++		m_bPresentWait = m_bPresentId && hasDeviceExtension( VK_KHR_PRESENT_WAIT_EXTENSION_NAME );
++		if ( m_bPresentId )
++			enabledExtensions.push_back( VK_KHR_PRESENT_ID_EXTENSION_NAME );
++		else
++			vk_log.infof( "VK_KHR_present_id not available, presenting without present ids" );
++		if ( m_bPresentWait )
++			enabledExtensions.push_back( VK_KHR_PRESENT_WAIT_EXTENSION_NAME );
++		else
++			vk_log.infof( "VK_KHR_present_wait not available, the vblank timer runs without present feedback" );
+ 
+ 		if ( supportsHDRMetadata )
+ 			enabledExtensions.push_back( VK_EXT_HDR_METADATA_EXTENSION_NAME );
+@@ -610,11 +715,28 @@ bool CVulkanDevice::createDevice()
+ 
+ 	enabledExtensions.push_back( VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME );
+ 
+-	enabledExtensions.push_back( VK_EXT_ROBUSTNESS_2_EXTENSION_NAME );
++	if ( m_bNullDescriptor )
++		enabledExtensions.push_back( VK_EXT_ROBUSTNESS_2_EXTENSION_NAME );
+ #if 0
+ 	enabledExtensions.push_back( VK_KHR_MAINTENANCE_5_EXTENSION_NAME );
+ #endif
+ 
++	if ( m_bVulkan11 )
++	{
++		enabledExtensions.push_back( VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME );
++		enabledExtensions.push_back( VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME );
++		if ( m_bSupportsFp16 )
++			enabledExtensions.push_back( VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME );
++		if ( hasDeviceExtension( VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME ) )
++			enabledExtensions.push_back( VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME );
++		if ( m_bDynamicRendering )
++		{
++			enabledExtensions.push_back( VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME );
++			enabledExtensions.push_back( VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME );
++			enabledExtensions.push_back( VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME );
++		}
++	}
++
+ 	for ( auto& extension : GetBackend()->GetDeviceExtensions( physDev() ) )
+ 		enabledExtensions.push_back( extension );
+ 
+@@ -668,7 +790,7 @@ bool CVulkanDevice::createDevice()
+ 
+ 	VkPhysicalDeviceFeatures2 features2 = {
+ 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+-		.pNext = &presentIdFeatures,
++		.pNext = m_bVulkan11 ? nullptr : &presentIdFeatures,
+ 		.features = {
+ 			.shaderInt16 = m_bSupportsFp16,
+ 		},
+@@ -685,12 +807,50 @@ bool CVulkanDevice::createDevice()
+ 
+ 	VkPhysicalDeviceVulkan12Features vulkan12Features = {
+ 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+-		.pNext = std::exchange(features2.pNext, &vulkan12Features),
+ 		.shaderFloat16 = m_bSupportsFp16,
+ 		.scalarBlockLayout = VK_TRUE,
+ 		.timelineSemaphore = VK_TRUE,
+ 	};
+ 
++	VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeatures = {
++		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
++		.timelineSemaphore = VK_TRUE,
++	};
++
++	VkPhysicalDeviceScalarBlockLayoutFeatures scalarFeatures = {
++		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES,
++		.scalarBlockLayout = VK_TRUE,
++	};
++
++	VkPhysicalDeviceShaderFloat16Int8Features float16Features = {
++		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
++		.shaderFloat16 = VK_TRUE,
++	};
++
++	VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamicRenderingFeatures = {
++		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR,
++		.dynamicRendering = VK_TRUE,
++	};
++
++	if ( !m_bVulkan11 )
++	{
++		vulkan12Features.pNext = std::exchange(features2.pNext, &vulkan12Features);
++	}
++	else
++	{
++		presentWaitFeatures.pNext = nullptr;
++		if ( m_bPresentWait )
++			presentWaitFeatures.pNext = std::exchange(features2.pNext, &presentWaitFeatures);
++		if ( m_bPresentId )
++			presentIdFeatures.pNext = std::exchange(features2.pNext, &presentIdFeatures);
++		if ( m_bDynamicRendering )
++			dynamicRenderingFeatures.pNext = std::exchange(features2.pNext, &dynamicRenderingFeatures);
++		if ( m_bSupportsFp16 )
++			float16Features.pNext = std::exchange(features2.pNext, &float16Features);
++		scalarFeatures.pNext = std::exchange(features2.pNext, &scalarFeatures);
++		timelineFeatures.pNext = std::exchange(features2.pNext, &timelineFeatures);
++	}
++
+ 	VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcrFeatures = {
+ 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+ 		.pNext = std::exchange(features2.pNext, &ycbcrFeatures),
+@@ -699,9 +859,10 @@ bool CVulkanDevice::createDevice()
+ 
+ 	VkPhysicalDeviceRobustness2FeaturesEXT robustness2Features = {
+ 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
+-		.pNext = std::exchange(features2.pNext, &robustness2Features),
+ 		.nullDescriptor = VK_TRUE,
+ 	};
++	if ( m_bNullDescriptor )
++		robustness2Features.pNext = std::exchange(features2.pNext, &robustness2Features);
+ 
+ 	VkResult res = vk.CreateDevice(physDev(), &deviceCreateInfo, nullptr, &m_device);
+ 	if ( res == VK_ERROR_NOT_PERMITTED_KHR && gamescope::Process::HasCapSysNice() )
+@@ -729,6 +890,22 @@ bool CVulkanDevice::createDevice()
+ 	VULKAN_DEVICE_FUNCTIONS
+ 	#undef VK_FUNC
+ 
++	if ( m_bVulkan11 )
++	{
++		vk.WaitSemaphores = (PFN_vkWaitSemaphores) vk.GetDeviceProcAddr( device(), "vkWaitSemaphoresKHR" );
++		vk.GetSemaphoreCounterValue = (PFN_vkGetSemaphoreCounterValue) vk.GetDeviceProcAddr( device(), "vkGetSemaphoreCounterValueKHR" );
++		vk.CmdBeginRendering = m_bDynamicRendering ? (PFN_vkCmdBeginRendering) vk.GetDeviceProcAddr( device(), "vkCmdBeginRenderingKHR" ) : nullptr;
++		vk.CmdEndRendering = m_bDynamicRendering ? (PFN_vkCmdEndRendering) vk.GetDeviceProcAddr( device(), "vkCmdEndRenderingKHR" ) : nullptr;
++		if ( !vk.CmdBeginRendering || !vk.CmdEndRendering )
++			m_bDynamicRendering = false;
++
++		if ( !vk.WaitSemaphores || !vk.GetSemaphoreCounterValue )
++		{
++			vk_log.errorf( "Vulkan 1.1 driver returned no vkWaitSemaphoresKHR/vkGetSemaphoreCounterValueKHR" );
++			return false;
++		}
++	}
++
+ 	vk.GetDeviceQueue(device(), m_queueFamily, 0, &m_queue);
+ 	if ( m_queueFamily == m_generalQueueFamily )
+ 		m_generalQueue = m_queue;
+@@ -1121,6 +1298,172 @@ bool CVulkanDevice::createScratchResources()
+ 	return true;
+ }
+ 
++bool CVulkanDevice::hasDeviceExtension( const char *pszName ) const
++{
++	for ( const auto &ext : m_supportedExts )
++	{
++		if ( strcmp( ext.extensionName, pszName ) == 0 )
++			return true;
++	}
++	return false;
++}
++
++bool CVulkanDevice::createNullDescriptorFallback()
++{
++	if ( m_bNullDescriptor )
++		return true;
++
++	auto createPlaceholder = [this]( VkImageType eType, VkFormat eFormat, uint32_t uBytes, bool bStorage ) -> gamescope::OwningRc<CVulkanTexture>
++	{
++		CVulkanTexture::createFlags flags;
++		flags.bSampled = true;
++		flags.bStorage = bStorage;
++		flags.bTransferDst = true;
++		flags.imageType = eType;
++
++		gamescope::OwningRc<CVulkanTexture> pTexture = new CVulkanTexture();
++		if ( !pTexture->BInit( 1u, 1u, 1u, VulkanFormatToDRM( eFormat ), flags ) )
++			return nullptr;
++
++		auto [pDst, uOffset] = uploadBufferData( uBytes );
++		memset( pDst, 0, uBytes );
++
++		auto cmdBuffer = commandBuffer();
++		cmdBuffer->copyBufferToImage( uploadBuffer(), uOffset, 0, pTexture.get() );
++		submit( std::move( cmdBuffer ) );
++		return pTexture;
++	};
++
++	m_pNullTexture2D = createPlaceholder( VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, 4, true );
++	m_pNullTexture1D = createPlaceholder( VK_IMAGE_TYPE_1D, VK_FORMAT_R16G16B16A16_UNORM, 8, false );
++	m_pNullTexture3D = createPlaceholder( VK_IMAGE_TYPE_3D, VK_FORMAT_R16G16B16A16_UNORM, 8, false );
++	if ( m_pNullTexture2D == nullptr || m_pNullTexture1D == nullptr || m_pNullTexture3D == nullptr )
++	{
++		vk_log.errorf( "failed to create the placeholder images for empty descriptor slots" );
++		return false;
++	}
++
++	if ( !m_bNoImmutableYcbcr )
++	{
++		VkFormatProperties nv12Properties;
++		vk.GetPhysicalDeviceFormatProperties( physDev(), VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, &nv12Properties );
++		VkResult res = ( nv12Properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT ) ? VK_SUCCESS : VK_ERROR_FORMAT_NOT_SUPPORTED;
++
++		if ( res == VK_SUCCESS )
++		{
++			VkImageCreateInfo imageInfo = {
++				.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++				.imageType = VK_IMAGE_TYPE_2D,
++				.format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
++				.extent = { 2, 2, 1 },
++				.mipLevels = 1,
++				.arrayLayers = 1,
++				.samples = VK_SAMPLE_COUNT_1_BIT,
++				.tiling = VK_IMAGE_TILING_OPTIMAL,
++				.usage = VK_IMAGE_USAGE_SAMPLED_BIT,
++				.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++				.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++			};
++			res = vk.CreateImage( device(), &imageInfo, nullptr, &m_nullYcbcrImage );
++		}
++
++		if ( res == VK_SUCCESS )
++		{
++			VkMemoryRequirements memReqs;
++			vk.GetImageMemoryRequirements( device(), m_nullYcbcrImage, &memReqs );
++			int32_t memType = findMemoryType( VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, memReqs.memoryTypeBits );
++			VkMemoryAllocateInfo allocInfo = {
++				.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++				.allocationSize = memReqs.size,
++				.memoryTypeIndex = uint32_t( memType ),
++			};
++			res = memType < 0 ? VK_ERROR_OUT_OF_DEVICE_MEMORY : vk.AllocateMemory( device(), &allocInfo, nullptr, &m_nullYcbcrMemory );
++			if ( res == VK_SUCCESS )
++				res = vk.BindImageMemory( device(), m_nullYcbcrImage, m_nullYcbcrMemory, 0 );
++		}
++
++		if ( res == VK_SUCCESS )
++		{
++			VkSamplerYcbcrConversionInfo conversionInfo = {
++				.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
++				.conversion = m_ycbcrConversion,
++			};
++			VkImageViewCreateInfo viewInfo = {
++				.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++				.pNext = &conversionInfo,
++				.image = m_nullYcbcrImage,
++				.viewType = VK_IMAGE_VIEW_TYPE_2D,
++				.format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
++				.subresourceRange = {
++					.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++					.levelCount = 1,
++					.layerCount = 1,
++				},
++			};
++			res = vk.CreateImageView( device(), &viewInfo, nullptr, &m_nullYcbcrView );
++		}
++
++		if ( res == VK_SUCCESS )
++		{
++			VkImageMemoryBarrier barrier = {
++				.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++				.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
++				.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++				.newLayout = VK_IMAGE_LAYOUT_GENERAL,
++				.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++				.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++				.image = m_nullYcbcrImage,
++				.subresourceRange = {
++					.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++					.levelCount = 1,
++					.layerCount = 1,
++				},
++			};
++			auto cmdBuffer = commandBuffer();
++			vk.CmdPipelineBarrier( cmdBuffer->rawBuffer(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++				0, 0, nullptr, 0, nullptr, 1, &barrier );
++			submit( std::move( cmdBuffer ) );
++		}
++		else
++		{
++			vk_log.infof( "no NV12 placeholder image (VkResult %d), YCbCr slots get the RGBA placeholder", res );
++			if ( m_nullYcbcrImage != VK_NULL_HANDLE )
++				vk.DestroyImage( device(), m_nullYcbcrImage, nullptr );
++			if ( m_nullYcbcrMemory != VK_NULL_HANDLE )
++				vk.FreeMemory( device(), m_nullYcbcrMemory, nullptr );
++			m_nullYcbcrImage = VK_NULL_HANDLE;
++			m_nullYcbcrMemory = VK_NULL_HANDLE;
++		}
++	}
++
++	waitIdle();
++	return true;
++}
++
++VkImageView CVulkanDevice::nullImageView( VkImageViewType eViewType )
++{
++	if ( m_bNullDescriptor )
++		return VK_NULL_HANDLE;
++
++	switch ( eViewType )
++	{
++		case VK_IMAGE_VIEW_TYPE_1D: return m_pNullTexture1D->srgbView();
++		case VK_IMAGE_VIEW_TYPE_3D: return m_pNullTexture3D->srgbView();
++		default: return m_pNullTexture2D->srgbView();
++	}
++}
++
++VkImageView CVulkanDevice::nullYcbcrImageView()
++{
++	if ( m_bNullDescriptor )
++		return VK_NULL_HANDLE;
++
++	if ( !m_bNoImmutableYcbcr && m_nullYcbcrView != VK_NULL_HANDLE )
++		return m_nullYcbcrView;
++
++	return m_pNullTexture2D->srgbView();
++}
++
+ bool CVulkanDevice::createUploadBuffer( uint32_t size )
+ {
+ 	// Whole MiB: growth is not a per-byte decision, and a rounded size keeps a
+@@ -1403,6 +1746,8 @@ void CVulkanDevice::logDeviceLimits()
+ 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+ 		.pNext = &maintenance3Props,
+ 	};
++	if ( m_bVulkan11 && !hasDeviceExtension( VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME ) )
++		maintenance3Props.pNext = nullptr;
+ 	vk.GetPhysicalDeviceProperties2( physDev(), &props2 );
+ 	const VkPhysicalDeviceProperties &props = props2.properties;
+ 	const VkPhysicalDeviceLimits &l = props.limits;
+@@ -1418,7 +1763,38 @@ void CVulkanDevice::logDeviceLimits()
+ 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+ 		.pNext = &features11,
+ 	};
+-	vk.GetPhysicalDeviceFeatures2( physDev(), &features2 );
++	if ( m_bVulkan11 )
++	{
++		VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcrFeatures = {
++			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
++		};
++		VkPhysicalDeviceScalarBlockLayoutFeatures scalarFeatures = {
++			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES,
++		};
++		VkPhysicalDeviceShaderFloat16Int8Features float16Features = {
++			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
++		};
++		VkPhysicalDeviceUniformBufferStandardLayoutFeatures uboLayoutFeatures = {
++			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES,
++		};
++		features2.pNext = &ycbcrFeatures;
++		if ( hasDeviceExtension( VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME ) )
++			scalarFeatures.pNext = std::exchange( features2.pNext, &scalarFeatures );
++		if ( hasDeviceExtension( VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME ) )
++			float16Features.pNext = std::exchange( features2.pNext, &float16Features );
++		if ( hasDeviceExtension( VK_KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_EXTENSION_NAME ) )
++			uboLayoutFeatures.pNext = std::exchange( features2.pNext, &uboLayoutFeatures );
++		vk.GetPhysicalDeviceFeatures2( physDev(), &features2 );
++
++		features11.samplerYcbcrConversion = ycbcrFeatures.samplerYcbcrConversion;
++		features12.scalarBlockLayout = scalarFeatures.scalarBlockLayout;
++		features12.shaderFloat16 = float16Features.shaderFloat16;
++		features12.uniformBufferStandardLayout = uboLayoutFeatures.uniformBufferStandardLayout;
++	}
++	else
++	{
++		vk.GetPhysicalDeviceFeatures2( physDev(), &features2 );
++	}
+ 
+ 	vk_log.infof( "limits: device=\"%s\" vendorID=0x%04x deviceID=0x%04x api=%u.%u.%u driverVersion=0x%08x driverID=%d driverName=\"%s\" driverInfo=\"%s\"",
+ 		props.deviceName, props.vendorID, props.deviceID,
+@@ -2009,6 +2385,8 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
+ 		ycbcrImageDescriptors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+ 		if (m_device->m_bNoImmutableYcbcr)
+ 			ycbcrImageDescriptors[i].sampler = imageDescriptors[i].sampler;
++		imageDescriptors[i].imageView = m_device->nullImageView(VK_IMAGE_VIEW_TYPE_2D);
++		ycbcrImageDescriptors[i].imageView = m_device->nullYcbcrImageView();
+ 		if (m_boundTextures[i] == nullptr)
+ 			continue;
+ 
+@@ -2033,17 +2411,22 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
+ 		shaperLutDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+ 		// TODO(Josh): I hate the fact that srgbView = view *as* raw srgb and treat as linear.
+ 		// I need to change this, it's so utterly stupid and confusing.
+-		shaperLutDescriptor[i].imageView = m_shaperLut[i] ? m_shaperLut[i]->srgbView() : VK_NULL_HANDLE;
++		shaperLutDescriptor[i].imageView = m_shaperLut[i] ? m_shaperLut[i]->srgbView() : m_device->nullImageView(VK_IMAGE_VIEW_TYPE_1D);
+ 
+ 		lut3DDescriptor[i].sampler = m_device->sampler(nearestState);
+ 		lut3DDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+-		lut3DDescriptor[i].imageView = m_lut3D[i] ? m_lut3D[i]->srgbView() : VK_NULL_HANDLE;
++		lut3DDescriptor[i].imageView = m_lut3D[i] ? m_lut3D[i]->srgbView() : m_device->nullImageView(VK_IMAGE_VIEW_TYPE_3D);
+ 	}
+ 
+ 	if (!m_target->isYcbcr())
+ 	{
+ 		targetDescriptors[0].imageView = m_target->srgbView();
+ 		targetDescriptors[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++		if (!m_device->supportsNullDescriptor())
++		{
++			targetDescriptors[1].imageView = m_device->nullImageView(VK_IMAGE_VIEW_TYPE_2D);
++			targetDescriptors[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++		}
+ 	}
+ 	else
+ 	{
+@@ -2912,7 +3295,7 @@ bool CVulkanTexture::BInitFromSwapchain( VkImage image, uint32_t width, uint32_t
+ 	};
+ 
+ 	createInfo.pNext = &viewUsageInfo;
+-	createInfo.format = ToSrgbVulkanFormat( format );
++	createInfo.format = g_device.supportsSwapchainMutableFormat() ? ToSrgbVulkanFormat( format ) : ToLinearVulkanFormat( format );
+ 
+ 	res = g_device.vk.CreateImageView(g_device.device(), &createInfo, nullptr, &m_linearView);
+ 	if ( res != VK_SUCCESS ) {
+@@ -3303,7 +3686,7 @@ void vulkan_present_to_window( void )
+ 
+ 	VkPresentInfoKHR presentInfo = {
+ 		.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+-		.pNext = &presentIdInfo,
++		.pNext = g_device.supportsPresentId() ? &presentIdInfo : nullptr,
+ 		.swapchainCount = 1,
+ 		.pSwapchains = &g_output.swapChain,
+ 		.pImageIndices = &g_output.nOutImage,
+@@ -3487,10 +3870,12 @@ bool vulkan_make_swapchain( VulkanOutput_t *pOutput )
+ 
+ 	vk_log.infof("Creating Gamescope nested swapchain with format %u and colorspace %u", eVkFormat, pOutput->surfaceFormats[surfaceFormat].colorSpace);
+ 
++	const bool bMutableFormat = formats[0] != formats[1] && g_device.supportsSwapchainMutableFormat();
++
+ 	VkSwapchainCreateInfoKHR createInfo = {
+ 		.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+-		.pNext = formats[0] != formats[1] ? &usageListInfo : nullptr,
+-		.flags = formats[0] != formats[1] ? VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR : (VkSwapchainCreateFlagBitsKHR )0,
++		.pNext = bMutableFormat ? &usageListInfo : nullptr,
++		.flags = bMutableFormat ? VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR : (VkSwapchainCreateFlagBitsKHR )0,
+ 		.surface = pOutput->surface,
+ 		.minImageCount = imageCount,
+ 		.imageFormat = eVkFormat,
+@@ -3883,7 +4268,7 @@ bool vulkan_init( VkInstance instance, VkSurfaceKHR surface )
+ 	if (!init_nis_data())
+ 		return false;
+ 
+-	if ( GetBackend()->UsesVulkanSwapchain() )
++	if ( GetBackend()->UsesVulkanSwapchain() && g_device.supportsPresentWait() )
+ 	{
+ 		std::thread present_wait_thread( present_wait_thread_func );
+ 		present_wait_thread.detach();
+--- a/src/rendervulkan.hpp
++++ b/src/rendervulkan.hpp
+@@ -876,6 +876,15 @@ public:
+ 	inline dev_t primaryDevId() {return m_drmPrimaryDevId;}
+ 	inline bool supportsFp16() {return m_bSupportsFp16;}
+ 	inline std::vector<VkExtensionProperties>& supportedExtensions() {return m_supportedExts;}
++	bool hasDeviceExtension( const char *pszName ) const;
++	inline bool isVulkan11() {return m_bVulkan11;}
++	inline bool supportsDynamicRendering() {return m_bDynamicRendering;}
++	inline bool supportsPresentId() {return m_bPresentId;}
++	inline bool supportsPresentWait() {return m_bPresentWait;}
++	inline bool supportsSwapchainMutableFormat() {return m_bSwapchainMutableFormat;}
++	inline bool supportsNullDescriptor() {return m_bNullDescriptor;}
++	VkImageView nullImageView( VkImageViewType eViewType );
++	VkImageView nullYcbcrImageView();
+ 
+ 	inline std::pair<void *, uint32_t> uploadBufferData(uint32_t size)
+ 	{
+@@ -921,6 +930,7 @@ protected:
+ 	void compileAllPipelines(std::stop_token st);
+ 	bool createDescriptorLayouts();
+ 	bool ensureUsableLayouts();
++	bool createNullDescriptorFallback();
+ 	void logDeviceLimits();
+ 
+ 	VkDevice m_device = nullptr;
+@@ -949,6 +959,20 @@ protected:
+ 	bool m_bSupportsModifiers = false;
+ 	bool m_bInitialized = false;
+ 
++	bool m_bVulkan11 = false;
++	bool m_bDynamicRendering = false;
++	bool m_bPresentId = false;
++	bool m_bPresentWait = false;
++	bool m_bSwapchainMutableFormat = false;
++	bool m_bNullDescriptor = false;
++
++	gamescope::OwningRc<CVulkanTexture> m_pNullTexture1D;
++	gamescope::OwningRc<CVulkanTexture> m_pNullTexture2D;
++	gamescope::OwningRc<CVulkanTexture> m_pNullTexture3D;
++	VkImage m_nullYcbcrImage = VK_NULL_HANDLE;
++	VkDeviceMemory m_nullYcbcrMemory = VK_NULL_HANDLE;
++	VkImageView m_nullYcbcrView = VK_NULL_HANDLE;
++
+ 
+ 	VkPhysicalDeviceMemoryProperties m_memoryProperties;
+ 
+--- a/src/reshade_effect_manager.cpp
++++ b/src/reshade_effect_manager.cpp
+@@ -1925,6 +1925,11 @@ ReshadeEffectPipeline* ReshadeEffectManager::pipeline(const ReshadeEffectKey &ke
+ 
+     m_lastKey = key;
+     m_lastPipeline = nullptr;
++    if (!m_device->supportsDynamicRendering() || !m_device->vk.CmdBeginRendering)
++    {
++        reshade_log.errorf("Vulkan driver has no dynamic rendering, not loading ReShade effect %s", key.path.c_str());
++        return nullptr;
++    }
+     auto pipeline = std::make_unique<ReshadeEffectPipeline>();
+     if (!pipeline->init(m_device, key))
+         return nullptr;
