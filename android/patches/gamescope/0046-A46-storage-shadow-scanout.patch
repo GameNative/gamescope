@@ -13,8 +13,8 @@ optimal, linear and per-modifier tiling features, picks again asking only
 for transfer-dst from the modifier but storage, sampled and transfer-src
 from the format's optimal tiling (the PowerVR driver has storage only on
 RGBA8, never on BGRA8, so the pick lands on XBGR8888; XBGR8888/ABGR8888 is
-the last pair tried for the primary and overlay planes), and sets
-g_bOutputStorageShadow. The output images are
+the last pair tried for the primary and overlay planes, and the no-overlay
+mapping knows them), and sets g_bOutputStorageShadow. The output images are
 then created as plain copy destinations and each gets an optimal-tiled
 shadow with the storage, sampled and transfer-src usage; vulkan_composite
 targets the shadow and copies it into the scan-out image on the same
@@ -132,6 +132,19 @@ take the old path unchanged.
  				if ( g_nDRMFormatOverlay == DRM_FORMAT_INVALID ) {
  					drm_log.errorf("Overlay plane doesn't support any formats >= 8888");
  					return false;
+@@ -1713,7 +1741,12 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
+ 		case DRM_FORMAT_ARGB8888:
+ 			g_nDRMFormatOverlay = DRM_FORMAT_ARGB8888;
+ 			break;
++		case DRM_FORMAT_XBGR8888:
++		case DRM_FORMAT_ABGR8888:
++			g_nDRMFormatOverlay = DRM_FORMAT_ABGR8888;
++			break;
+ 		default:
++			drm_log.errorf("no overlay format for primary format 0x%08x", g_nDRMFormat);
+ 			return false;
+ 		}
+ 	}
 --- a/src/rendervulkan.cpp
 +++ b/src/rendervulkan.cpp
 @@ -59,6 +59,7 @@
