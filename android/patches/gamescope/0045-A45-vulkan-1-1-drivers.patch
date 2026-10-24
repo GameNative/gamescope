@@ -24,7 +24,11 @@ layout). On the swapchain backends VK_KHR_swapchain_mutable_format,
 VK_KHR_present_id and VK_KHR_present_wait are optional: without the first the
 swapchain is created with one view format, without the others presents carry
 no id and the present-wait thread is not started. Each missing extension logs
-one "<extension> not available, ..." line.
+one "<extension> not available, ..." line. The present_id and present_wait
+feature structures are chained on every device only when their extension was
+enabled: the DRM backend never enables them, and the PowerVR driver (Pixel 10,
+24.3), which has neither, answered the unconditional structures with
+VK_ERROR_FEATURE_NOT_PRESENT.
 
 A 1.2 or newer device with these extensions takes the same extensions, the same
 feature chain and the same code paths as before.
@@ -217,16 +221,27 @@ feature chain and the same code paths as before.
  	for ( auto& extension : GetBackend()->GetDeviceExtensions( physDev() ) )
  		enabledExtensions.push_back( extension );
  
-@@ -668,7 +790,7 @@ bool CVulkanDevice::createDevice()
+@@ -656,19 +778,16 @@ bool CVulkanDevice::createDevice()
+ 
+ 	VkPhysicalDevicePresentWaitFeaturesKHR presentWaitFeatures = {
+ 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
+-		.pNext = &features13,
+ 		.presentWait = VK_TRUE,
+ 	};
+ 
+ 	VkPhysicalDevicePresentIdFeaturesKHR presentIdFeatures = {
+ 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
+-		.pNext = &presentWaitFeatures,
+ 		.presentId = VK_TRUE,
+ 	};
  
  	VkPhysicalDeviceFeatures2 features2 = {
  		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
 -		.pNext = &presentIdFeatures,
-+		.pNext = m_bVulkan11 ? nullptr : &presentIdFeatures,
  		.features = {
  			.shaderInt16 = m_bSupportsFp16,
  		},
-@@ -685,12 +807,50 @@ bool CVulkanDevice::createDevice()
+@@ -685,12 +804,51 @@ bool CVulkanDevice::createDevice()
  
  	VkPhysicalDeviceVulkan12Features vulkan12Features = {
  		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
@@ -256,17 +271,18 @@ feature chain and the same code paths as before.
 +		.dynamicRendering = VK_TRUE,
 +	};
 +
++	if ( m_bPresentWait )
++		presentWaitFeatures.pNext = std::exchange(features2.pNext, &presentWaitFeatures);
++	if ( m_bPresentId )
++		presentIdFeatures.pNext = std::exchange(features2.pNext, &presentIdFeatures);
++
 +	if ( !m_bVulkan11 )
 +	{
++		features13.pNext = std::exchange(features2.pNext, &features13);
 +		vulkan12Features.pNext = std::exchange(features2.pNext, &vulkan12Features);
 +	}
 +	else
 +	{
-+		presentWaitFeatures.pNext = nullptr;
-+		if ( m_bPresentWait )
-+			presentWaitFeatures.pNext = std::exchange(features2.pNext, &presentWaitFeatures);
-+		if ( m_bPresentId )
-+			presentIdFeatures.pNext = std::exchange(features2.pNext, &presentIdFeatures);
 +		if ( m_bDynamicRendering )
 +			dynamicRenderingFeatures.pNext = std::exchange(features2.pNext, &dynamicRenderingFeatures);
 +		if ( m_bSupportsFp16 )
@@ -278,7 +294,7 @@ feature chain and the same code paths as before.
  	VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcrFeatures = {
  		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
  		.pNext = std::exchange(features2.pNext, &ycbcrFeatures),
-@@ -699,9 +859,10 @@ bool CVulkanDevice::createDevice()
+@@ -699,9 +857,10 @@ bool CVulkanDevice::createDevice()
  
  	VkPhysicalDeviceRobustness2FeaturesEXT robustness2Features = {
  		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
@@ -290,7 +306,7 @@ feature chain and the same code paths as before.
  
  	VkResult res = vk.CreateDevice(physDev(), &deviceCreateInfo, nullptr, &m_device);
  	if ( res == VK_ERROR_NOT_PERMITTED_KHR && gamescope::Process::HasCapSysNice() )
-@@ -729,6 +890,22 @@ bool CVulkanDevice::createDevice()
+@@ -729,6 +888,22 @@ bool CVulkanDevice::createDevice()
  	VULKAN_DEVICE_FUNCTIONS
  	#undef VK_FUNC
  
@@ -313,7 +329,7 @@ feature chain and the same code paths as before.
  	vk.GetDeviceQueue(device(), m_queueFamily, 0, &m_queue);
  	if ( m_queueFamily == m_generalQueueFamily )
  		m_generalQueue = m_queue;
-@@ -1121,6 +1298,172 @@ bool CVulkanDevice::createScratchResources()
+@@ -1121,6 +1296,172 @@ bool CVulkanDevice::createScratchResources()
  	return true;
  }
  
@@ -486,7 +502,7 @@ feature chain and the same code paths as before.
  bool CVulkanDevice::createUploadBuffer( uint32_t size )
  {
  	// Whole MiB: growth is not a per-byte decision, and a rounded size keeps a
-@@ -1403,6 +1746,8 @@ void CVulkanDevice::logDeviceLimits()
+@@ -1403,6 +1744,8 @@ void CVulkanDevice::logDeviceLimits()
  		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
  		.pNext = &maintenance3Props,
  	};
@@ -495,7 +511,7 @@ feature chain and the same code paths as before.
  	vk.GetPhysicalDeviceProperties2( physDev(), &props2 );
  	const VkPhysicalDeviceProperties &props = props2.properties;
  	const VkPhysicalDeviceLimits &l = props.limits;
-@@ -1418,7 +1763,38 @@ void CVulkanDevice::logDeviceLimits()
+@@ -1418,7 +1761,38 @@ void CVulkanDevice::logDeviceLimits()
  		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
  		.pNext = &features11,
  	};
@@ -535,7 +551,7 @@ feature chain and the same code paths as before.
  
  	vk_log.infof( "limits: device=\"%s\" vendorID=0x%04x deviceID=0x%04x api=%u.%u.%u driverVersion=0x%08x driverID=%d driverName=\"%s\" driverInfo=\"%s\"",
  		props.deviceName, props.vendorID, props.deviceID,
-@@ -2009,6 +2385,8 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
+@@ -2009,6 +2383,8 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
  		ycbcrImageDescriptors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
  		if (m_device->m_bNoImmutableYcbcr)
  			ycbcrImageDescriptors[i].sampler = imageDescriptors[i].sampler;
@@ -544,7 +560,7 @@ feature chain and the same code paths as before.
  		if (m_boundTextures[i] == nullptr)
  			continue;
  
-@@ -2033,17 +2411,22 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
+@@ -2033,17 +2409,22 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
  		shaperLutDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
  		// TODO(Josh): I hate the fact that srgbView = view *as* raw srgb and treat as linear.
  		// I need to change this, it's so utterly stupid and confusing.
@@ -569,7 +585,7 @@ feature chain and the same code paths as before.
  	}
  	else
  	{
-@@ -2912,7 +3295,7 @@ bool CVulkanTexture::BInitFromSwapchain( VkImage image, uint32_t width, uint32_t
+@@ -2912,7 +3293,7 @@ bool CVulkanTexture::BInitFromSwapchain( VkImage image, uint32_t width, uint32_t
  	};
  
  	createInfo.pNext = &viewUsageInfo;
@@ -578,7 +594,7 @@ feature chain and the same code paths as before.
  
  	res = g_device.vk.CreateImageView(g_device.device(), &createInfo, nullptr, &m_linearView);
  	if ( res != VK_SUCCESS ) {
-@@ -3303,7 +3686,7 @@ void vulkan_present_to_window( void )
+@@ -3303,7 +3684,7 @@ void vulkan_present_to_window( void )
  
  	VkPresentInfoKHR presentInfo = {
  		.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -587,7 +603,7 @@ feature chain and the same code paths as before.
  		.swapchainCount = 1,
  		.pSwapchains = &g_output.swapChain,
  		.pImageIndices = &g_output.nOutImage,
-@@ -3487,10 +3870,12 @@ bool vulkan_make_swapchain( VulkanOutput_t *pOutput )
+@@ -3487,10 +3868,12 @@ bool vulkan_make_swapchain( VulkanOutput_t *pOutput )
  
  	vk_log.infof("Creating Gamescope nested swapchain with format %u and colorspace %u", eVkFormat, pOutput->surfaceFormats[surfaceFormat].colorSpace);
  
@@ -602,7 +618,7 @@ feature chain and the same code paths as before.
  		.surface = pOutput->surface,
  		.minImageCount = imageCount,
  		.imageFormat = eVkFormat,
-@@ -3883,7 +4268,7 @@ bool vulkan_init( VkInstance instance, VkSurfaceKHR surface )
+@@ -3883,7 +4266,7 @@ bool vulkan_init( VkInstance instance, VkSurfaceKHR surface )
  	if (!init_nis_data())
  		return false;
  
