@@ -1,5 +1,19 @@
-diff --git a/src/Apps/gamescopereaper.cpp b/src/Apps/gamescopereaper.cpp
-index 083aaf6..0a8af57 100644
+A28 — end the session when no guest image is left
+
+Wine's own processes outlive the game: the wrapper chain that started it,
+explorer and services all sit in drive_c/windows, so waiting on the primary
+child alone keeps the session alive after the game quits. The reaper watches the
+guest images instead — a .exe named by argv[0] or argv[1] outside wine's windows
+directory — and ends the session when none is left.
+
+An empty guest set is not an exit on its own. A launcher exits before the game's
+image appears, and some titles close the launcher and start a differently named
+executable, so the gap can outlast any fixed window; ending there kills the game
+as it starts. The reaper therefore also fingerprints the session's process tree
+(every pid reachable from the primary child by parent chain) and counts idle
+polls only while that fingerprint is unchanged. A handoff keeps the tree moving
+— forks, exits, the successor appearing — while a finished session goes still.
+An unreadable /proc leaves the flat two-second window in place.
 --- a/src/Apps/gamescopereaper.cpp
 +++ b/src/Apps/gamescopereaper.cpp
 @@ -2,8 +2,10 @@
@@ -13,7 +27,7 @@ index 083aaf6..0a8af57 100644
  
  #include <getopt.h>
  #include <pthread.h>
-@@ -16,6 +18,47 @@ namespace gamescope
+@@ -16,6 +18,64 @@ namespace gamescope
  {
      static LogScope s_ReaperLog( "reaper" );
  
@@ -25,15 +39,17 @@ index 083aaf6..0a8af57 100644
 +    // game, so waiting on the primary child alone would keep the session alive
 +    // after it quits; the guest watch ignores them by living in drive_c/windows.
 +    //
-+    // The idle window covers a launcher handing off: it exits before the game's
-+    // process appears, and ending the session in that gap kills the game as it
-+    // starts (Batman: Arkham Asylum GOTY). It also absorbs a process briefly
-+    // between images.
++    // An empty guest set alone is not an exit: a launcher hands off to a game
++    // image that may be differently named and may take a while to appear, and
++    // ending the session in that gap kills the game as it starts. The session's
++    // tree fingerprint separates the two cases -- a handoff keeps the tree
++    // moving, a finished session goes still.
 +    static void WaitForSessionEnd( pid_t nPrimaryChild )
 +    {
-+        const int nIdlePollsToEnd = 8;   // 2 s at the 250 ms poll below
++        const int nIdlePollsToEnd = 8;   // 2 s of a still, guest-less session
 +        bool bSeen = false;
 +        int nIdlePolls = 0;
++        uint64_t nTreeStamp = 0;
 +
 +        while ( s_bRun )
 +        {
@@ -47,10 +63,25 @@ index 083aaf6..0a8af57 100644
 +                bSeen = true;
 +                nIdlePolls = 0;
 +            }
-+            else if ( bSeen && ++nIdlePolls >= nIdlePollsToEnd )
++            else if ( bSeen )
 +            {
-+                s_ReaperLog.infof( "No guest process left. Ending session." );
-+                return;
++                // An empty guest set is not an exit on its own: a launcher may
++                // hand off to a differently named image, and on a slow title
++                // that gap outlasts any fixed window. A handoff keeps the
++                // session's process tree moving -- a fork here, an exit there --
++                // while a finished session goes still, so only a still tree is
++                // counted. An unreadable /proc (zero) keeps the flat window.
++                const uint64_t nStamp = Process::SessionTreeStamp( nPrimaryChild );
++                const bool bTreeMoved = nStamp != 0 && nStamp != nTreeStamp;
++                nTreeStamp = nStamp;
++
++                if ( bTreeMoved )
++                    nIdlePolls = 0;
++                else if ( ++nIdlePolls >= nIdlePollsToEnd )
++                {
++                    s_ReaperLog.infof( "No guest process left. Ending session." );
++                    return;
++                }
 +            }
 +
 +            struct timespec ts{ 0, 250 * 1000 * 1000 };
@@ -61,7 +92,7 @@ index 083aaf6..0a8af57 100644
      // Watches over a PID and waits for all the children to die.
      // It sets itself up as a subreaper so any children get reparented ti oti.
      // If the primary process dies, it kills all the children.
-@@ -37,8 +80,6 @@ namespace gamescope
+@@ -37,8 +97,6 @@ namespace gamescope
  
          bool bRespawn = false;
          bool bNewSession = false;
@@ -70,7 +101,7 @@ index 083aaf6..0a8af57 100644
          int nOptIndex = -1;
          int nOption = -1;
          while ( ( nOption = getopt_long(argc, argv, "", k_ReaperOptions, &nOptIndex ) ) != -1 )
-@@ -140,7 +181,7 @@ namespace gamescope
+@@ -140,7 +198,7 @@ namespace gamescope
              // Wait for the primary child to die, then forward the death signal to
              // all of the other children, if we aren't in a PID namespace.
              if ( s_bRun )
@@ -79,11 +110,17 @@ index 083aaf6..0a8af57 100644
  
              if ( bRespawn )
              {
-diff --git a/src/Utils/Process.cpp b/src/Utils/Process.cpp
-index 7333229..745f833 100644
 --- a/src/Utils/Process.cpp
 +++ b/src/Utils/Process.cpp
-@@ -11,6 +11,7 @@
+@@ -5,12 +5,15 @@
+ #include "../Utils/Parsers.h"
+ #include "../Utils/String.h"
+ 
++#include <algorithm>
+ #include <array>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
  #include <fstream>
  #include <istream>
  #include <string>
@@ -91,7 +128,7 @@ index 7333229..745f833 100644
  #include <vector>
  
  #include <errno.h>
-@@ -142,6 +143,117 @@ namespace gamescope::Process
+@@ -142,6 +145,195 @@ namespace gamescope::Process
          return false;
      }
  
@@ -108,41 +145,12 @@ index 7333229..745f833 100644
 +        return pszBase;
 +    }
 +
-+    // Wine's own programs live in the prefix's windows directory. The match is
-+    // anchored on the drive so a game installed under a folder named Windows
-+    // (UE5's default packaging folder) is not taken for one of them.
++    // Wine's own programs live in the prefix's windows directory.
 +    static bool IsUnderWindowsDirectory( const char *pszValue )
 +    {
 +        for ( const char *p = pszValue; *p; p++ )
 +        {
-+            if ( strncasecmp( p, "c:\\windows\\", 11 ) == 0 || strncasecmp( p, "c:/windows/", 11 ) == 0 ||
-+                 strncasecmp( p, "/drive_c/windows/", 17 ) == 0 )
-+                return true;
-+        }
-+        return false;
-+    }
-+
-+    // Helpers in the Steam folder that outlive the game: the headless Steam host
-+    // (running as steam.exe) with its overlay and error reporter, and eastub,
-+    // which stays resident as the EA Desktop stand-in. This is the app's X11
-+    // exit-watch list, so a session ends at the same moment on either server.
-+    static const char *const k_pszResidentHelpers[] =
-+    {
-+        "steam.exe",
-+        "steamhost32.exe",
-+        "steamhost64.exe",
-+        "gameoverlayui.exe",
-+        "gameoverlayui64.exe",
-+        "steamerrorreporter.exe",
-+        "steamerrorreporter64.exe",
-+        "eastub.exe",
-+    };
-+
-+    static bool IsResidentHelper( const char *pszBase )
-+    {
-+        for ( const char *pszHelper : k_pszResidentHelpers )
-+        {
-+            if ( strcasecmp( pszBase, pszHelper ) == 0 )
++            if ( strncasecmp( p, "windows\\", 8 ) == 0 || strncasecmp( p, "windows/", 8 ) == 0 )
 +                return true;
 +        }
 +        return false;
@@ -159,10 +167,7 @@ index 7333229..745f833 100644
 +
 +        const char *pszBase = Basename( pszValue );
 +        size_t nLength = strlen( pszBase );
-+        if ( nLength <= 4 || strcasecmp( pszBase + nLength - 4, ".exe" ) != 0 )
-+            return false;
-+
-+        return !IsResidentHelper( pszBase );
++        return nLength > 4 && strcasecmp( pszBase + nLength - 4, ".exe" ) == 0;
 +    }
 +
 +    bool IsGuestProcessRunning()
@@ -206,14 +211,122 @@ index 7333229..745f833 100644
 +        return false;
 +    }
 +
++    // The parent of `nPid`, from `/proc/<pid>/stat`. The comm field is in
++    // parentheses and may itself contain spaces and parentheses, so the parse
++    // starts at the last ')' — after it come `state` and then `ppid`.
++    static pid_t ParentPid( pid_t nPid )
++    {
++        char szPath[ 64 ];
++        snprintf( szPath, sizeof( szPath ), "/proc/%d/stat", (int) nPid );
++
++        FILE *pStatFile = fopen( szPath, "r" );
++        if ( !pStatFile )
++            return 0;
++        defer( fclose( pStatFile ) );
++
++        char szBuf[ 512 ];
++        size_t nRead = fread( szBuf, 1, sizeof( szBuf ) - 1, pStatFile );
++        szBuf[ nRead ] = '\0';
++
++        const char *pszClose = nullptr;
++        for ( size_t i = 0; i < nRead; i++ )
++        {
++            if ( szBuf[ i ] == ')' )
++                pszClose = szBuf + i;
++        }
++        if ( !pszClose )
++            return 0;
++
++        // " S 1234 ..." — skip the state character, then read the ppid.
++        const char *pszCursor = pszClose + 1;
++        while ( *pszCursor == ' ' )
++            pszCursor++;
++        if ( *pszCursor )
++            pszCursor++;
++        return (pid_t) strtol( pszCursor, nullptr, 10 );
++    }
++
++    uint64_t SessionTreeStamp( pid_t nRoot )
++    {
++        if ( nRoot <= 0 )
++            return 0;
++
++        DIR *pProcDir = opendir( "/proc" );
++        if ( !pProcDir )
++            return 0;
++        defer( closedir( pProcDir ) );
++
++        struct ProcessEntry { pid_t nPid; pid_t nParent; };
++        std::vector<ProcessEntry> entries;
++        std::vector<pid_t> sessionPids;
++
++        struct dirent *pEntry;
++        while ( ( pEntry = readdir( pProcDir ) ) )
++        {
++            if ( pEntry->d_type != DT_DIR || !IsDigit( pEntry->d_name[0] ) )
++                continue;
++
++            pid_t nPid = (pid_t) strtol( pEntry->d_name, nullptr, 10 );
++            if ( nPid <= 0 || nPid == nRoot )
++                continue;
++
++            entries.push_back( { nPid, ParentPid( nPid ) } );
++        }
++
++        // A process belongs to the session when its parent chain reaches the
++        // root within a bounded walk: a reparented descendant lands on the
++        // reaper, which is the root, so the chain is short in a live session.
++        // The lookups run off a copy sorted by pid, so a poll over the whole
++        // process table stays a few thousand comparisons.
++        std::vector<ProcessEntry> byPid = entries;
++        std::sort( byPid.begin(), byPid.end(), []( const ProcessEntry &a, const ProcessEntry &b ) {
++            return a.nPid < b.nPid;
++        } );
++
++        const auto parentOf = [ &byPid ]( pid_t nPid ) -> pid_t {
++            auto it = std::lower_bound( byPid.begin(), byPid.end(), nPid,
++                []( const ProcessEntry &entry, pid_t nValue ) { return entry.nPid < nValue; } );
++            return it != byPid.end() && it->nPid == nPid ? it->nParent : 0;
++        };
++
++        for ( const ProcessEntry &entry : entries )
++        {
++            pid_t nCursor = entry.nParent;
++            for ( int nHop = 0; nHop < 64 && nCursor > 1; nHop++ )
++            {
++                if ( nCursor == nRoot )
++                {
++                    sessionPids.push_back( entry.nPid );
++                    break;
++                }
++
++                pid_t nNext = parentOf( nCursor );
++                if ( nNext == 0 )
++                    break;
++                nCursor = nNext;
++            }
++        }
++
++        // Sorted, so the stamp depends on the set and not on readdir's order.
++        std::sort( sessionPids.begin(), sessionPids.end() );
++
++        // FNV-1a, 64-bit: the empty set still hashes to the offset basis, which
++        // is not zero, so zero stays reserved for "unreadable".
++        uint64_t nStamp = 1469598103934665603ull;
++        for ( pid_t nPid : sessionPids )
++        {
++            nStamp ^= (uint64_t) nPid;
++            nStamp *= 1099511628211ull;
++        }
++        return nStamp;
++    }
++
      void KillProcessTree( std::vector<pid_t> nPids, int nSignal )
      {
          for ( pid_t nPid : nPids )
-diff --git a/src/Utils/Process.h b/src/Utils/Process.h
-index 2208dae..262eaf8 100644
 --- a/src/Utils/Process.h
 +++ b/src/Utils/Process.h
-@@ -16,6 +16,14 @@ namespace gamescope::Process
+@@ -16,6 +16,22 @@ namespace gamescope::Process
      // Matches against comm, which the kernel truncates to 15 chars.
      bool IsProcessRunning( const char *pszComm );
  
@@ -224,6 +337,14 @@ index 2208dae..262eaf8 100644
 +    // cannot hold the session open, and a launcher handing off to a differently
 +    // named game image is followed rather than mistaken for an exit.
 +    bool IsGuestProcessRunning();
++
++    // A fingerprint of the process tree under `nRoot`: every pid reachable from
++    // it by parent chain, hashed. It changes whenever any process in the session
++    // is created or exits, which is what tells a launcher handing off to a game
++    // (the tree keeps moving) apart from a session that is over (the tree has
++    // gone still). Zero when /proc cannot be read, so a caller can fall back to
++    // a flat idle window.
++    uint64_t SessionTreeStamp( pid_t nRoot );
 +
      void KillAllChildren( pid_t nParentPid, int nSignal );
      void KillProcess( pid_t nPid, int nSignal );
