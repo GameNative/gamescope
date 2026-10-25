@@ -438,6 +438,15 @@ done
 [ "$BUILD_PATH_FAIL" = 0 ] || {
     echo "FAIL: staged Mesa files carry build-host paths" >&2; exit 1; }
 
+# --- libandroid gate ---------------------------------------------------------
+# libandroid.so is the NDK's app-facing platform interface (ANativeWindow,
+# AHardwareBuffer), and a file that links it can only load in a namespace that
+# carries the NDK stub. That is not this payload's contract, and a stale
+# libgndrm_shim.so once shipped a NEEDED on it with nothing in the payload
+# showing it — so the whole staged tree is gated, not just the files linked
+# here. See android/check-no-libandroid.sh.
+bash "$GS_DIR/android/check-no-libandroid.sh" "$STAGE"
+
 # --- page-size gate ----------------------------------------------------------
 # Android 15+ devices use 16 KB pages, and a library whose LOAD segments are
 # aligned below that cannot be mapped at all. Everything this script builds is

@@ -25,6 +25,11 @@ tar --zstd -xf "$ASSET" -C "$WORK"
 # Names bionic/NDK genuinely provide on every device (loader + libc family +
 # the Android platform GL entry points we do NOT own). Anything else must be
 # in the payload.
+#
+# libandroid.so is in this list for dlopen only: a loaded app library may open
+# it. It is never a legal DT_NEEDED — a file that links it can only load in a
+# namespace that carries the NDK stub, which is not this payload's contract —
+# so the DT_NEEDED scan refuses it before the allowlist is consulted.
 SYSTEM_RE='^(libc|libm|libdl|liblog|libandroid|libz|libsync|libstdc\+\+|ld-android|libEGL|libGLESv1_CM|libGLESv2|libGLESv3|libvulkan)\.so$'
 
 fail=0
@@ -66,6 +71,11 @@ echo "=== DT_NEEDED closure (every shipped ELF)"
 while IFS= read -r elf; do
     while read -r name; do
         [ -n "$name" ] || continue
+        if [ "$name" = "libandroid.so" ]; then
+            printf '  FORBIDDEN  %-34s DT_NEEDED (%s)\n' "$name" "${elf#$WORK/}"
+            fail=1
+            continue
+        fi
         check_name "$name" "${elf#$WORK/}" "DT_NEEDED"
     done < <(readelf -d "$elf" 2>/dev/null | sed -nE 's/.*\(NEEDED\).*\[(.*)\]/\1/p')
 done < <(find "$WORK"/bin "$WORK"/lib -type f 2>/dev/null | sort)
@@ -127,7 +137,8 @@ done
 echo
 if [ "$fail" -eq 0 ]; then
     echo "RESULT: CLEAN — every DT_NEEDED, every non-optional dlopen'd SONAME and"
-    echo "        every manifest library_path resolves inside the payload."
+    echo "        every manifest library_path resolves inside the payload, and no"
+    echo "        shipped ELF links libandroid.so."
 else
     echo "RESULT: FAIL — unresolved names above (see UNRESOLVED lines)."
 fi
