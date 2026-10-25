@@ -80,7 +80,7 @@ index 083aaf6..0a8af57 100644
              if ( bRespawn )
              {
 diff --git a/src/Utils/Process.cpp b/src/Utils/Process.cpp
-index 7333229..745f833 100644
+index 7333229..49b582c 100644
 --- a/src/Utils/Process.cpp
 +++ b/src/Utils/Process.cpp
 @@ -11,6 +11,7 @@
@@ -91,7 +91,7 @@ index 7333229..745f833 100644
  #include <vector>
  
  #include <errno.h>
-@@ -142,6 +143,117 @@ namespace gamescope::Process
+@@ -142,6 +143,85 @@ namespace gamescope::Process
          return false;
      }
  
@@ -108,41 +108,12 @@ index 7333229..745f833 100644
 +        return pszBase;
 +    }
 +
-+    // Wine's own programs live in the prefix's windows directory. The match is
-+    // anchored on the drive so a game installed under a folder named Windows
-+    // (UE5's default packaging folder) is not taken for one of them.
++    // Wine's own programs live in the prefix's windows directory.
 +    static bool IsUnderWindowsDirectory( const char *pszValue )
 +    {
 +        for ( const char *p = pszValue; *p; p++ )
 +        {
-+            if ( strncasecmp( p, "c:\\windows\\", 11 ) == 0 || strncasecmp( p, "c:/windows/", 11 ) == 0 ||
-+                 strncasecmp( p, "/drive_c/windows/", 17 ) == 0 )
-+                return true;
-+        }
-+        return false;
-+    }
-+
-+    // Helpers in the Steam folder that outlive the game: the headless Steam host
-+    // (running as steam.exe) with its overlay and error reporter, and eastub,
-+    // which stays resident as the EA Desktop stand-in. This is the app's X11
-+    // exit-watch list, so a session ends at the same moment on either server.
-+    static const char *const k_pszResidentHelpers[] =
-+    {
-+        "steam.exe",
-+        "steamhost32.exe",
-+        "steamhost64.exe",
-+        "gameoverlayui.exe",
-+        "gameoverlayui64.exe",
-+        "steamerrorreporter.exe",
-+        "steamerrorreporter64.exe",
-+        "eastub.exe",
-+    };
-+
-+    static bool IsResidentHelper( const char *pszBase )
-+    {
-+        for ( const char *pszHelper : k_pszResidentHelpers )
-+        {
-+            if ( strcasecmp( pszBase, pszHelper ) == 0 )
++            if ( strncasecmp( p, "windows\\", 8 ) == 0 || strncasecmp( p, "windows/", 8 ) == 0 )
 +                return true;
 +        }
 +        return false;
@@ -159,10 +130,7 @@ index 7333229..745f833 100644
 +
 +        const char *pszBase = Basename( pszValue );
 +        size_t nLength = strlen( pszBase );
-+        if ( nLength <= 4 || strcasecmp( pszBase + nLength - 4, ".exe" ) != 0 )
-+            return false;
-+
-+        return !IsResidentHelper( pszBase );
++        return nLength > 4 && strcasecmp( pszBase + nLength - 4, ".exe" ) == 0;
 +    }
 +
 +    bool IsGuestProcessRunning()

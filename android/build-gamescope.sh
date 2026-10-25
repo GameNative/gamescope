@@ -16,9 +16,11 @@
 # --clean restores the tree to what the patch train expects: tracked files
 # reset, untracked meson state removed (patch-seeded headers, the wrap-redirect
 # files meson writes), the patch stamp removed, the wrap overlays re-applied,
-# the meson build dir dropped. Ignored paths are otherwise left alone, so
-# .idea/, the fetched subprojects and the meson package cache survive. The
-# discarded diff is saved first. Composes with the flags above.
+# the meson build dir dropped. android/patches is copied out before the reset
+# and back after it, so a local patch experiment — edited or added files — is
+# kept and re-applied. Ignored paths are otherwise left alone, so .idea/, the
+# fetched subprojects and the meson package cache survive. The discarded diff
+# is saved first. Composes with the flags above.
 #
 # Env overrides:
 #   NDK        — NDK path           (default: $HOME/Android/Sdk/ndk/27.3.13750724)
@@ -87,13 +89,22 @@ if [ "$DO_CLEAN" = 1 ]; then
         rm -f "$SAVE"
     fi
     echo "clean: removing untracked build state:"
-    git -C "$GS_DIR" clean -fdn | sed 's/^/    /'
+    git -C "$GS_DIR" clean -fdn | awk '!/android\/patches/' | sed 's/^/    /'
+    # The patch train is the one tracked path that survives: an experiment under
+    # android/patches is local work, and the reset would take both a changed
+    # patch and an added one. Copied out first, put back after the clean.
+    PATCHES_SAVED="$(mktemp -d "${TMPDIR:-/tmp}/gs-patches.XXXXXX")"
+    cp -a "$GS_DIR/android/patches/." "$PATCHES_SAVED/"
     git -C "$GS_DIR" reset --hard
     git -C "$GS_DIR" clean -fd
     # The stamp is ignored (a local build record, never committed), and `clean`
     # leaves ignored paths alone — but a stamp that outlived the reset would tell
     # the next run every patch is already applied, on a tree that is not patched.
     rm -f "$PATCH_STAMP"
+    rm -rf "$GS_DIR/android/patches"
+    mkdir -p "$GS_DIR/android/patches"
+    cp -a "$PATCHES_SAVED/." "$GS_DIR/android/patches/"
+    rm -rf "$PATCHES_SAVED"
     if [ -d "$GS_DIR/subprojects/wlroots/.git" ] || [ -f "$GS_DIR/subprojects/wlroots/.git" ]; then
         git -C "$GS_DIR/subprojects/wlroots" reset --hard
         git -C "$GS_DIR/subprojects/wlroots" clean -fd
