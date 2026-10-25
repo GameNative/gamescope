@@ -1,0 +1,34 @@
+A47 — take `-r` as the grid, not as the mode's refresh
+
+`-r` is the session's vblank grid, while the panel's real rate is what the DRM
+mode advertises. `init_drm` hands the grid to `preferred_refresh`, and the mode
+search requires `mode->vrefresh` to equal it, so a grid that matches no mode
+falls through to the first mode on the connector — with `-r 1200` it matches
+nothing.
+
+The lookup now re-finds by the requested size with the refresh unconstrained, so
+the nested refresh is free to differ from the mode's rate and a connector whose
+modes all carry the real rate still yields an output.
+
+This is the second half of the old A34, kept when A34's fps cap was parked: the
+cap no longer exists, but the grid argument does.
+
+--- a/src/Backends/DRMBackend.cpp
++++ b/src/Backends/DRMBackend.cpp
+@@ -1385,6 +1385,16 @@
+ 		mode = find_mode(best->GetModeConnector(), drm->preferred_width, drm->preferred_height, gamescope::ConvertmHzToHz( drm->preferred_refresh ));
+ 	}
+ 
++	// gamenative A47: -r is the session's vblank grid, not the mode's rate: the
++	// panel's real refresh is what the connector advertises, so the grid matches
++	// no mode. Re-find by size alone rather than let the grid pick the mode, so
++	// the nested refresh is free to differ from the mode's rate and a connector
++	// whose only modes carry the real rate still yields an output.
++	if (!mode && drm->preferred_refresh != 0)
++	{
++		mode = find_mode(best->GetModeConnector(), drm->preferred_width, drm->preferred_height, 0);
++	}
++
+ 	if (!mode && best->GetScreenType() == gamescope::GAMESCOPE_SCREEN_TYPE_EXTERNAL) {
+ 		saved_mode mode_info{};
+ 		if (get_saved_mode(description, mode_info))
