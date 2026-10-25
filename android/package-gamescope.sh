@@ -97,8 +97,10 @@ done
 # An up-to-date build keeps the old file, so its age alone proves nothing. What
 # must not happen is a source newer than the artifact built from it: that is the
 # stale file, and the package would carry it.
-# Each artifact is checked against the sources it is built from, not the whole
-# tree: an untouched crate keeps its library, and that is not staleness.
+# Each artifact is checked against the sources it is built from — its own crate
+# plus the path dependencies it links, and the workspace manifest that sets the
+# profile — not the whole tree: a crate the artifact does not link is not a
+# source of staleness, and `libgamenative_drm.so` never compiles the C shim.
 check_fresh() {
     local f="$1"; shift
     local stale
@@ -107,10 +109,26 @@ check_fresh() {
         -newer "$f" -print -quit)"
     [ -z "$stale" ] || { echo "error: $f is older than $stale" >&2; exit 1; }
 }
-check_fresh "$DRM_SO"  "$GNDRM_DIR/modules" "$GNDRM_DIR/Cargo.toml"
-check_fresh "$ICD_SO"  "$GNDRM_DIR/icd_shim"
+check_fresh "$DRM_SO" \
+    "$GNDRM_DIR/modules/gndrm-android" \
+    "$GNDRM_DIR/modules/gndrm-daemon" \
+    "$GNDRM_DIR/modules/gndrm-uapi" \
+    "$GNDRM_DIR/modules/gndrm-obf" \
+    "$GNDRM_DIR/modules/gndrm-obf-macros" \
+    "$GNDRM_DIR/Cargo.toml"
+check_fresh "$ICD_SO" \
+    "$GNDRM_DIR/icd_shim" \
+    "$GNDRM_DIR/modules/gndrm-lsfg" \
+    "$GNDRM_DIR/modules/gndrm-uapi" \
+    "$GNDRM_DIR/modules/gndrm-obf" \
+    "$GNDRM_DIR/modules/gndrm-obf-macros" \
+    "$GNDRM_DIR/Cargo.toml"
 check_fresh "$SHIM_SO" "$GNDRM_DIR/modules/gndrm-shim"
-check_fresh "$LSFG_SO" "$GNDRM_DIR/modules/gndrm-lsfg"
+check_fresh "$LSFG_SO" \
+    "$GNDRM_DIR/modules/gndrm-lsfg" \
+    "$GNDRM_DIR/modules/gndrm-obf" \
+    "$GNDRM_DIR/modules/gndrm-obf-macros" \
+    "$GNDRM_DIR/Cargo.toml"
 
 # --- staging ----------------------------------------------------------------
 WORK="$(mktemp -d)"

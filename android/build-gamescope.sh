@@ -15,10 +15,10 @@
 #
 # --clean restores the tree to what the patch train expects: tracked files
 # reset, untracked meson state removed (patch-seeded headers, the wrap-redirect
-# files meson writes), the wrap overlays re-applied, the meson build dir
-# dropped. Ignored paths are left alone, so .idea/, the fetched subprojects and
-# the meson package cache survive. The discarded diff is saved first. Composes
-# with the flags above.
+# files meson writes), the patch stamp removed, the wrap overlays re-applied,
+# the meson build dir dropped. Ignored paths are otherwise left alone, so
+# .idea/, the fetched subprojects and the meson package cache survive. The
+# discarded diff is saved first. Composes with the flags above.
 #
 # Env overrides:
 #   NDK        — NDK path           (default: $HOME/Android/Sdk/ndk/27.3.13750724)
@@ -30,6 +30,8 @@ GS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NDK="${NDK:-$HOME/Android/Sdk/ndk/27.3.13750724}"
 TERMUXFS="${TERMUXFS:-$HOME/termuxfs/aarch64/data/data/com.termux/files/usr}"
 BUILD_DIR="${BUILD_DIR:-build-android}"
+# Patch-train stamp: name + blob hash per applied patch (see step 1).
+PATCH_STAMP="$GS_DIR/.gn-patches-applied"
 SKIP_PATCHES=0
 SETUP_ONLY=0
 DO_CLEAN=0
@@ -88,6 +90,10 @@ if [ "$DO_CLEAN" = 1 ]; then
     git -C "$GS_DIR" clean -fdn | sed 's/^/    /'
     git -C "$GS_DIR" reset --hard
     git -C "$GS_DIR" clean -fd
+    # The stamp is ignored (a local build record, never committed), and `clean`
+    # leaves ignored paths alone — but a stamp that outlived the reset would tell
+    # the next run every patch is already applied, on a tree that is not patched.
+    rm -f "$PATCH_STAMP"
     if [ -d "$GS_DIR/subprojects/wlroots/.git" ] || [ -f "$GS_DIR/subprojects/wlroots/.git" ]; then
         git -C "$GS_DIR/subprojects/wlroots" reset --hard
         git -C "$GS_DIR/subprojects/wlroots" clean -fd
@@ -112,13 +118,11 @@ if [ "$DO_CLEAN" = 1 ]; then
 fi
 
 # --- 1. patch train -------------------------------------------------------
-# Every patch applied here is recorded in an untracked stamp (name + blob hash),
+# Every patch applied here is recorded in an ignored stamp (name + blob hash),
 # so a second run skips it by the stamp instead of a reverse-apply check: a
 # later patch that edits lines inside an earlier hunk makes that check fail
-# although the tree is right. --clean removes the stamp with the other
-# untracked build state; a patch whose content changed falls back to the
-# apply / reverse-apply checks.
-PATCH_STAMP="$GS_DIR/.gn-patches-applied"
+# although the tree is right. --clean removes the stamp; a patch whose content
+# changed falls back to the apply / reverse-apply checks.
 apply_patch_once() {
     local p="$1" label="$2"
     local sig
