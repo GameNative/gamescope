@@ -1,0 +1,93 @@
+A48 — bring a nested application window to the front when it maps
+
+Wine runs every game inside the explorer virtual desktop, so the game's
+windows are children of one full-size root child: the only window the
+compositor manages and focuses. winex11 never activates such a child
+from X focus (an unmanaged window stays WithdrawnState on the Win32 side,
+so can_activate_window() is false for FocusIn and WM_TAKE_FOCUS alike),
+and a game that maps its window with SWP_NOACTIVATE never becomes the
+foreground window: it ignores the controller and keyboard, polls XInput
+once, and hides its own window about 25 ms later. Need for Speed Most
+Wanted sits on its title screen under gamescope for exactly this reason,
+and launchers that open before the game lose the mouse the same way.
+
+The app's own X11 server gets the same window activated through
+DesktopHelper.onMapWindow -> WinHandler.bringToFront, which sends
+winhandler.exe (listening on loopback udp/7946 inside the prefix) a
+BRING_TO_FRONT request; winhandler.exe calls SetForegroundWindow, which
+needs no X focus at all. The compositor already selects
+SubstructureNotify on every toplevel, so it sees those nested maps; on
+the map of a child whose WM_CLASS is not explorer.exe or tabtip.exe and
+whose size is more than 1x1, send that request with the window's class.
+Verified on the Odin 3: sent at map time the game goes live (pad, keyboard,
+continuous XInput polling); sent after the game has hidden its window it
+does nothing, so the map event is the only usable trigger.
+
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index 5f4f19c..adafff0 100644
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -68,6 +68,7 @@
+ #include <sys/procctl.h>
+ #endif
+ #include <sys/socket.h>
++#include <netinet/in.h>
+ #include <sys/resource.h>
+ #include <time.h>
+ #include <unistd.h>
+@@ -5919,6 +5920,46 @@ handle_desktop_window(steamcompmgr_win_t *w)
+ 	}
+ }
+ 
++// Wine's virtual desktop nests the game's windows under one root child and
++// winex11 never activates such a child from X focus, so a game mapped with
++// SWP_NOACTIVATE stays inactive. The app's X11 server answers every map with
++// WinHandler.bringToFront; send winhandler.exe the same udp/7946 packet here.
++static void gn_bring_to_front( const char *pszClass )
++{
++	unsigned char buf[64] = {};
++	size_t len = strlen( pszClass );
++	if ( len > 51 ) len = 51;
++	buf[0] = 12;
++	uint32_t nLen = (uint32_t)len;
++	memcpy( buf + 1, &nLen, sizeof nLen );
++	memcpy( buf + 5, pszClass, len );
++	int fd = socket( AF_INET, SOCK_DGRAM, 0 );
++	if ( fd < 0 ) return;
++	struct sockaddr_in sa = {};
++	sa.sin_family = AF_INET;
++	sa.sin_port = htons( 7946 );
++	sa.sin_addr.s_addr = htonl( INADDR_LOOPBACK );
++	sendto( fd, buf, sizeof buf, 0, (struct sockaddr *)&sa, sizeof sa );
++	close( fd );
++}
++
++static void gn_activate_nested_app_window( xwayland_ctx_t *ctx, Window window )
++{
++	XClassHint hint = {};
++	if ( !XGetClassHint( ctx->dpy, window, &hint ) )
++		return;
++	const char *pszClass = hint.res_class ? hint.res_class : hint.res_name;
++	bool bApp = pszClass && *pszClass && strcmp( pszClass, "explorer.exe" ) != 0 && strcmp( pszClass, "tabtip.exe" ) != 0;
++	XWindowAttributes attr;
++	if ( bApp && XGetWindowAttributes( ctx->dpy, window, &attr ) && attr.width > 1 && attr.height > 1 )
++	{
++		xwm_log.infof( "nested application window 0x%lx (%s, %dx%d) mapped: bringing it to the front", window, pszClass, attr.width, attr.height );
++		gn_bring_to_front( pszClass );
++	}
++	if ( hint.res_name ) XFree( hint.res_name );
++	if ( hint.res_class ) XFree( hint.res_class );
++}
++
+ static void
+ map_win(xwayland_ctx_t* ctx, Window id, unsigned long sequence)
+ {
+@@ -8788,6 +8829,8 @@ void xwayland_ctx_t::Dispatch()
+ 
+ 				if (w && w->xwayland().id == ev.xmap.window)
+ 					map_win(ctx, ev.xmap.window, ev.xmap.serial);
++				else if (w && ev.xmap.event != ctx->root)
++					gn_activate_nested_app_window(ctx, ev.xmap.window);
+ 				break;
+ 			}
+ 			case UnmapNotify:
