@@ -1,0 +1,62 @@
+# Meson cross file template: aarch64-linux-android (API 28) against the termux
+# prefix, which supplies libdrm and the libglvnd headers at build time.
+# build-mesa-glamor.sh fills in the placeholders and writes the result into the
+# build root, so no build-host path is stored in the tree.
+#
+# [host_machine] system is 'linux', not 'android', on purpose. With 'android'
+# Mesa builds its Android platform (gralloc/AHardwareBuffer EGL, libgbm_mesa),
+# which glamor does not use. The plain Linux GBM backend gives EGL
+# EGL_PLATFORM_GBM_KHR. The NDK clang still defines __ANDROID__, so the sources
+# take their Android code paths (memfd via syscall, zink dlopens libvulkan.so).
+
+[binaries]
+c          = [@CCACHE@'@NDK_BIN@/aarch64-linux-android28-clang']
+cpp        = [@CCACHE@'@NDK_BIN@/aarch64-linux-android28-clang++']
+ar         = '@NDK_BIN@/llvm-ar'
+strip      = '@NDK_BIN@/llvm-strip'
+nm         = '@NDK_BIN@/llvm-nm'
+pkg-config = 'pkg-config'
+# build-machine tools, never the aarch64 ones from the prefix
+bison      = '@BISON@'
+flex       = '@FLEX@'
+
+[host_machine]
+system     = 'linux'
+cpu_family = 'aarch64'
+cpu        = 'armv8-a'
+endian     = 'little'
+
+[built-in options]
+# -fno-emulated-tls: the guest's libGL.so.1 imports the TLS variable
+# _glapi_tls_Context. With the NDK's emulated TLS only
+# __emutls_v._glapi_tls_Context is exported, so a guest library that links libGL
+# and is dlopen'd later (Wine's winegstreamer unixlib) cannot resolve it and the
+# session loses every media codec path. Mesa adds the flag itself only for
+# platforms=android with sdk >= 29, which this build is not.
+c_args   = ['-g0', '-O2', '-fPIC', '-DANDROID',
+            '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES',
+            '-fno-emulated-tls',
+            '-I@OVERLAY@/include',
+            '-idirafter', '@DEPS@/include',
+            '-idirafter', '@DEPS@/include/libdrm']
+cpp_args = ['-g0', '-O2', '-fPIC', '-DANDROID',
+            '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES',
+            '-fno-emulated-tls',
+            '-I@OVERLAY@/include',
+            '-idirafter', '@DEPS@/include',
+            '-idirafter', '@DEPS@/include/libdrm']
+c_link_args   = ['-L@DEPS@/lib',
+                 '-Wl,-z,max-page-size=16384',
+                 '-Wl,-plugin-opt=-emulated-tls=0',
+                 '-llog', '-lsync']
+cpp_link_args = ['-L@DEPS@/lib',
+                 '-Wl,-z,max-page-size=16384',
+                 '-Wl,-plugin-opt=-emulated-tls=0',
+                 '-llog', '-lsync',
+                 '-static-libstdc++']
+
+[properties]
+# Overlay pkg-config only: the prefix's own .pc files add -I${includedir} ahead
+# of the NDK/libc++ paths and break C++ (see overlay/pkgconfig/libdrm.pc). The
+# prefix's headers are reached through the -idirafter above instead.
+pkg_config_libdir = ['@OVERLAY@/pkgconfig']

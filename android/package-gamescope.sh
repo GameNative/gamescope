@@ -23,11 +23,11 @@
 # Mesa GL/EGL for Xwayland's glamor: glamor dlopens libEGL.so.1 by exact
 # SONAME, so the payload ships glvnd's loader (libEGL.so.1) + GLES shims from
 # the termux prefix, and Mesa's EGL vendor (libEGL_mesa.so.0, per the shipped
-# 50_mesa.json), libgallium, libgbm, libglapi, the gbm/dri_gbm backend and the
-# DRI drivers under lib/dri from the STAGED minimal Mesa (GN_MESA_GLAMOR_STAGE,
-# Projects/mesa/build-android-glamor/stage) — zink+softpipe, LLVM disabled. That
-# stage has no libLLVM/libxml2/libicu dependency, unlike the prefix's
-# libgallium-25.3.5, so those are no longer shipped. zink dlopens
+# 50_mesa.json), libgallium (glapi built in), libgbm, the gbm/dri_gbm backend
+# and the DRI drivers under lib/dri from the STAGED minimal Mesa
+# (GN_MESA_GLAMOR_STAGE, built by android/mesa-glamor/build-mesa-glamor.sh) —
+# zink+softpipe, LLVM disabled. That stage has no libLLVM/libxml2/libicu
+# dependency, unlike the prefix's libgallium-25.3.5, so those are not shipped. zink dlopens
 # libvulkan.so.1 (a name Android does not provide — its loader is libvulkan.so),
 # so the payload carries Mesa's loader explicitly.
 
@@ -38,13 +38,13 @@ WS_DIR="$(dirname "$GS_DIR")"
 GNDRM_DIR="${GNDRM_DIR:-$WS_DIR/gamenative-drm}"
 GN_DIR="${GN_DIR:-$WS_DIR/GameNative}"
 DEPS="${GAMESCOPE_TERMUX_PREFIX:-$HOME/termuxfs/aarch64/data/data/com.termux/files/usr}"
-# Staged minimal Mesa (Projects/mesa, target build-android-glamor/stage): zink +
+# Staged minimal Mesa (android/mesa-glamor/build-mesa-glamor.sh): zink +
 # softpipe gallium, glvnd EGL/GBM platform, LLVM DISABLED. The packager prefers
-# this stage for every Mesa/GBM file it provides, so the payload no longer
-# carries the termux prefix's LLVM-bound Mesa (libgallium-25.3.5 + libLLVM +
+# this stage for every Mesa/GBM file it provides, so the payload does not carry
+# the termux prefix's LLVM-bound Mesa (libgallium-25.3.5 + libLLVM +
 # libxml2/libicu). libglvnd's loader/GLES libs and everything else still come
 # from the prefix.
-GN_MESA_GLAMOR_STAGE="${GN_MESA_GLAMOR_STAGE:-$WS_DIR/mesa/build-android-glamor/stage}"
+GN_MESA_GLAMOR_STAGE="${GN_MESA_GLAMOR_STAGE:-$GS_DIR/build-android-mesa-glamor/stage}"
 # macOS writes an AppleDouble "._name" sibling for every file it copies or
 # archives, which lands in the payload as a thousand extra members. BSD cp and
 # tar honour this; on Linux it is inert.
@@ -174,7 +174,7 @@ resolve_libs() {
                 # NDK sysroot ships only a versioned STUB (sync_merge/
                 # sync_file_info/sync_file_info_free @@LIBSYNC, no sync_wait,
                 # DT_NEEDED on itself) under <api>/libsync.so. The staged
-                # libgallium-25.0.0-devel.so NEEDs libsync.so, so without this
+                # libgallium NEEDs libsync.so, so without this
                 # skip the resolver copies the stub into lib/, where it shadows
                 # /system/lib64/libsync.so by SONAME and breaks libui's import
                 # (gamescope cannot exec: cannot locate symbol "sync_wait").
@@ -209,16 +209,19 @@ resolve_libs "$STAGE/bin/gamescope" "$STAGE/bin/gamescopereaper"
 # dirs are termux-prefix paths absent on device); the vendor's library_path in
 # 50_mesa.json is "libEGL_mesa.so.0".
 #
-# The EGL vendor / gallium / GBM / glapi files come from the staged minimal Mesa
+# The EGL vendor / gallium / GBM files come from the staged minimal Mesa
 # (LLVM-free); libglvnd's loader + GLES shims are NOT built by that stage, so
 # they still come from the termux prefix. libgbm.so.1 satisfies the DT_NEEDED of
-# libEGL_mesa/libdril, and libgbm.so is the exact name Xwayland dlopens.
+# libEGL_mesa/libdril, and libgbm.so is the exact name Xwayland dlopens. glapi
+# is part of libgallium since Mesa 25.1, whose name carries the Mesa version.
+GALLIUM_SO=("$GN_MESA_GLAMOR_STAGE"/lib/libgallium-*.so)
+[ "${#GALLIUM_SO[@]}" = 1 ] && [ -f "${GALLIUM_SO[0]}" ] || {
+    echo "error: expected one libgallium-*.so in $GN_MESA_GLAMOR_STAGE/lib" >&2; exit 1; }
 MESA_STAGE_SONAMES=(
     libEGL_mesa.so.0          # glvnd vendor, 50_mesa.json library_path
-    libgallium-25.0.0-devel.so
+    "${GALLIUM_SO[0]##*/}"
     libgbm.so.1               # DT_NEEDED of libEGL_mesa / DRI drivers
     libgbm.so                 # Xwayland dlopens this exact name
-    libglapi.so.0
 )
 GLVND_PREFIX_SONAMES=(
     libEGL.so.1               # the name glamor asks for (glvnd loader)

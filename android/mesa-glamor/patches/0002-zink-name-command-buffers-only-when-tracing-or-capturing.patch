@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Utkarsh Dalal <utkarsh.dalal@toptal.com>
+Date: Thu, 29 Oct 2026 00:28:58 +0530
+Subject: [PATCH] zink: name command buffers only when tracing or capturing
+
+Since 82656de0297b every batch state labels its two command buffers with
+vkSetDebugUtilsObjectNameEXT whenever the instance has VK_EXT_debug_utils.
+Under gamescope, Xwayland's glamor reaches the container's adrenotools
+Turnip through gn-vkshim's proxy, which hands out its own wrapper objects
+as VkCommandBuffer handles and passes vkSetDebugUtilsObjectNameEXT through
+untouched. Turnip then reads the wrapper as a vk_object_base and faults
+(SEGV at 0x58) in the first eglCreateContext, so Xwayland never starts.
+
+The names are only consumed by tracing tools and RenderDoc, so set them
+under the same conditions zink already uses for its debug labels. This
+can go once the shim unwraps the handle in vkSetDebugUtilsObjectNameEXT.
+---
+ src/gallium/drivers/zink/zink_batch.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/gallium/drivers/zink/zink_batch.c b/src/gallium/drivers/zink/zink_batch.c
+index 29925bd915ae..8a844932b619 100644
+--- a/src/gallium/drivers/zink/zink_batch.c
++++ b/src/gallium/drivers/zink/zink_batch.c
+@@ -279,6 +279,13 @@ zink_label_cmd_buffer(struct zink_context *ctx, VkDevice device, VkCommandBuffer
+ {
+    struct zink_screen *screen = zink_screen(ctx->base.screen);
+ 
++   bool wanted = zink_tracing;
++#if HAVE_RENDERDOC_INTEGRATION
++   wanted |= screen->renderdoc_api != NULL;
++#endif
++   if (!wanted)
++      return;
++
+    VkDebugUtilsObjectNameInfoEXT name_info = {
+       .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT,
+       .pNext = NULL,

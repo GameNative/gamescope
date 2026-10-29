@@ -126,8 +126,9 @@ fi
 
 echo
 echo "=== required GL/EGL artefacts"
-for f in lib/libEGL.so.1 lib/libEGL_mesa.so.0 lib/libgallium-25.0.0-devel.so \
-         lib/libgbm.so.1 lib/libglapi.so.0 lib/libvulkan.so.1 \
+gallium="$(cd "$WORK" && ls lib/libgallium-*.so 2>/dev/null | head -1)"
+for f in lib/libEGL.so.1 lib/libEGL_mesa.so.0 "${gallium:-lib/libgallium-*.so}" \
+         lib/libgbm.so.1 lib/libvulkan.so.1 \
          lib/gbm/dri_gbm.so lib/dri/zink_dri.so lib/dri/swrast_dri.so \
          lib/dri/kms_swrast_dri.so lib/dri/libdril_dri.so \
          share/glvnd/egl_vendor.d/50_mesa.json; do
