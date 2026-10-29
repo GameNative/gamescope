@@ -70,4 +70,8 @@ its env override (`GNDRM_DIR`, `GN_XWAYLAND_DIR`).
 The minimal GL/EGL stack (zink + softpipe) that Xwayland's glamor runs on is
 built from this tree: `android/mesa-glamor/build-mesa-glamor.sh` patches a
 pinned upstream Mesa release and stages it where the packager looks for it
-(`GN_MESA_GLAMOR_STAGE`). See `android/mesa-glamor/README.md`.
+(`GN_MESA_GLAMOR_STAGE`). The packager runs that build itself whenever the stage
+is missing, built from another Mesa version, or older than the sources in
+`android/mesa-glamor/` — a stage directory that exists is not evidence that it
+is current, and the payload's glamor is only as new as that stage. See
+`android/mesa-glamor/README.md`.

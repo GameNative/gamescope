@@ -129,14 +129,10 @@ jobs:
           cp /tmp/xwayland-stage/data/user/0/app.gamenative/files/gamescope/lib/pkgconfig/xwayland.pc \
             "$HOME/termuxfs/aarch64/data/data/com.termux/files/usr/lib/pkgconfig/"
 
-      # Mesa 26.2 needs meson >= 1.4 (the runner has 1.3) plus mako, PyYAML
-      # and packaging, so it gets its own venv; the gamescope steps keep the
-      # system meson.
+      # bison/flex are the only host tools the Mesa build still needs supplied;
+      # it provisions its own meson + Python modules into a venv in its work dir.
       - name: Install the glamor Mesa build tools
-        run: |
-          sudo apt-get install -y bison flex python3-venv
-          python3 -m venv "$HOME/mesa-venv"
-          "$HOME/mesa-venv/bin/pip" install --quiet 'meson>=1.4,<2' mako pyyaml packaging
+        run: sudo apt-get install -y bison flex python3-venv
 
       - name: Cache the Mesa release tarball
         uses: actions/cache@v4
@@ -154,7 +150,6 @@ jobs:
 
       - name: Build the glamor Mesa stage
         run: |
-          export PATH="$HOME/mesa-venv/bin:$PATH"
           export CCACHE_DIR="$HOME/.ccache-mesa"
           export GN_MESA_TARBALL_DIR="$HOME/mesa-tarball"
           bash android/mesa-glamor/build-mesa-glamor.sh

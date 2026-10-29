@@ -13,7 +13,10 @@
 #   share/glvnd/egl_vendor.d/50_mesa.json
 #
 # Runs on Linux or macOS. bison and flex come from PATH (macOS ships bison 2.3,
-# put Homebrew's first). Python needs mako, PyYAML and packaging; meson >= 1.4.
+# put Homebrew's first). meson >= 1.4 and the Python modules Mesa's build imports
+# (mako, PyYAML, packaging) are provisioned into a venv in the work dir, because
+# a host `meson` runs on whichever interpreter owns it and that one usually has
+# none of them.
 #
 # Env overrides:
 #   NDK                    NDK root (default: $HOME/Android/Sdk/ndk/27.3.13750724)
@@ -42,6 +45,25 @@ NDK_BIN="$NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin"
 BISON="$(command -v bison)" || { echo "bison not in PATH" >&2; exit 1; }
 FLEX="$(command -v flex)" || { echo "flex not in PATH" >&2; exit 1; }
 CCACHE="$(command -v ccache || true)"
+
+# Mesa's build imports mako, PyYAML and packaging, and needs meson >= 1.4. A bare
+# `meson` from PATH runs on whichever python owns it (here the distro's, which
+# has neither the modules nor a recent enough version), so the build tools live
+# in a venv in the work dir and come first in PATH. The venv host must be an
+# interpreter that can bootstrap pip: a bundled runtime python (no ensurepip)
+# cannot, so the distro interpreter wins when it exists.
+VENV="$ROOT/venv"
+if [ ! -x "$VENV/bin/meson" ]; then
+    PYTHON=/usr/bin/python3
+    [ -x "$PYTHON" ] || PYTHON=python3
+    rm -rf "$VENV"
+    "$PYTHON" -m venv "$VENV" || {
+        echo "cannot create the Mesa build-tool venv with $PYTHON (it needs the" >&2
+        echo "venv module and ensurepip; Debian/Ubuntu: apt-get install python3-venv)" >&2
+        exit 1; }
+    "$VENV/bin/pip" install --quiet 'meson>=1.4,<2' mako pyyaml packaging
+fi
+PATH="$VENV/bin:$PATH"
 
 SRC="$(bash "$HERE/fetch-mesa.sh" "$ROOT" | tail -1)"
 
