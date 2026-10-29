@@ -18,9 +18,12 @@ GN_MESA_GLAMOR_STAGE=$PWD/build-android-mesa-glamor/stage android/package-gamesc
 ```
 
 The stage defaults to `build-android-mesa-glamor/stage`, which is also where
-`package-gamescope.sh` looks. Linux or macOS; needs the NDK (`NDK`), the termux
-prefix (`TERMUXFS`), bison and flex in `PATH`, meson >= 1.4 and Python with
-mako, PyYAML and packaging. The CI workflow builds it and uploads the stage as
+`package-gamescope.sh` looks — and it builds the stage itself when it is missing,
+built from another Mesa version, or older than the sources here, so the manual
+run is only needed to compile ahead of a pack. Linux or macOS; needs the NDK
+(`NDK`), the termux prefix (`TERMUXFS`), bison and flex in `PATH`, and `python3`
+with venv support — meson >= 1.4 plus mako, PyYAML and packaging are provisioned
+into `venv/` in the work dir. The CI workflow builds it and uploads the stage as
 the `mesa-glamor-stage-<sha>` artifact.
 
 ## Patches

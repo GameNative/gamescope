@@ -25,7 +25,8 @@
 # the termux prefix, and Mesa's EGL vendor (libEGL_mesa.so.0, per the shipped
 # 50_mesa.json), libgallium (glapi built in), libgbm, the gbm/dri_gbm backend
 # and the DRI drivers under lib/dri from the STAGED minimal Mesa
-# (GN_MESA_GLAMOR_STAGE, built by android/mesa-glamor/build-mesa-glamor.sh) —
+# (GN_MESA_GLAMOR_STAGE, source in android/mesa-glamor/, which this script
+# builds below whenever the stage is missing or older than that source) —
 # zink+softpipe, LLVM disabled. That stage has no libLLVM/libxml2/libicu
 # dependency, unlike the prefix's libgallium-25.3.5, so those are not shipped. zink dlopens
 # libvulkan.so.1 (a name Android does not provide — its loader is libvulkan.so),
@@ -212,8 +213,32 @@ resolve_libs "$STAGE/bin/gamescope" "$STAGE/bin/gamescopereaper"
 # The EGL vendor / gallium / GBM files come from the staged minimal Mesa
 # (LLVM-free); libglvnd's loader + GLES shims are NOT built by that stage, so
 # they still come from the termux prefix. libgbm.so.1 satisfies the DT_NEEDED of
-# libEGL_mesa/libdril, and libgbm.so is the exact name Xwayland dlopens. glapi
-# is part of libgallium since Mesa 25.1, whose name carries the Mesa version.
+# libEGL_mesa/libdril, and libgbm.so is the exact name Xwayland dlopens.
+# glapi is part of libgallium since Mesa 25.1, whose name carries the Mesa
+# version, and the GALLIUM_SO glob below is the only place its version is read.
+# The stage is a build product of this tree, so the packager makes it current the
+# way it treats every gamenative-drm artifact: a directory that exists says
+# nothing about whether it is current. What shipped for months was a 25.0-devel
+# stage from a retired repo that no build step in this loop ever refreshed —
+# glamor ran the old gallium while the tree described 26.x. Missing, built from
+# a different Mesa version, or older than android/mesa-glamor/ all mean rebuild.
+MESA_VERSION="$(sed -n 's/^MESA_VERSION="\(.*\)"/\1/p' "$GS_DIR/android/mesa-glamor/fetch-mesa.sh")"
+[ -n "$MESA_VERSION" ] || { echo "error: no MESA_VERSION in android/mesa-glamor/fetch-mesa.sh" >&2; exit 1; }
+ensure_mesa_stage() {
+    local want="$GN_MESA_GLAMOR_STAGE/lib/libgallium-$MESA_VERSION.so" newer
+    if [ -f "$want" ]; then
+        newer="$(find "$GS_DIR/android/mesa-glamor" -type f ! -name '*.md' \
+            -newer "$want" -print -quit)"
+        [ -n "$newer" ] || return 0
+        echo "mesa-glamor: $newer is newer than the staged Mesa $MESA_VERSION — rebuilding"
+    elif [ -d "$GN_MESA_GLAMOR_STAGE" ]; then
+        echo "mesa-glamor: no libgallium-$MESA_VERSION.so in $GN_MESA_GLAMOR_STAGE — rebuilding"
+    else
+        echo "mesa-glamor: building the Mesa $MESA_VERSION stage at $GN_MESA_GLAMOR_STAGE"
+    fi
+    bash "$GS_DIR/android/mesa-glamor/build-mesa-glamor.sh"
+}
+ensure_mesa_stage
 GALLIUM_SO=("$GN_MESA_GLAMOR_STAGE"/lib/libgallium-*.so)
 [ "${#GALLIUM_SO[@]}" = 1 ] && [ -f "${GALLIUM_SO[0]}" ] || {
     echo "error: expected one libgallium-*.so in $GN_MESA_GLAMOR_STAGE/lib" >&2; exit 1; }
