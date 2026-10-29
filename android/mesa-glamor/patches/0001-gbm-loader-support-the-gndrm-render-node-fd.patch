@@ -1,0 +1,310 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Joshua Tam <297250+joshuatam@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 22:01:08 +0800
+Subject: [PATCH] gbm, loader: support the gndrm render-node fd
+
+The loader and GBM changes the gndrm stack depends on:
+
+- src/gbm/main/gbm.c: accept the gndrm socket fd (DRM_IOCTL_VERSION
+  names the device "gamenative") in gbm_create_device().
+
+- src/loader/loader.c: treat that fd as render capable and pick zink for
+  it instead of the kernel driver name.
+
+- src/gbm/main/backend.c: resolve the GBM backend directory at runtime as
+  the gbm/ sibling of libgbm instead of the configure-time prefix.
+
+- src/meson.build: build targets/dril for a GBM-only build too.
+
+Ported from the 25.0-devel fork onto mesa-26.2.6. Upstream no longer has
+the dynamic gallium pipe-loader (PIPE_SEARCH_DIR and gallium-pipe are
+gone), so the pipe-loader half of the original change is dropped.
+---
+ src/gbm/main/backend.c |  6 ++-
+ src/gbm/main/gbm.c     | 46 ++++++++++++++++++++++-
+ src/gbm/meson.build    |  4 --
+ src/loader/loader.c    | 83 ++++++++++++++++++++++++++++++++++++++++--
+ src/loader/loader.h    | 16 ++++++++
+ src/meson.build        |  6 ++-
+ 6 files changed, 150 insertions(+), 11 deletions(-)
+
+diff --git a/src/gbm/main/backend.c b/src/gbm/main/backend.c
+index 7eb835d371cd..05a3e96fb129 100644
+--- a/src/gbm/main/backend.c
++++ b/src/gbm/main/backend.c
+@@ -107,9 +107,13 @@ backend_create_device(const struct gbm_backend_desc *bd, int fd)
+ static struct gbm_device *
+ load_backend_by_name(const char *name, int fd, bool warn_on_fail)
+ {
++   char backend_dir[PATH_MAX];
++   const char *search_path =
++      loader_get_sibling_dir(&load_backend_by_name, "gbm",
++                             backend_dir, sizeof(backend_dir));
+    void *lib = loader_open_driver_lib(name, BACKEND_LIB_SUFFIX,
+                                       backend_search_path_vars,
+-                                      DEFAULT_BACKENDS_PATH,
++                                      search_path,
+                                       warn_on_fail);
+ 
+    if (!lib)
+diff --git a/src/gbm/main/gbm.c b/src/gbm/main/gbm.c
+index 9b7b1ccc0459..cd986d89480a 100644
+--- a/src/gbm/main/gbm.c
++++ b/src/gbm/main/gbm.c
+@@ -30,6 +30,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <stdint.h>
++#include <stdbool.h>
+ 
+ #ifdef MAJOR_IN_MKDEV
+ #include <sys/mkdev.h>
+@@ -40,6 +41,7 @@
+ #include <sys/stat.h>
+ #include <unistd.h>
+ #include <errno.h>
++#include <xf86drm.h>
+ 
+ #include "gbm.h"
+ #include "gbmint.h"
+@@ -112,6 +114,47 @@ gbm_device_destroy(struct gbm_device *gbm)
+    _gbm_device_destroy(gbm);
+ }
+ 
++/**
++ * Decide whether a fd can be a GBM device.
++ *
++ * Normally this is a DRM character device (S_IFCHR).  gndrm (GameNative
++ * userspace DRM) is different: its render-node fd is a Unix socket served by
++ * our daemon through libgndrm_shim.so, an LD_PRELOAD ioctl interceptor, so
++ * fstat() reports S_IFSOCK with st_rdev == 0.  Every probe that keys off
++ * st_mode/st_rdev (drmGetDevice2, the /sys/dev/char/ lookups) fails on it, yet
++ * the shim does forward DRM_IOCTL_VERSION and the daemon names the device
++ * "gamenative" (gndrm-daemon's DRIVER_NAME).  Accept such an fd here;
++ * otherwise gbm_create_device() bails before the backend runs and Xwayland
++ * glamor logs "couldn't create gbm device" and disables itself.
++ *
++ * GNDRM_DRM_NAME overrides the expected device name (default "gamenative").
++ */
++static bool
++gbm_fd_is_device(int fd)
++{
++   struct stat buf;
++
++   if (fd < 0 || fstat(fd, &buf) < 0)
++      return false;
++
++   if (S_ISCHR(buf.st_mode))
++      return true;
++
++   const char *want = getenv("GNDRM_DRM_NAME");
++   if (!want || !*want)
++      want = "gamenative";
++
++   drmVersionPtr version = drmGetVersion(fd);
++   if (!version)
++      return false;
++
++   bool match = version->name_len == (int)strlen(want) &&
++                strncmp(version->name, want, version->name_len) == 0;
++
++   drmFreeVersion(version);
++   return match;
++}
++
+ /** Create a gbm device for allocating buffers
+  *
+  * The file descriptor passed in is used by the backend to communicate with
+@@ -128,9 +171,8 @@ GBM_EXPORT struct gbm_device *
+ gbm_create_device(int fd)
+ {
+    struct gbm_device *gbm = NULL;
+-   struct stat buf;
+ 
+-   if (fd < 0 || fstat(fd, &buf) < 0 || !S_ISCHR(buf.st_mode)) {
++   if (!gbm_fd_is_device(fd)) {
+       errno = EINVAL;
+       return NULL;
+    }
+diff --git a/src/gbm/meson.build b/src/gbm/meson.build
+index fbfdfb20f269..66e73088e102 100644
+--- a/src/gbm/meson.build
++++ b/src/gbm/meson.build
+@@ -10,9 +10,6 @@ files_gbm = files(
+   'main/gbm.h',
+   'main/gbmint.h',
+ )
+-args_gbm = [
+-  '-DDEFAULT_BACKENDS_PATH="@0@"'.format(gbm_backends_path),
+-]
+ incs_gbm = [include_directories('main'), inc_loader, inc_gallium, inc_util]
+ 
+ libgbm_name = 'gbm'
+@@ -25,7 +22,6 @@ libgbm = shared_library(
+   libgbm_name,
+   files_gbm,
+   include_directories : incs_gbm,
+-  c_args : [args_gbm],
+   link_args : [ld_args_gc_sections],
+   link_with : [libloader],
+   dependencies : [dep_libdrm, idep_xmlconfig],
+diff --git a/src/loader/loader.c b/src/loader/loader.c
+index 0bbccbf5b239..2680f8bd0dc0 100644
+--- a/src/loader/loader.c
++++ b/src/loader/loader.c
+@@ -124,6 +124,41 @@ loader_get_kernel_driver_name(int fd)
+    return driver;
+ }
+ 
++/*
++ * gndrm (GameNative userspace DRM): the on-device fd is a Unix socket served
++ * by our daemon through libgndrm_shim.so, not a /dev/dri node.  libdrm's
++ * device probes (drmGetDevice2, and the /sys/dev/char/<maj>:<min> lookups
++ * that key off st_rdev) all fail on it because fstat() reports a socket.
++ * The shim does serve DRM_IOCTL_VERSION, and the daemon names the device
++ * "gamenative" (see gndrm-daemon's DRIVER_NAME).  Keying off that name lets
++ * us treat the fd as a DRM render node and default it to the zink DRI driver
++ * rather than the kernel-driver-name path, which would try - and fail - to
++ * dlopen dri/gamenative_dri.so.
++ *
++ * GNDRM_DRM_NAME    overrides the expected device name (default "gamenative").
++ * GNDRM_MESA_DRIVER overrides the DRI driver picked for such a device.
++ */
++static bool
++loader_is_gndrm_device(int fd)
++{
++   const char *want = getenv("GNDRM_DRM_NAME");
++   drmVersionPtr version;
++   bool match;
++
++   if (!want || !*want)
++      want = "gamenative";
++
++   version = drmGetVersion(fd);
++   if (!version)
++      return false;
++
++   match = version->name_len == (int)strlen(want) &&
++           strncmp(version->name, want, version->name_len) == 0;
++
++   drmFreeVersion(version);
++   return match;
++}
++
+ bool
+ amd_predicate(int fd, const char *driver)
+ {
+@@ -307,8 +342,12 @@ loader_is_device_render_capable(int fd)
+    drmDevicePtr dev_ptr;
+    bool ret;
+ 
+-   if (drmGetDevice2(fd, 0, &dev_ptr) != 0)
+-      return false;
++   if (drmGetDevice2(fd, 0, &dev_ptr) != 0) {
++      /* gndrm socket fd: not a real /dev/dri node, but the daemon serves
++       * render-node ioctls, so honour it when the VERSION ioctl names us.
++       */
++      return loader_is_gndrm_device(fd);
++   }
+ 
+    ret = (dev_ptr->available_nodes & (1 << DRM_NODE_RENDER));
+ 
+@@ -799,8 +838,13 @@ loader_get_driver_for_fd(int fd)
+ #endif
+ 
+    driver = loader_get_pci_driver(fd);
+-   if (!driver)
++   if (!driver) {
++      if (loader_is_gndrm_device(fd)) {
++         const char *override = getenv("GNDRM_MESA_DRIVER");
++         return strdup((override && *override) ? override : "zink");
++      }
+       driver = loader_get_kernel_driver_name(fd);
++   }
+ 
+    return driver;
+ }
+@@ -852,6 +896,39 @@ loader_bind_extensions(void *data,
+ 
+    return ret;
+ }
++
++/**
++ * Resolve a directory installed next to the shared object that contains
++ * \p self, writing "<libdir>/<subdir>" into \p buf.
++ *
++ * The configure-time prefix names the build host's staging tree, which does
++ * not exist where the library is actually installed, so a driver directory
++ * must be derived at runtime from the loading library's own on-disk path.
++ * Falls back to \p subdir relative to the current directory when the library
++ * path cannot be determined (e.g. a statically linked caller).
++ */
++const char *
++loader_get_sibling_dir(const void *self, const char *subdir,
++                       char *buf, size_t buf_size)
++{
++   Dl_info info;
++   const char *slash;
++
++   if (buf_size == 0)
++      return NULL;
++
++   if (dladdr(self, &info) && info.dli_fname &&
++       (slash = strrchr(info.dli_fname, '/')) &&
++       snprintf(buf, buf_size, "%.*s/%s", (int)(slash - info.dli_fname),
++                info.dli_fname, subdir) < (int)buf_size)
++      return buf;
++
++   if (snprintf(buf, buf_size, "%s", subdir) < (int)buf_size)
++      return buf;
++
++   return NULL;
++}
++
+ /**
+  * Opens a driver or backend using its name, returning the library handle.
+  *
+diff --git a/src/loader/loader.h b/src/loader/loader.h
+index 6748cb5269d8..c623876a66ae 100644
+--- a/src/loader/loader.h
++++ b/src/loader/loader.h
+@@ -72,6 +72,22 @@ loader_open_driver_lib(const char *driver_name,
+                        const char *default_search_path,
+                        bool warn_on_fail);
+ 
++/**
++ * Resolve a directory installed next to the shared object that contains
++ * \p self, into \p buf as "<libdir>/<subdir>".
++ *
++ * Configure-time prefixes (DEFAULT_BACKENDS_PATH, dri_drivers_path, ...) name
++ * the build host's staging tree, which does not exist where the library is
++ * actually installed.  Callers that need a driver directory should pass the
++ * address of a function defined in their own shared object here so the
++ * directory is derived at runtime from that object's on-disk location.
++ *
++ * \return buf, or NULL if \p subdir alone would not fit in \p buf.
++ */
++const char *
++loader_get_sibling_dir(const void *self, const char *subdir,
++                       char *buf, size_t buf_size);
++
+ char *
+ loader_get_device_name_for_fd(int fd);
+ 
+diff --git a/src/meson.build b/src/meson.build
+index c36f44b13978..0254c35be576 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -161,7 +161,11 @@ if with_egl
+   subdir('egl')
+ endif
+ if with_gallium
+-  if with_glx == 'dri' or with_platform_x11
++  # The DRI megadriver (targets/dril) is normally only built for GLX-DRI or an
++  # X11 platform. A minimal GBM+EGL build (Xwayland glamor) has neither, but
++  # the packaged stack still ships lib/dri/libdril_dri.so next to libgallium,
++  # so build it whenever GBM is enabled too.
++  if with_glx == 'dri' or with_platform_x11 or with_gbm
+     subdir('gallium/targets/dril')
+   endif
+ endif

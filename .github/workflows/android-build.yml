@@ -7,7 +7,8 @@
 # EGL/GLES/GBM, Vulkan) that android/build-gamescope.sh links against.
 #
 # Xwayland is built first because wlroots resolves its xwayland dependency
-# from the xwayland.pc that build installs.
+# from the xwayland.pc that build installs. The glamor Mesa stage Xwayland
+# runs on (android/mesa-glamor) is built next and uploaded as an artifact.
 name: Android build (test)
 
 on:
@@ -127,6 +128,46 @@ jobs:
           DESTDIR=/tmp/xwayland-stage ninja -C build-android install
           cp /tmp/xwayland-stage/data/user/0/app.gamenative/files/gamescope/lib/pkgconfig/xwayland.pc \
             "$HOME/termuxfs/aarch64/data/data/com.termux/files/usr/lib/pkgconfig/"
+
+      # Mesa 26.2 needs meson >= 1.4 (the runner has 1.3) plus mako, PyYAML
+      # and packaging, so it gets its own venv; the gamescope steps keep the
+      # system meson.
+      - name: Install the glamor Mesa build tools
+        run: |
+          sudo apt-get install -y bison flex python3-venv
+          python3 -m venv "$HOME/mesa-venv"
+          "$HOME/mesa-venv/bin/pip" install --quiet 'meson>=1.4,<2' mako pyyaml packaging
+
+      - name: Cache the Mesa release tarball
+        uses: actions/cache@v4
+        with:
+          path: ~/mesa-tarball
+          key: mesa-tarball-${{ hashFiles('android/mesa-glamor/fetch-mesa.sh') }}
+
+      - name: Cache ccache (glamor Mesa)
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache-mesa
+          key: ccache-mesa-glamor-${{ hashFiles('android/mesa-glamor/**') }}
+          restore-keys: |
+            ccache-mesa-glamor-
+
+      - name: Build the glamor Mesa stage
+        run: |
+          export PATH="$HOME/mesa-venv/bin:$PATH"
+          export CCACHE_DIR="$HOME/.ccache-mesa"
+          export GN_MESA_TARBALL_DIR="$HOME/mesa-tarball"
+          bash android/mesa-glamor/build-mesa-glamor.sh
+          bash android/check-no-libandroid.sh build-android-mesa-glamor/stage
+          ccache -s || true
+          tar -C build-android-mesa-glamor/stage -czf mesa-glamor-stage.tar.gz .
+
+      - name: Upload the glamor Mesa stage
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesa-glamor-stage-${{ github.sha }}
+          path: mesa-glamor-stage.tar.gz
+          if-no-files-found: error
 
       - name: Cache ccache
         uses: actions/cache@v4

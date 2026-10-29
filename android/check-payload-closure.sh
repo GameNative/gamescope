@@ -41,9 +41,10 @@ done
 
 # dlopen probes that are NOT part of the shipped runtime set: loaded only on a
 # code branch that is not exercised in a Gamescope session (desktop-GL/X11
-# fallbacks of libepoxy and the ICD shim's X11/adrenotools guest hooks). They
-# are reported, never counted as failures, but they are never silently hidden.
-OPTIONAL_RE='^(libadrenotools\.so|libX11\.so\.6|libxcb\.so\.1|libGL\.so\.1|libGLX\.so\.1|libOpenGL\.so\.0|librenderdoc\.so)$'
+# fallbacks of libepoxy, the ICD shim's X11/adrenotools guest hooks and Mesa's
+# RenderDoc capture hook). They are reported, never counted as failures, but
+# they are never silently hidden.
+OPTIONAL_RE='^(libadrenotools\.so|libX11\.so\.6|libxcb\.so\.1|libGL\.so\.1|libGLX\.so\.1|libOpenGL\.so\.0|librenderdoc\.so|libVkLayer_GLES_RenderDoc\.so)$'
 
 check_name() { # check_name <name> <needed-by> <kind>
     local name="$1" by="$2" kind="$3"
@@ -126,8 +127,9 @@ fi
 
 echo
 echo "=== required GL/EGL artefacts"
-for f in lib/libEGL.so.1 lib/libEGL_mesa.so.0 lib/libgallium-25.0.0-devel.so \
-         lib/libgbm.so.1 lib/libglapi.so.0 lib/libvulkan.so.1 \
+gallium="$(cd "$WORK" && ls lib/libgallium-*.so 2>/dev/null | head -1)"
+for f in lib/libEGL.so.1 lib/libEGL_mesa.so.0 "${gallium:-lib/libgallium-*.so}" \
+         lib/libgbm.so.1 lib/libvulkan.so.1 \
          lib/gbm/dri_gbm.so lib/dri/zink_dri.so lib/dri/swrast_dri.so \
          lib/dri/kms_swrast_dri.so lib/dri/libdril_dri.so \
          share/glvnd/egl_vendor.d/50_mesa.json; do

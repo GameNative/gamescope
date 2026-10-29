@@ -19,6 +19,7 @@ filename order.
 | `build-gamescope.sh` | applies the series and configures/builds the prefix build |
 | `package-gamescope.sh` | assembles the runtime payload from a finished build |
 | `check-payload-closure.sh` | checks the packaged payload is self-contained |
+| `mesa-glamor/` | the glamor GL/EGL/GBM stack: pinned upstream Mesa, its patches and build |
 
 ## Building
 
@@ -62,7 +63,11 @@ This tree is only the display server. The pieces it stages but does not build:
 |---|---|
 | `gamenative-drm` | the userspace-DRM daemon library, the Vulkan ICD and the LD_PRELOAD socket shim, plus the `gn-dmabuf-test` / `gn-wsi-test` / `gn-xtree-probe` clients in `bin/` |
 | `gamenative-xwayland` | the Xwayland binary and its payload, absorbed into this one |
-| `mesa` | the staged minimal GL/EGL (zink + softpipe) carried under `lib/` |
 
 Each sibling is looked up beside this checkout and can be pointed elsewhere with
-its env override (`GNDRM_DIR`, `GN_XWAYLAND_DIR`, `GN_MESA_GLAMOR_STAGE`).
+its env override (`GNDRM_DIR`, `GN_XWAYLAND_DIR`).
+
+The minimal GL/EGL stack (zink + softpipe) that Xwayland's glamor runs on is
+built from this tree: `android/mesa-glamor/build-mesa-glamor.sh` patches a
+pinned upstream Mesa release and stages it where the packager looks for it
+(`GN_MESA_GLAMOR_STAGE`). See `android/mesa-glamor/README.md`.

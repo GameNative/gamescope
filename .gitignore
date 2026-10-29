@@ -8,3 +8,6 @@ android/cross/aarch64-linux-android.txt
 # Patch-train record written by android/build-gamescope.sh. Local build state:
 # committed, it would tell a fresh checkout its patches are already applied.
 .gn-patches-applied
+
+# Work dir of android/mesa-glamor/build-mesa-glamor.sh (tarball, source, stage).
+/build-android-mesa-glamor/
