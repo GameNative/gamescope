@@ -30,7 +30,9 @@ tar --zstd -xf "$ASSET" -C "$WORK"
 # it. It is never a legal DT_NEEDED — a file that links it can only load in a
 # namespace that carries the NDK stub, which is not this payload's contract —
 # so the DT_NEEDED scan refuses it before the allowlist is consulted.
-SYSTEM_RE='^(libc|libm|libdl|liblog|libandroid|libz|libsync|libstdc\+\+|ld-android|libEGL|libGLESv1_CM|libGLESv2|libGLESv3|libvulkan)\.so$'
+# libnativewindow.so is the platform library the ICD dlopens for the guest's
+# AHardwareBuffer receive path; present on every Android this payload runs on.
+SYSTEM_RE='^(libc|libm|libdl|liblog|libandroid|libz|libsync|libnativewindow|libstdc\+\+|ld-android|libEGL|libGLESv1_CM|libGLESv2|libGLESv3|libvulkan)\.so$'
 
 fail=0
 declare -A present
