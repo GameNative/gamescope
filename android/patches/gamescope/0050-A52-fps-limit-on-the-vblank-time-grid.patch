@@ -1,0 +1,98 @@
+A52 — release limited frames on the vblank time grid, not on every Nth wakeup
+
+The non-VRR frame-rate limit counted compositor wakeups: a window got its frame
+callback on every (refresh / target)th wakeup, which equals every Nth vblank only
+while no wakeup is ever late. The timer re-arms by stepping to the next vblank
+after "now", so a wakeup that comes more than one vblank late skips the vblanks
+in between, and those never count. On the 1200 Hz grid a session runs on, a
+wakeup is late by a vblank after 0.83 ms of scheduling delay, and every late one
+holds the next frame a whole vblank longer. A 60 cap then reads 50-57, a 30 cap
+25-28, in proportion to the wakeups lost -- exactly the flat 18-21 ms frames
+users saw with the CPU and the GPU idle -- and it sinks further as the device
+throttles and the compositor thread is scheduled later still.
+
+The limiter now keeps a release grid in time: the next release is the previous
+one plus the target period, and a frame is released on the first vblank whose
+nominal time reaches it, with half a vblank of tolerance for the anchor moving.
+A late wakeup delays that one release by the lateness, and the grid absorbs it on
+the next, so the average rate is the target. A stall longer than a period is a
+lost frame, never a debt to repay with back-to-back releases. The VRR path is
+untouched: it already schedules by time.
+
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index 773e95c..d6da2ad 100644
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -1233,6 +1233,52 @@ uint32_t g_uCurrentBasePlaneAppID = 0;
+ bool g_bCurrentBasePlaneIsFifo = false;
+ 
+ static int g_nSteamCompMgrTargetFPS = 0;
++
++// Non-VRR frame-rate limit: a frame is released on the vblank whose nominal time reaches
++// the release grid (the previous release plus the target period), not on every Nth
++// compositor wakeup. The timer steps over the vblanks a late wakeup missed, so counting
++// wakeups turns every late one into a frame held a whole vblank longer: on a fine vblank
++// grid that reads as a cap below the target whenever the compositor thread is scheduled
++// late, and it sinks further as the device throttles.
++static uint64_t g_ulFPSLimitNextRelease = 0;
++static bool g_bFPSLimitReleaseThisVBlank = true;
++
++static void steamcompmgr_update_fps_limit_release( uint64_t ulTargetVBlank )
++{
++	int nRefreshmHz = g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
++	int nRefreshHz = gamescope::ConvertmHzToHz( nRefreshmHz );
++	int nTargetFPS = g_nSteamCompMgrTargetFPS;
++
++	if ( !nTargetFPS || nRefreshHz <= nTargetFPS )
++	{
++		g_bFPSLimitReleaseThisVBlank = true;
++		g_ulFPSLimitNextRelease = 0;
++		return;
++	}
++
++	const uint64_t ulPeriod = gamescope::mHzToRefreshCycle( gamescope::ConvertHztomHz( nTargetFPS ) );
++	const uint64_t ulVBlank = gamescope::mHzToRefreshCycle( nRefreshmHz );
++
++	// First vblank under this cap, or the grid is ahead of us (cap change, clock step): anchor here.
++	if ( g_ulFPSLimitNextRelease == 0 || g_ulFPSLimitNextRelease > ulTargetVBlank + ulPeriod )
++		g_ulFPSLimitNextRelease = ulTargetVBlank;
++
++	// Half a vblank of tolerance so a release point that lands a hair past this vblank's
++	// nominal time is not pushed to the next one when the anchor moves.
++	if ( ulTargetVBlank + ulVBlank / 2 < g_ulFPSLimitNextRelease )
++	{
++		g_bFPSLimitReleaseThisVBlank = false;
++		return;
++	}
++
++	g_bFPSLimitReleaseThisVBlank = true;
++	g_ulFPSLimitNextRelease += ulPeriod;
++
++	// A stall longer than a period is a lost frame, not a debt: never release on
++	// consecutive vblanks to catch up.
++	if ( g_ulFPSLimitNextRelease <= ulTargetVBlank + ulVBlank / 2 )
++		g_ulFPSLimitNextRelease = ulTargetVBlank + ulPeriod;
++}
+ static uint64_t g_uDynamicRefreshEqualityTime = 0;
+ static int g_nDynamicRefreshRate[gamescope::GAMESCOPE_SCREEN_TYPE_COUNT] = { 0, 0 };
+ // Delay to stop modes flickering back and forth.
+@@ -7037,9 +7083,7 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vb
+ 	{
+ 		if ( g_nSteamCompMgrTargetFPS && bShouldLimitFPS && nRefreshHz > nTargetFPS )
+ 		{
+-			int nVblankDivisor = nRefreshHz / nTargetFPS;
+-
+-			if ( vblank_idx % nVblankDivisor != 0 )
++			if ( !g_bFPSLimitReleaseThisVBlank )
+ 				bSendCallback = false;
+ 		}
+ 	}
+@@ -10553,6 +10597,8 @@ steamcompmgr_main(int argc, char **argv)
+ 		static uint64_t vblank_idx = 0;
+ 		if ( vblank )
+ 		{
++			steamcompmgr_update_fps_limit_release( g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank );
++
+ 			{
+ 				uint64_t now = get_time_in_nanos();
+ 
