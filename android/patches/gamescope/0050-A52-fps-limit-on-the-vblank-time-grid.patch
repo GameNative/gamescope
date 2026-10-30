@@ -33,10 +33,10 @@ the release grid stays free-running. The VRR path is untouched: it already
 schedules by time.
 
 diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
-index 773e95c..fca0913 100644
+index 773e95c..39e9e12 100644
 --- a/src/steamcompmgr.cpp
 +++ b/src/steamcompmgr.cpp
-@@ -1233,6 +1233,128 @@ uint32_t g_uCurrentBasePlaneAppID = 0;
+@@ -1233,6 +1233,136 @@ uint32_t g_uCurrentBasePlaneAppID = 0;
  bool g_bCurrentBasePlaneIsFifo = false;
  
  static int g_nSteamCompMgrTargetFPS = 0;
@@ -82,8 +82,16 @@ index 773e95c..fca0913 100644
 +
 +	uint64_t ulAnchor = 0;
 +	uint32_t uLatch = 0, uLead = 0;
++	static bool s_bLoggedNoGrid = false;
 +	if ( !gamenative_drm_latch_grid( &ulAnchor, &uLatch, &uLead ) || !uLatch )
++	{
++		if ( !s_bLoggedNoGrid )
++		{
++			s_bLoggedNoGrid = true;
++			xwm_log.infof( "fps limit: the shim answers no panel latch grid yet, free-running" );
++		}
 +		return ulPeriod;
++	}
 +
 +	const uint64_t ulMult = ( ulPeriod + uLatch / 2 ) / uLatch;
 +	if ( !ulMult )
@@ -165,7 +173,7 @@ index 773e95c..fca0913 100644
  static uint64_t g_uDynamicRefreshEqualityTime = 0;
  static int g_nDynamicRefreshRate[gamescope::GAMESCOPE_SCREEN_TYPE_COUNT] = { 0, 0 };
  // Delay to stop modes flickering back and forth.
-@@ -3654,6 +3776,7 @@ paint_all( global_focus_t *pFocus, bool async )
+@@ -3654,6 +3784,7 @@ paint_all( global_focus_t *pFocus, bool async )
  		}
  	}
  
@@ -173,7 +181,7 @@ index 773e95c..fca0913 100644
  	if ( pConnector && pConnector->Present( &frameInfo, async ) != 0 )
  	{
  		return;
-@@ -7037,9 +7160,7 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vb
+@@ -7037,9 +7168,7 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vb
  	{
  		if ( g_nSteamCompMgrTargetFPS && bShouldLimitFPS && nRefreshHz > nTargetFPS )
  		{
@@ -184,7 +192,7 @@ index 773e95c..fca0913 100644
  				bSendCallback = false;
  		}
  	}
-@@ -10553,6 +10674,8 @@ steamcompmgr_main(int argc, char **argv)
+@@ -10553,6 +10682,8 @@ steamcompmgr_main(int argc, char **argv)
  		static uint64_t vblank_idx = 0;
  		if ( vblank )
  		{
