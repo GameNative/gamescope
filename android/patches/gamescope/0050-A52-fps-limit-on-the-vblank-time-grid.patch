@@ -1,4 +1,4 @@
-A52 — release limited frames on the vblank time grid, not on every Nth wakeup
+A52 — release limited frames on a time grid, snapped to the panel's latch grid
 
 The non-VRR frame-rate limit counted compositor wakeups: a window got its frame
 callback on every (refresh / target)th wakeup, which equals every Nth vblank only
@@ -6,24 +6,37 @@ while no wakeup is ever late. The timer re-arms by stepping to the next vblank
 after "now", so a wakeup that comes more than one vblank late skips the vblanks
 in between, and those never count. On the 1200 Hz grid a session runs on, a
 wakeup is late by a vblank after 0.83 ms of scheduling delay, and every late one
-holds the next frame a whole vblank longer. A 60 cap then reads 50-57, a 30 cap
-25-28, in proportion to the wakeups lost -- exactly the flat 18-21 ms frames
-users saw with the CPU and the GPU idle -- and it sinks further as the device
-throttles and the compositor thread is scheduled later still.
+holds the next frame a whole vblank longer: the cap reads below the target in
+proportion to the wakeups lost, and sinks further as the device throttles.
 
 The limiter now keeps a release grid in time: the next release is the previous
 one plus the target period, and a frame is released on the first vblank whose
 nominal time reaches it, with half a vblank of tolerance for the anchor moving.
-A late wakeup delays that one release by the lateness, and the grid absorbs it on
-the next, so the average rate is the target. A stall longer than a period is a
-lost frame, never a debt to repay with back-to-back releases. The VRR path is
-untouched: it already schedules by time.
+A late wakeup delays that one release by the lateness, and the grid absorbs it
+on the next, so the average rate is the target. A stall longer than a period is
+a lost frame, never a debt to repay with back-to-back releases.
+
+That grid is still free-running against the panel. The daemon stamps the flip
+events on its own 1200 Hz timeline, so nothing ties a release to where
+SurfaceFlinger latches, and with a 60 cap on a 60 Hz panel the commits drift
+across the latch deadline: two land on one latch point and one is replaced,
+measured as 59.4 commits/s shown at 56.7 fps, where at 120 Hz (every commit
+its own latch point) the same session shows all 59.4. So when the DRM shim
+answers the panel's latch grid (gamenative_drm_latch_grid, weak: anchor, period,
+lead, measured by the daemon from the latch stats) and the target period is a
+whole number of latch periods, the release grid is snapped onto the latch grid,
+offset by a lead the limiter steers itself: each commit's time is read against
+the grid, and the lead moves an eighth of the error toward landing commits in
+the middle of their latch window, so none sits on the edge and no two share a
+point. Without the symbol, or with a target the panel period does not divide,
+the release grid stays free-running. The VRR path is untouched: it already
+schedules by time.
 
 diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
-index 773e95c..d6da2ad 100644
+index 773e95c..eb15f5b 100644
 --- a/src/steamcompmgr.cpp
 +++ b/src/steamcompmgr.cpp
-@@ -1233,6 +1233,52 @@ uint32_t g_uCurrentBasePlaneAppID = 0;
+@@ -1233,6 +1233,119 @@ uint32_t g_uCurrentBasePlaneAppID = 0;
  bool g_bCurrentBasePlaneIsFifo = false;
  
  static int g_nSteamCompMgrTargetFPS = 0;
@@ -34,8 +47,72 @@ index 773e95c..d6da2ad 100644
 +// wakeups turns every late one into a frame held a whole vblank longer: on a fine vblank
 +// grid that reads as a cap below the target whenever the compositor thread is scheduled
 +// late, and it sinks further as the device throttles.
++//
++// On the gamenative backend the panel's latch grid is known (the daemon measures it from
++// the display's latch stats and the DRM shim answers it), and the vblank grid is not tied
++// to it. When the target period is a whole number of latch periods the release grid is
++// snapped onto the latch grid, offset by a lead the limiter steers itself: it reads where
++// each commit landed in its latch window and aims for the middle, so no two commits fall
++// on one latch point and none sits on the edge. Without the grid the release grid is
++// free-running.
 +static uint64_t g_ulFPSLimitNextRelease = 0;
 +static bool g_bFPSLimitReleaseThisVBlank = true;
++static uint64_t g_ulFPSLimitLastCommit = 0;
++static uint64_t g_ulFPSLimitLastCommitSeen = 0;
++static int64_t g_lFPSLimitLatchLead = 0;
++static bool g_bFPSLimitOnLatchGrid = false;
++
++extern "C" int gamenative_drm_latch_grid( uint64_t *pulAnchorNs, uint32_t *puPeriodNs, uint32_t *puLeadNs ) __attribute__(( weak ));
++
++// lValue reduced into [-lPeriod/2, lPeriod/2).
++static int64_t steamcompmgr_wrap_ns( int64_t lValue, int64_t lPeriod )
++{
++	const int64_t lHalf = lPeriod / 2;
++	const int64_t r = ( ( lValue + lHalf ) % lPeriod + lPeriod ) % lPeriod;
++	return r - lHalf;
++}
++
++// Snap the release grid onto the latch grid when there is one the target period fits.
++// Returns the period to step the grid by: the latch multiple when snapped.
++static uint64_t steamcompmgr_fps_limit_snap_to_latch_grid( uint64_t ulPeriod )
++{
++	g_bFPSLimitOnLatchGrid = false;
++	if ( !gamenative_drm_latch_grid )
++		return ulPeriod;
++
++	uint64_t ulAnchor = 0;
++	uint32_t uLatch = 0, uLead = 0;
++	if ( !gamenative_drm_latch_grid( &ulAnchor, &uLatch, &uLead ) || !uLatch )
++		return ulPeriod;
++
++	const uint64_t ulMult = ( ulPeriod + uLatch / 2 ) / uLatch;
++	if ( !ulMult )
++		return ulPeriod;
++	const uint64_t ulGrid = ulMult * uLatch;
++	const int64_t lError = int64_t( ulGrid ) - int64_t( ulPeriod );
++	if ( std::abs( lError ) * 100 > int64_t( ulPeriod ) )
++		return ulPeriod;
++
++	// Steer the lead from where the last commit landed in its latch window: aim for the
++	// middle, in steps of an eighth of the error so the pipeline's own jitter is not chased.
++	if ( g_ulFPSLimitLastCommit && g_ulFPSLimitLastCommit != g_ulFPSLimitLastCommitSeen )
++	{
++		g_ulFPSLimitLastCommitSeen = g_ulFPSLimitLastCommit;
++		// Time from the commit to the latch point it lands on: (0, latch].
++		int64_t lMargin = steamcompmgr_wrap_ns( int64_t( ulAnchor ) - int64_t( g_ulFPSLimitLastCommit ), int64_t( uLatch ) );
++		if ( lMargin <= 0 )
++			lMargin += uLatch;
++		const int64_t lErr = lMargin - int64_t( uLatch ) / 2;
++		g_lFPSLimitLatchLead = std::clamp<int64_t>( g_lFPSLimitLatchLead - lErr / 8, 0, int64_t( ulGrid ) - 1 );
++	}
++
++	const int64_t lBase = int64_t( ulAnchor ) - g_lFPSLimitLatchLead;
++	const int64_t lOff = steamcompmgr_wrap_ns( int64_t( g_ulFPSLimitNextRelease ) - lBase, int64_t( ulGrid ) );
++	const int64_t lSnapped = int64_t( g_ulFPSLimitNextRelease ) - lOff;
++	g_ulFPSLimitNextRelease = uint64_t( std::max<int64_t>( lSnapped, 0 ) );
++	g_bFPSLimitOnLatchGrid = true;
++	return ulGrid;
++}
 +
 +static void steamcompmgr_update_fps_limit_release( uint64_t ulTargetVBlank )
 +{
@@ -47,15 +124,18 @@ index 773e95c..d6da2ad 100644
 +	{
 +		g_bFPSLimitReleaseThisVBlank = true;
 +		g_ulFPSLimitNextRelease = 0;
++		g_bFPSLimitOnLatchGrid = false;
 +		return;
 +	}
 +
-+	const uint64_t ulPeriod = gamescope::mHzToRefreshCycle( gamescope::ConvertHztomHz( nTargetFPS ) );
++	uint64_t ulPeriod = gamescope::mHzToRefreshCycle( gamescope::ConvertHztomHz( nTargetFPS ) );
 +	const uint64_t ulVBlank = gamescope::mHzToRefreshCycle( nRefreshmHz );
 +
 +	// First vblank under this cap, or the grid is ahead of us (cap change, clock step): anchor here.
 +	if ( g_ulFPSLimitNextRelease == 0 || g_ulFPSLimitNextRelease > ulTargetVBlank + ulPeriod )
 +		g_ulFPSLimitNextRelease = ulTargetVBlank;
++
++	ulPeriod = steamcompmgr_fps_limit_snap_to_latch_grid( ulPeriod );
 +
 +	// Half a vblank of tolerance so a release point that lands a hair past this vblank's
 +	// nominal time is not pushed to the next one when the anchor moves.
@@ -76,7 +156,15 @@ index 773e95c..d6da2ad 100644
  static uint64_t g_uDynamicRefreshEqualityTime = 0;
  static int g_nDynamicRefreshRate[gamescope::GAMESCOPE_SCREEN_TYPE_COUNT] = { 0, 0 };
  // Delay to stop modes flickering back and forth.
-@@ -7037,9 +7083,7 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vb
+@@ -3654,6 +3767,7 @@ paint_all( global_focus_t *pFocus, bool async )
+ 		}
+ 	}
+ 
++	g_ulFPSLimitLastCommit = get_time_in_nanos();
+ 	if ( pConnector && pConnector->Present( &frameInfo, async ) != 0 )
+ 	{
+ 		return;
+@@ -7037,9 +7151,7 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vb
  	{
  		if ( g_nSteamCompMgrTargetFPS && bShouldLimitFPS && nRefreshHz > nTargetFPS )
  		{
@@ -87,7 +175,7 @@ index 773e95c..d6da2ad 100644
  				bSendCallback = false;
  		}
  	}
-@@ -10553,6 +10597,8 @@ steamcompmgr_main(int argc, char **argv)
+@@ -10553,6 +10665,8 @@ steamcompmgr_main(int argc, char **argv)
  		static uint64_t vblank_idx = 0;
  		if ( vblank )
  		{
