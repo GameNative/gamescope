@@ -1,0 +1,98 @@
+A49 — nudge the session reaper when a guest's window maps or goes away
+
+The reaper (A28) ends the session once no guest image is left, and it learns of
+a process exit from SIGCHLD only for the children reparented to it. A game that
+stays the child of a live wine process -- the wrapper that started it, explorer
+-- exits without a word to the reaper, and only its heartbeat catches that,
+seconds later. The compositor sees the exit at once: the game's windows are
+unmapped and destroyed when its X connection closes.
+
+So the compositor tells the reaper. Each window records at creation whether its
+owner (the X client's pid, from XRes) is a guest image, by the same rule the
+reaper applies; a window whose owner is a guest, or is unknown, nudges the
+reaper (SIGUSR1) when it maps -- so the first guest is seen the moment its
+window shows -- and when it is unmapped or destroyed. The decision is taken at
+creation because at destroy time the owner is usually already gone from /proc.
+Wine's own windows (the desktop, tabtip) never nudge: their owners fail the
+guest rule.
+
+The reaper's pid is the primary child gamescope spawned through the watchdog.
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index adafff0..773e95c 100644
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -5960,6 +5960,14 @@ static void gn_activate_nested_app_window( xwayland_ctx_t *ctx, Window window )
+ 	if ( hint.res_class ) XFree( hint.res_class );
+ }
+ 
++// A window whose owner is a guest, or whose owner is unknown, is one the
++// session reaper wants to hear about when it maps or goes away.
++static bool
++win_concerns_reaper(const steamcompmgr_win_t *w)
++{
++	return w->pid <= 0 || w->bGuestOwner;
++}
++
+ static void
+ map_win(xwayland_ctx_t* ctx, Window id, unsigned long sequence)
+ {
+@@ -5969,6 +5977,8 @@ map_win(xwayland_ctx_t* ctx, Window id, unsigned long sequence)
+ 		return;
+ 
+ 	w->xwayland().a.map_state = IsViewable;
++	if (win_concerns_reaper(w))
++		gamescope::Process::KickSessionReaper();
+ 
+ 	/* This needs to be here or else we lose transparency messages */
+ 	XSelectInput(ctx->dpy, id, PropertyChangeMask | SubstructureNotifyMask |
+@@ -6090,6 +6100,8 @@ unmap_win(xwayland_ctx_t *ctx, Window id, bool fade)
+ 	if (!w)
+ 		return;
+ 	w->xwayland().a.map_state = IsUnmapped;
++	if (win_concerns_reaper(w))
++		gamescope::Process::KickSessionReaper();
+ 
+ 	MakeFocusDirty();
+ 
+@@ -6211,6 +6223,7 @@ add_win(xwayland_ctx_t *ctx, Window id, Window prev, unsigned long sequence)
+ 	{
+ 		new_win->pid = -1;
+ 	}
++	new_win->bGuestOwner = gamescope::Process::IsGuestProcess( new_win->pid );
+ 
+ 	new_win->isOverlay = false;
+ 	new_win->isExternalOverlay = false;
+@@ -6459,7 +6472,11 @@ finish_destroy_win(xwayland_ctx_t *ctx, Window id, bool gone)
+ 		if (w->xwayland().id == id)
+ 		{
+ 			if (gone)
++			{
+ 				finish_unmap_win (ctx, w);
++				if (win_concerns_reaper(w))
++					gamescope::Process::KickSessionReaper();
++			}
+ 			
+ 			{
+ 				std::unique_lock lock( ctx->list_mutex );
+@@ -9620,6 +9637,7 @@ void LaunchNestedChildren( char **ppPrimaryChildArgv )
+ 	if ( ppPrimaryChildArgv && *ppPrimaryChildArgv )
+ 	{
+ 		pid_t nPrimaryChildPid = gamescope::Process::SpawnProcessInWatchdog( ppPrimaryChildArgv, false );
++		gamescope::Process::SetSessionReaper( nPrimaryChildPid );
+ 
+ 		std::thread waitThread([ nPrimaryChildPid ]()
+ 		{
+diff --git a/src/steamcompmgr_shared.hpp b/src/steamcompmgr_shared.hpp
+index 7d96cfa..87cf86d 100644
+--- a/src/steamcompmgr_shared.hpp
++++ b/src/steamcompmgr_shared.hpp
+@@ -108,6 +108,9 @@ struct steamcompmgr_win_t {
+ 	std::shared_ptr<std::string> title;
+ 	bool utf8_title = false;
+ 	pid_t pid = -1;
++	// The owning process is a guest image (see Process::IsGuestProcess), so
++	// this window coming or going is news for the session reaper.
++	bool bGuestOwner = false;
+ 
+ 	bool isSteamLegacyBigPicture = false;
+ 	bool isSteamStreamingClient = false;
