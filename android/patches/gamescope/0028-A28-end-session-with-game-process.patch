@@ -14,12 +14,16 @@ found in /proc/<pid>/cwd, the file's own path decides; not found, it came from
 the system path and is wine's own (start.exe, winhandler.exe).
 
 The watch is driven by events, not a poll. While a guest runs the reaper sleeps
-in sigtimedwait until something happens: a child exit (SIGCHLD -- as subreaper
+until something happens: a child exit (SIGCHLD -- as subreaper
 it inherits wine's double-forked processes, the game among them), a nudge from
 the compositor (SIGUSR1, sent by A49 when a guest's window maps or goes away),
 or a slow heartbeat (10 s) for an exit that produced neither. Every exited child
 is reaped, not only the primary one, so a finished launcher does not stay a
-zombie in the session's tree. Until the first guest is seen the table is read
+zombie in the session's tree. The two signals are taken by a handler that
+writes to a pipe the loop polls, never by a signal mask: the reaper runs under
+the host's LD_PRELOAD, whose libraries start threads before main with SIGUSR1
+unblocked, and a process-directed signal landing on one of them with no handler
+would end the reaper. Until the first guest is seen the table is read
 every 500 ms; after the guest set empties, every 250 ms for the two seconds it
 takes to call the tree still.
 
@@ -32,10 +36,10 @@ polls only while that fingerprint is unchanged. A handoff keeps the tree moving
 — forks, exits, the successor appearing — while a finished session goes still.
 An unreadable /proc leaves the flat two-second window in place.
 diff --git a/src/Apps/gamescopereaper.cpp b/src/Apps/gamescopereaper.cpp
-index 083aaf6..9c6f354 100644
+index 083aaf6..483ee7f 100644
 --- a/src/Apps/gamescopereaper.cpp
 +++ b/src/Apps/gamescopereaper.cpp
-@@ -2,8 +2,12 @@
+@@ -2,12 +2,17 @@
  #include "../log.hpp"
  
  #include <cassert>
@@ -46,9 +50,15 @@ index 083aaf6..9c6f354 100644
 +#include <ctime>
 +#include <optional>
  
++#include <fcntl.h>
  #include <getopt.h>
++#include <poll.h>
  #include <pthread.h>
-@@ -16,6 +20,96 @@ namespace gamescope
+-#include <fcntl.h>
+ #include <sys/resource.h>
+ #include <sys/wait.h>
+ #include <unistd.h>
+@@ -16,6 +21,134 @@ namespace gamescope
  {
      static LogScope s_ReaperLog( "reaper" );
  
@@ -73,6 +83,25 @@ index 083aaf6..9c6f354 100644
 +    // away), or a slow heartbeat for an exit that produced neither. Only after
 +    // the guest set has emptied does it sample the tree at a short interval,
 +    // and only for the two seconds it takes to call the tree still.
++    //
++    // Both signals are taken through a handler that writes to a pipe, and the
++    // loop waits on the pipe. A signal mask would not do: the reaper runs under
++    // the host's LD_PRELOAD and those libraries start threads of their own
++    // before main, with SIGUSR1 unblocked -- a process-directed SIGUSR1 may land
++    // on any of them, and with no handler installed its default action is to
++    // end the process. A handler is process-wide, whichever thread takes it.
++    static int s_nWakeFd = -1;
++
++    static void OnWakeSignal( int )
++    {
++        if ( s_nWakeFd >= 0 )
++        {
++            const char c = 0;
++            ssize_t nWritten = write( s_nWakeFd, &c, 1 );
++            (void) nWritten;
++        }
++    }
++
 +    static void WaitForSessionEnd( pid_t nPrimaryChild )
 +    {
 +        using namespace std::chrono;
@@ -81,11 +110,17 @@ index 083aaf6..9c6f354 100644
 +        const milliseconds kStartupStep{ 500 };   // until the first guest is seen
 +        const milliseconds kHeartbeat{ 10000 };   // while a guest runs
 +
-+        sigset_t waitSet;
-+        sigemptyset( &waitSet );
-+        sigaddset( &waitSet, SIGCHLD );
-+        sigaddset( &waitSet, SIGUSR1 );
-+        sigprocmask( SIG_BLOCK, &waitSet, nullptr );
++        int nPipe[ 2 ] = { -1, -1 };
++        if ( pipe2( nPipe, O_CLOEXEC | O_NONBLOCK ) != 0 )
++            s_ReaperLog.errorf( "pipe2 failed (%s); the watch falls back to its timers.", strerror( errno ) );
++        s_nWakeFd = nPipe[ 1 ];
++
++        struct sigaction wakeHandler{};
++        wakeHandler.sa_handler = OnWakeSignal;
++        wakeHandler.sa_flags = SA_RESTART | SA_NOCLDSTOP;
++        sigemptyset( &wakeHandler.sa_mask );
++        sigaction( SIGCHLD, &wakeHandler, nullptr );
++        sigaction( SIGUSR1, &wakeHandler, nullptr );
 +
 +        bool bSeen = false;
 +        uint64_t nTreeStamp = 0;
@@ -135,17 +170,30 @@ index 083aaf6..9c6f354 100644
 +            }
 +
 +            // Sleep until a child exits, the compositor nudges us, or the wait
-+            // runs out. A termination signal interrupts the wait (EINTR) and
++            // runs out. A termination signal interrupts the poll (EINTR) and
 +            // its handler has cleared s_bRun.
-+            struct timespec ts{ (time_t) ( wait.count() / 1000 ), (long) ( wait.count() % 1000 ) * 1000 * 1000 };
-+            sigtimedwait( &waitSet, nullptr, &ts );
++            if ( nPipe[ 0 ] >= 0 )
++            {
++                struct pollfd wake{ nPipe[ 0 ], POLLIN, 0 };
++                if ( poll( &wake, 1, (int) wait.count() ) > 0 )
++                {
++                    char buf[ 64 ];
++                    while ( read( nPipe[ 0 ], buf, sizeof( buf ) ) > 0 )
++                        ;
++                }
++            }
++            else
++            {
++                struct timespec ts{ (time_t) ( wait.count() / 1000 ), (long) ( wait.count() % 1000 ) * 1000 * 1000 };
++                nanosleep( &ts, nullptr );
++            }
 +        }
 +    }
 +
      // Watches over a PID and waits for all the children to die.
      // It sets itself up as a subreaper so any children get reparented ti oti.
      // If the primary process dies, it kills all the children.
-@@ -37,8 +131,6 @@ namespace gamescope
+@@ -37,8 +170,6 @@ namespace gamescope
  
          bool bRespawn = false;
          bool bNewSession = false;
@@ -154,7 +202,7 @@ index 083aaf6..9c6f354 100644
          int nOptIndex = -1;
          int nOption = -1;
          while ( ( nOption = getopt_long(argc, argv, "", k_ReaperOptions, &nOptIndex ) ) != -1 )
-@@ -140,7 +232,7 @@ namespace gamescope
+@@ -140,7 +271,7 @@ namespace gamescope
              // Wait for the primary child to die, then forward the death signal to
              // all of the other children, if we aren't in a PID namespace.
              if ( s_bRun )
