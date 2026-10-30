@@ -1,0 +1,92 @@
+A51 — lay the scan-out image out at the pool buffer's row stride
+
+A scan-out image is allocated from the session's pool, and that buffer is
+gralloc's: its rows are padded for widths gralloc does not like (1024 px ->
+5120 B, 1440 px -> 5888 B on Adreno), which is the same fact the ICD already
+handles for its own dma-buf slots and export-emulated images. The image here is
+created by gamescope through a DRM-format-modifier *list*, so Turnip picks the
+layout, and for a LINEAR modifier it picks width * 4. The compositor then reads
+the buffer at the buffer's stride and the GPU wrote it at the driver's: every
+row lands a little further along than the row read back, so the frame comes out
+sheared, repeated across the width, with the tail of the buffer unwritten.
+
+Only a composited frame touches this image. A frame that direct-scans-out
+(gamescope's `drm_prepare` path: one screen-sized layer, no filter that needs
+the shader, no look, no ReShade) is the guest's own buffer, so it is unaffected
+-- which is why the fault appears exactly when a scaling filter (NEAREST, FSR,
+NIS, SGSR) forces `vulkan_composite`, and not before.
+
+At 1280 and 1920 wide the stride is tight, so the two pitches agree and no
+output this stack has run before could show it.
+
+The pitch is not derivable from the geometry, so it is asked for: the shim owns
+the pool and answers `gamenative_drm_scanout_pitch(w, h)` -- measuring it with
+one throwaway pool allocation for a geometry it has not seen. The output image
+is then created with an explicit LINEAR modifier at that stride instead of the
+modifier list, which also makes the AddFB2 export report the same stride the
+compositor reads. A real KMS session has no shim, the weak symbol does not
+resolve, and the driver's own choice stands.
+
+diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -2707,6 +2707,12 @@
+ 	}
+ }
+ 
++// gamenative A51: the row stride of the scan-out pool's buffer for a geometry,
++// resolved by the shim (libgndrm_shim.so, which owns the pool and the daemon
++// connection) or 0 when there is no such session. Weak: gamescope must still
++// link and run on a real KMS device.
++extern "C" __attribute__( ( weak ) ) uint32_t gamenative_drm_scanout_pitch( uint32_t width, uint32_t height );
++
+ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA /* = nullptr */,  uint32_t contentWidth /* = 0 */, uint32_t contentHeight /* =  0 */, CVulkanTexture *pExistingImageToReuseMemory, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb )
+ {
+ 	m_pBackendFb = std::move( pBackendFb );
+@@ -2906,6 +2912,46 @@
+ 		imageInfo.tiling = tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+ 	}
+ 
++	// gamenative A51: a scan-out image is allocated from the session's pool, whose
++	// buffer carries gralloc's row stride — not width * 4 for every width (1024 px
++	// is 5120 B on Adreno). The compositor reads that buffer at the buffer's
++	// stride, so the image is laid out at it: with the driver's own tight pitch
++	// every row the GPU writes lands a little further along than the row read
++	// back, and a composited frame is sheared. Direct scanout never writes this
++	// image, so it stays clean — which is why the shear only appears once a
++	// filter (or a look, or ReShade) forces the composite. The pitch comes from
++	// the shim, which owns the pool; without one (a real KMS session) the
++	// driver's own choice stands.
++	if ( flags.bOutputImage && pDMA == nullptr && pExistingImageToReuseMemory == nullptr
++	     && tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
++	     && gamenative_drm_scanout_pitch != nullptr )
++	{
++		uint32_t uPoolPitch = gamenative_drm_scanout_pitch( width, height );
++		if ( uPoolPitch != 0 )
++		{
++			modifierPlaneLayouts[0] = {
++				.offset = 0,
++				.size = 0,
++				.rowPitch = uPoolPitch,
++				.arrayPitch = 0,
++				.depthPitch = 0,
++			};
++			// A create-info chain carries the explicit layout *or* the modifier
++			// list, never both: unlink the list, making the external-memory (and
++			// format-list) nodes the chain's tail.
++			imageInfo.pNext = modifierListInfo.pNext;
++			modifierInfo = {
++				.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
++				.pNext = std::exchange( imageInfo.pNext, &modifierInfo ),
++				.drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
++				.drmFormatModifierPlaneCount = 1,
++				.pPlaneLayouts = modifierPlaneLayouts,
++			};
++			vk_log.infof( "output image %ux%u at the pool's row stride %u (tight %u)",
++				width, height, uPoolPitch, width * 4u );
++		}
++	}
++
+ 	if ( flags.bFlippable == true && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT )
+ 	{
+ 		// We want to scan-out the image
