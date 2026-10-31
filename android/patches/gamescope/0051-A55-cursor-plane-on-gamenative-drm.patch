@@ -1,0 +1,369 @@
+A55 — the cursor rides the daemon's cursor plane
+
+With the cursor shown, every cursor motion was a full composite and a new
+scan-out flip: drm_cursor_plane is off on gamenative-drm, so a frame with a
+cursor layer always takes the composite path (RP6, Dave the Diver at a 60 cap:
+70-76 SurfaceFlinger presents/s instead of 60, +2.8 % gamescope CPU, +500
+wakeups/s, and LSFG pacing wrecked by the extra source frames). The plane was
+off because the daemon's cursor plane was a stub: capped at 64x64 so libliftoff
+could not park the game there, and never presented.
+
+A daemon with a real cursor plane accepts the private client cap GNCL
+(0x474E434C): it presents the cursor plane on a layer of its own above the
+scan-out layer, answers DRM_CAP_CURSOR_WIDTH/HEIGHT with its limit (256), and
+refuses any larger framebuffer on that plane, so the game can never land on it.
+
+- init_drm sets GNCL under gamenative-drm before reading the cursor caps. When
+  it is accepted, drm_cursor_plane is turned on and the cursor is scanned out on
+  the plane; when it is refused (an older daemon), nothing changes.
+- The direct path (the game's buffer on the primary plane) needs nothing more:
+  a cursor-only paint commits the same primary framebuffer with the cursor
+  plane moved, which the daemon turns into a cursor-layer update and no frame.
+- The composite path (FSR/NIS/SGSR, filters, looks, a game buffer the primary
+  plane refuses) composites every layer except the cursor and commits the
+  composite with the cursor on its plane. A paint whose only cause is a cursor
+  motion re-commits the last such composite instead of compositing again
+  (not with a fade, blur, ReShade or composite debug on). If the two-plane
+  commit is refused, that frame composites the cursor in as before, and the
+  same cursor image is not offered to the plane again.
+- A cursor motion with the cursor on the plane is a repaint request like any
+  other (picked up on the next vblank, painted on every flip type), but it is
+  recorded as a cursor repaint instead of setting hasRepaint: a motion serial
+  the paint records, so a motion during a paint stays pending. A paint whose
+  only cause is a cursor motion is flagged cursor-only, and the backend takes
+  the cursor-only path (same primary framebuffer or last composite, cursor
+  plane moved, no composite).
+
+Logs: "cursor: daemon cursor layer on (GNCL accepted, max 256x256),
+drm_cursor_plane=1" or "... off (GNCL rejected: ...)" once at start, and
+"cursor: composite under the cursor plane: composites=N cursor-only reuses=M".
+
+diff --git a/src/Backends/DRMBackend.cpp b/src/Backends/DRMBackend.cpp
+index de5960f..e25ec21 100644
+--- a/src/Backends/DRMBackend.cpp
++++ b/src/Backends/DRMBackend.cpp
+@@ -1602,12 +1602,35 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
+ 		return false;
+ 	}
+ 
++	// gamenative A55: ask the daemon for a real cursor plane: presented on a layer of
++	// its own above the scan-out layer, capped at its cursor limit, and refusing any
++	// larger framebuffer, so libliftoff can never park the game on it. With it the
++	// cursor is scanned out on that plane instead of forcing a composite of every
++	// frame while it is shown. An older daemon refuses the cap (EINVAL): the cursor
++	// plane stays off and the cursor is composited as before.
++	if ( BUsesGameNativeDrm() )
++	{
++		static constexpr uint64_t GNDRM_CLIENT_CAP_CURSOR_LAYER = 0x474E434Cull; // "GNCL"
++		if ( drmSetClientCap( drm->fd, GNDRM_CLIENT_CAP_CURSOR_LAYER, 1 ) == 0 )
++		{
++			cv_drm_cursor_plane = true;
++			g_bCursorOnPlane = true;
++		}
++		else
++		{
++			drm_log.infof( "cursor: daemon cursor layer off (GNCL rejected: %s), cursor stays in the composite", strerror( errno ) );
++		}
++	}
++
+ 	if (drmGetCap(drm->fd, DRM_CAP_CURSOR_WIDTH, &drm->cursor_width) != 0) {
+ 		drm->cursor_width = 64;
+ 	}
+ 	if (drmGetCap(drm->fd, DRM_CAP_CURSOR_HEIGHT, &drm->cursor_height) != 0) {
+ 		drm->cursor_height = 64;
+ 	}
++	if ( g_bCursorOnPlane )
++		drm_log.infof( "cursor: daemon cursor layer on (GNCL accepted, max %llux%llu), drm_cursor_plane=1",
++			(unsigned long long)drm->cursor_width, (unsigned long long)drm->cursor_height );
+ 
+ 	uint64_t cap;
+ 	g_bSupportsSyncObjs = drmGetCap(drm->fd, DRM_CAP_SYNCOBJ, &cap) == 0 && cap != 0;
+@@ -3995,6 +4018,12 @@ namespace gamescope
+ 
+ 			bool bWantsPartialComposite = pFrameInfo->layers.count() >= 3 && !kDisablePartialComposition;
+ 
++			// A55: the composite a cursor-only paint may re-use is only the one the
++			// previous present committed under the cursor plane; any other path leaves
++			// it cleared.
++			gamescope::Rc<CVulkanTexture> pLastCompositeUnderCursor = std::move( m_pCompositeUnderCursor );
++			m_pCompositeUnderCursor = nullptr;
++
+ 			static bool s_bWasFirstFrame = true;
+ 			bool bWasFirstFrame = s_bWasFirstFrame;
+ 			s_bWasFirstFrame = false;
+@@ -4081,6 +4110,31 @@ namespace gamescope
+ 			if ( kDisablePartialComposition )
+ 				bNeedsFullComposite = true;
+ 
++			// gamenative A55: with the daemon's cursor layer, composite everything but
++			// the cursor and scan the cursor out on its plane, so a cursor motion
++			// re-commits the last composite instead of compositing again.
++			if ( g_bCursorOnPlane && cv_drm_cursor_plane && kDisablePartialComposition )
++			{
++				const int nLast = pFrameInfo->layers.count() - 1;
++				if ( nLast >= 1 )
++				{
++					const FrameInfo_t::Layer_t &cursorLayer = pFrameInfo->layers.get( nLast );
++					// The plane takes the cursor at its drawn size: a scaled cursor past the
++					// daemon's limit, or one whose plane commit was already refused, is
++					// composited in without trying (no second composite per frame).
++					const bool bFits = cursorLayer.tex &&
++						cursorLayer.tex->width() / cursorLayer.scale.x <= (float)g_DRM.cursor_width + 0.5f &&
++						cursorLayer.tex->height() / cursorLayer.scale.y <= (float)g_DRM.cursor_height + 0.5f;
++					if ( cursorLayer.zpos == g_zposCursor && bFits && cursorLayer.tex->GetBackendFb() &&
++						 cursorLayer.tex.get() != m_pRefusedCursorTex.get() )
++					{
++						int ret = PresentCompositeUnderCursorPlane( pFrameInfo, bAsync, pLastCompositeUnderCursor );
++						if ( ret != -EAGAIN )
++							return ret;
++						// The cursor plane was refused: composite it in, as before.
++					}
++				}
++			}
+ 			FrameInfo_t compositeFrameInfo = *pFrameInfo;
+ 
+ 			if ( compositeFrameInfo.layers.count() == 1 )
+@@ -4446,6 +4500,104 @@ namespace gamescope
+ 		bool m_bWasCompositing = false;
+ 		bool m_bWasPartialCompositing = false;
+ 		int m_nLastSingleOverlayZPos = 0;
++		// A55: the last composite of the base planes committed under the cursor
++		// plane, re-committed for a cursor-only paint. Null when the last present
++		// did not go that way.
++		gamescope::Rc<CVulkanTexture> m_pCompositeUnderCursor;
++		// A55: the cursor texture whose two-plane commit was refused; it is
++		// composited in until the cursor image changes.
++		gamescope::Rc<CVulkanTexture> m_pRefusedCursorTex;
++		uint64_t m_ulCursorPlaneComposites = 0;
++		uint64_t m_ulCursorPlaneReuses = 0;
++
++		// A55: composite every layer but the topmost (the cursor), or re-use the last
++		// such composite when only the cursor moved, and commit it with the cursor on
++		// the cursor plane. -EAGAIN when the two-plane commit is refused: the caller
++		// then composites the cursor in, as before.
++		int PresentCompositeUnderCursorPlane( const FrameInfo_t *pFrameInfo, bool bAsync, const gamescope::Rc<CVulkanTexture> &pLastComposite )
++		{
++			const int nCursor = pFrameInfo->layers.count() - 1;
++
++			const bool bReuse = pFrameInfo->bCursorOnly &&
++				pLastComposite != nullptr &&
++				!pFrameInfo->bFadingOut &&
++				!pFrameInfo->blurLayer0 &&
++				g_reshade_effect.empty() &&
++				g_uCompositeDebug == 0;
++
++			gamescope::Rc<CVulkanTexture> pComposite;
++			if ( bReuse )
++			{
++				pComposite = pLastComposite;
++				m_ulCursorPlaneReuses++;
++			}
++			else
++			{
++				FrameInfo_t compositeFrameInfo = *pFrameInfo;
++				compositeFrameInfo.layers.pop();
++
++				std::optional oCompositeResult = vulkan_composite( &compositeFrameInfo, nullptr, false );
++				m_bWasCompositing = true;
++				if ( !oCompositeResult )
++				{
++					xwm_log.errorf( "vulkan_composite failed" );
++					return -EINVAL;
++				}
++				vulkan_wait( *oCompositeResult, true );
++				pComposite = vulkan_get_last_output_image( false, false );
++				m_ulCursorPlaneComposites++;
++			}
++
++			FrameInfo_t presentCompFrameInfo = {};
++			presentCompFrameInfo.allowVRR = pFrameInfo->allowVRR;
++			presentCompFrameInfo.outputEncodingEOTF = pFrameInfo->outputEncodingEOTF;
++			presentCompFrameInfo.applyOutputColorMgmt = false;
++
++			FrameInfo_t::Layer_t *baseLayer = presentCompFrameInfo.layers.push();
++			assert( baseLayer );
++			baseLayer->scale.x = 1.0;
++			baseLayer->scale.y = 1.0;
++			baseLayer->opacity = 1.0;
++			baseLayer->zpos = g_zposBase;
++			baseLayer->tex = pComposite;
++			baseLayer->applyColorMgmt = false;
++			baseLayer->filter = GamescopeUpscaleFilter::NEAREST;
++			baseLayer->ctm = nullptr;
++			baseLayer->colorspace = pFrameInfo->outputEncodingEOTF == EOTF_PQ ? GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ : GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
++
++			FrameInfo_t::Layer_t *cursorLayer = presentCompFrameInfo.layers.push();
++			assert( cursorLayer );
++			*cursorLayer = pFrameInfo->layers.get( nCursor );
++
++			std::shared_ptr<gamescope::BackendBlob> pPendingModeId = g_DRM.pending.mode_id;
++			int ret = drm_prepare( &g_DRM, bAsync, &presentCompFrameInfo );
++			if ( ret == -EACCES )
++				return 0;
++			if ( ret != 0 )
++			{
++				if ( g_DRM.needs_modeset )
++					g_DRM.pending.mode_id = pPendingModeId;
++				static bool s_bLogged = false;
++				if ( !s_bLogged )
++				{
++					s_bLogged = true;
++					drm_log.infof( "cursor: composite + cursor plane refused (%s), cursor composited in", strerror( -ret ) );
++				}
++				m_pCompositeUnderCursor = nullptr;
++				m_pRefusedCursorTex = pFrameInfo->layers.get( nCursor ).tex;
++				return -EAGAIN;
++			}
++
++			m_bWasPartialCompositing = false;
++			m_pCompositeUnderCursor = pComposite;
++
++			const uint64_t ulTotal = m_ulCursorPlaneComposites + m_ulCursorPlaneReuses;
++			if ( ulTotal == 1 || ulTotal % 3600 == 0 )
++				drm_log.infof( "cursor: composite under the cursor plane: composites=%llu cursor-only reuses=%llu",
++					(unsigned long long)m_ulCursorPlaneComposites, (unsigned long long)m_ulCursorPlaneReuses );
++
++			return Commit( &presentCompFrameInfo );
++		}
+ 
+ 		uint32_t m_uNextPresentCtx = 0;
+ 		DRMPresentCtx m_PresentCtxs[3];
+diff --git a/src/rendervulkan.hpp b/src/rendervulkan.hpp
+index aec9a1e..6f0732c 100644
+--- a/src/rendervulkan.hpp
++++ b/src/rendervulkan.hpp
+@@ -291,6 +291,9 @@ struct FrameInfo_t
+ 	GamescopeUpscaleScaler eUpscaleScaler = GamescopeUpscaleScaler::AUTO;
+ 	int nUpscaleSharpness = 0;
+ 	bool bFadingOut;
++	// gamenative A55: only the cursor changed since the last paint (a cursor motion
++	// with the cursor on its own plane), so the base content is the last frame's.
++	bool bCursorOnly = false;
+ 	BlurMode blurLayer0;
+ 	int blurRadius;
+ 
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index d6da2ad..55d6f40 100644
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -1138,6 +1138,21 @@ uint32_t		lastPublishedInputCounter;
+ std::atomic<bool> hasRepaint = false;
+ bool			hasRepaintNonBasePlane = false;
+ 
++// A55: cursor-plane repaints. Like hasRepaint, a motion is a repaint request the
++// next vblank picks up; unlike it, it says only the cursor changed. Every motion
++// bumps the serial and a paint records the serial it painted, so a motion that
++// lands during a paint is still pending after it instead of being cleared with it.
++std::atomic<bool> g_bCursorOnPlane{ false };
++static std::atomic<uint64_t> g_ulCursorRepaintSerial{ 0 };
++static uint64_t s_ulCursorRepaintPainted = 0;
++// Set for the paint_all call of a paint whose only cause is a cursor motion.
++static bool g_bPaintIsCursorOnly = false;
++
++void request_cursor_repaint( void )
++{
++	g_ulCursorRepaintSerial.fetch_add( 1, std::memory_order_relaxed );
++}
++
+ bool			g_bUpdateForwardedVROverlays = false;
+ 
+ static gamescope::ConCommand cc_debug_force_repaint( "debug_force_repaint", "Force a repaint",
+@@ -3357,6 +3372,7 @@ paint_all( global_focus_t *pFocus, bool async )
+ 	frameInfo.outputEncodingEOTF = g_ColorMgmt.pending.outputEncodingEOTF;
+ 	frameInfo.allowVRR = cv_adaptive_sync;
+ 	frameInfo.bFadingOut = fadingOut;
++	frameInfo.bCursorOnly = g_bPaintIsCursorOnly && !fadingOut;
+ 	frameInfo.eUpscaleFilter = pFocus->eUpscaleFilter;
+ 	frameInfo.eUpscaleScaler = pFocus->eUpscaleScaler;
+ 	frameInfo.nUpscaleSharpness = pFocus->nUpscaleSharpness;
+@@ -10782,6 +10798,12 @@ steamcompmgr_main(int argc, char **argv)
+ 
+ 		bool bPainted = false;
+ 
++		// A55: a cursor motion with the cursor on its own plane. Painted like a base
++		// repaint (so every flip type still shows it), but flagged so the backend can
++		// re-use the last composite of the base planes.
++		const uint64_t ulCursorRepaintSerial = g_ulCursorRepaintSerial.load( std::memory_order_relaxed );
++		const bool bCursorRepaint = ulCursorRepaintSerial != s_ulCursorRepaintPainted;
++
+ 		static int nIgnoredOverlayRepaints = 0;
+ 
+ 		if ( !hasRepaintNonBasePlane )
+@@ -10883,13 +10905,13 @@ steamcompmgr_main(int argc, char **argv)
+ 				{
+ 					case FlipType::Normal:
+ 					{
+-						bShouldPaint = vblank && ( hasRepaint || hasRepaintNonBasePlane || bForceSyncFlip );
++						bShouldPaint = vblank && ( hasRepaint || bCursorRepaint || hasRepaintNonBasePlane || bForceSyncFlip );
+ 						break;
+ 					}
+ 
+ 					case FlipType::Async:
+ 					{
+-						bShouldPaint = hasRepaint;
++						bShouldPaint = hasRepaint || bCursorRepaint;
+ 
+ 						if ( vblank && !bShouldPaint && hasRepaintNonBasePlane )
+ 							nIgnoredOverlayRepaints++;
+@@ -10899,7 +10921,7 @@ steamcompmgr_main(int argc, char **argv)
+ 
+ 					case FlipType::VRR:
+ 					{
+-						bShouldPaint = hasRepaint && bVRRCanFlip;
++						bShouldPaint = ( hasRepaint || bCursorRepaint ) && bVRRCanFlip;
+ 
+ 						if ( bIsVBlankFromTimer )
+ 						{
+@@ -10938,7 +10960,10 @@ steamcompmgr_main(int argc, char **argv)
+ 
+ 			if ( bShouldPaint )
+ 			{
++				g_bPaintIsCursorOnly = bCursorRepaint && !hasRepaint && !hasRepaintNonBasePlane &&
++					!bForceSyncFlip && !g_bUpdateForwardedVROverlays;
+ 				paint_all( pPaintFocus, eFlipType == FlipType::Async );
++				g_bPaintIsCursorOnly = false;
+ 
+ 				bPainted = true;
+ 			}
+@@ -10960,6 +10985,7 @@ steamcompmgr_main(int argc, char **argv)
+ 			hasRepaint = false;
+ 			hasRepaintNonBasePlane = false;
+ 			nIgnoredOverlayRepaints = 0;
++			s_ulCursorRepaintPainted = ulCursorRepaintSerial;
+ 
+ 			{
+ 				gamescope::CScriptScopedLock script;
+diff --git a/src/steamcompmgr_shared.hpp b/src/steamcompmgr_shared.hpp
+index 87cf86d..aea260b 100644
+--- a/src/steamcompmgr_shared.hpp
++++ b/src/steamcompmgr_shared.hpp
+@@ -292,6 +292,12 @@ struct steamcompmgr_win_t {
+ 
+ extern std::atomic<bool> hasRepaint;
+ 
++// gamenative A55: the cursor is scanned out on a plane of its own (the daemon's
++// cursor layer), so a cursor motion repaints the cursor plane only: the base
++// planes' content is unchanged and a composite of them can be re-used.
++extern std::atomic<bool> g_bCursorOnPlane;
++void request_cursor_repaint( void );
++
+ namespace gamescope
+ {
+ 	struct GamescopeScreenshotInfo
+diff --git a/src/wlserver.cpp b/src/wlserver.cpp
+index 10b6dda..f7635d0 100644
+--- a/src/wlserver.cpp
++++ b/src/wlserver.cpp
+@@ -2933,7 +2933,11 @@ void wlserver_oncursorevent()
+ 
+ 	if ( !wlserver.bCursorHidden && wlserver.bCursorHasImage )
+ 	{
+-		hasRepaint = true;
++		// A55: with the cursor on its own plane, a motion moves that plane only.
++		if ( g_bCursorOnPlane )
++			request_cursor_repaint();
++		else
++			hasRepaint = true;
+ 	}
+ }
+ 
