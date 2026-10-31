@@ -31,9 +31,18 @@ absolute CLOCK_MONOTONIC timerfd.
   whole number of vblanks, refresh / target, which truncates on a coarse grid
   (40 fps on 60 Hz read as one vblank, 16.7 ms instead of 25). The limiter
   releases on a time grid since A52, so the cycle is now the target's period.
+  The daemon re-posts the rate on every panel report: a repeat of the current
+  rate changes nothing (no limiter re-anchor, no log), and a refused value
+  (out of range, legacy grid) is logged once.
+- A latch-grid stamp can be up to a panel period plus the lead ahead of the
+  moment the event arrives (the old timeline was at most 0.83 ms ahead).
+  Every reader was checked: GetNextVBlank only steps forward from it (a stamp
+  ahead skips the vblank the flip already occupies, which is right), the
+  mangoapp frametime takes stamp-to-stamp deltas and already drops a stamp
+  older than the last, and nothing else subtracts it from now.
 - A gamescope_private command repaints once (force_repaint): scaling_filter,
   scaling_sharpness and debug_force_repaint change the next frame with no
-  commit behind them.
+  commit behind them. gn_panel_refresh does not: it only moves the grid.
 
 Log lines (logcat, System.out "[gamescope]"):
   drm: vblank: daemon latch-grid stamps on (GNLG accepted, grid N mHz)
@@ -78,10 +87,10 @@ index de5960f..a9e0542 100644
  		drm->cursor_width = 64;
  	}
 diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
-index d6da2ad..1ef5d95 100644
+index d6da2ad..6af0c7e 100644
 --- a/src/steamcompmgr.cpp
 +++ b/src/steamcompmgr.cpp
-@@ -1279,6 +1279,32 @@ static void steamcompmgr_update_fps_limit_release( uint64_t ulTargetVBlank )
+@@ -1279,6 +1279,42 @@ static void steamcompmgr_update_fps_limit_release( uint64_t ulTargetVBlank )
  	if ( g_ulFPSLimitNextRelease <= ulTargetVBlank + ulVBlank / 2 )
  		g_ulFPSLimitNextRelease = ulTargetVBlank + ulPeriod;
  }
@@ -98,23 +107,33 @@ index d6da2ad..1ef5d95 100644
 +static gamescope::ConVar<int> cv_gn_panel_refresh( "gn_panel_refresh", 0, "GameNative: the panel's refresh in Hz; moves the vblank grid (nested refresh) to it.",
 +[]( gamescope::ConVar<int> &cv )
 +{
++	// The daemon re-posts the rate on every report, not only on a change: a repeat of
++	// the current rate is a no-op (ApplyPendingRefresh), and a refusal is logged once
++	// per value.
++	static int s_nLastRefused = 0;
 +	if ( cv <= 0 || cv > k_nMaxPanelRefreshHz )
 +	{
-+		xwm_log.infof( "gn_panel_refresh %d ignored: out of range", cv.Get() );
++		if ( std::exchange( s_nLastRefused, cv.Get() ) != cv.Get() )
++			xwm_log.infof( "gn_panel_refresh %d ignored: out of range", cv.Get() );
 +		return;
 +	}
 +	if ( g_nNestedRefresh > gamescope::ConvertHztomHz( k_nMaxPanelRefreshHz ) )
 +	{
-+		xwm_log.infof( "gn_panel_refresh %d ignored: session runs the legacy %d mHz grid", cv.Get(), g_nNestedRefresh );
++		if ( std::exchange( s_nLastRefused, cv.Get() ) != cv.Get() )
++			xwm_log.infof( "gn_panel_refresh %d ignored: session runs the legacy %d mHz grid", cv.Get(), g_nNestedRefresh );
 +		return;
 +	}
++	s_nLastRefused = 0;
++	// Always posted, so a later repeat supersedes a change still pending; the loop is
++	// only woken for a change.
 +	GetVBlankTimer().RequestRefreshmHz( gamescope::ConvertHztomHz( cv.Get() ) );
-+	nudge_steamcompmgr();
++	if ( gamescope::ConvertHztomHz( cv.Get() ) != g_nNestedRefresh )
++		nudge_steamcompmgr();
 +});
  static uint64_t g_uDynamicRefreshEqualityTime = 0;
  static int g_nDynamicRefreshRate[gamescope::GAMESCOPE_SCREEN_TYPE_COUNT] = { 0, 0 };
  // Delay to stop modes flickering back and forth.
-@@ -10278,6 +10304,15 @@ steamcompmgr_main(int argc, char **argv)
+@@ -10278,6 +10314,15 @@ steamcompmgr_main(int argc, char **argv)
  
  		g_SteamCompMgrWaiter.PollEvents();
  
@@ -130,7 +149,7 @@ index d6da2ad..1ef5d95 100644
  		bool vblank = false;
  		if ( std::optional<gamescope::VBlankTime> pendingVBlank = GetVBlankTimer().ProcessVBlank() )
  		{
-@@ -10664,9 +10699,11 @@ steamcompmgr_main(int argc, char **argv)
+@@ -10664,9 +10709,11 @@ steamcompmgr_main(int argc, char **argv)
  				}
  				else
  				{
@@ -198,17 +217,20 @@ index 41902c3..1d9dc5f 100644
          std::optional<VBlankTime> m_PendingVBlank;
  
 diff --git a/src/wlserver.cpp b/src/wlserver.cpp
-index 10b6dda..82831cf 100644
+index 10b6dda..8229dfb 100644
 --- a/src/wlserver.cpp
 +++ b/src/wlserver.cpp
-@@ -1534,7 +1534,12 @@ static void gamescope_private_execute( struct wl_client *client, struct wl_resou
+@@ -1534,7 +1534,15 @@ static void gamescope_private_execute( struct wl_client *client, struct wl_resou
  	args.emplace_back( cvar_name );
  	args.emplace_back( value );
  	if ( gamescope::ConCommand::Exec( std::span<std::string_view>{ args } ) )
 +	{
 +		// A command can change what the next frame shows (scaling_filter,
 +		// scaling_sharpness, debug_force_repaint) without a commit behind it.
-+		force_repaint();
++		// gn_panel_refresh is re-posted on every panel report and moves only the
++		// vblank grid, so it does not cost a frame.
++		if ( std::string_view{ cvar_name } != "gn_panel_refresh" )
++			force_repaint();
  		gamescope_private_send_command_executed( resource );
 +	}
  }
