@@ -4,13 +4,13 @@ The non-VRR frame-rate limit counted compositor wakeups: a window got its frame
 callback on every (refresh / target)th wakeup, which equals every Nth vblank only
 while no wakeup is ever late. The timer re-arms by stepping to the next vblank
 after "now", so a wakeup that comes more than one vblank late skips the vblanks
-in between, and those never count. On the 1200 Hz grid a session runs on
-(-r 1200, the nested refresh), a wakeup is late by a vblank after 0.83 ms of
-scheduling delay, and every late one holds the next frame a whole vblank
-longer: a 60 cap then reads 50-57, a 30 cap 25-28, in proportion to the wakeups
-lost -- the flat 18-21 ms frames users saw with the CPU and the GPU idle -- and
-it sinks further as the device throttles and the compositor thread is scheduled
-later still.
+in between, and those never count. The finer the session grid, the sooner a
+wakeup is late: on the fine grid the launcher used to pass, a sub-millisecond
+scheduling delay already cost a whole vblank, and every late wakeup held the
+next frame a vblank longer: a 60 cap then read 50-57, a 30 cap 25-28, in
+proportion to the wakeups lost -- the flat 18-21 ms frames users saw with the
+CPU and the GPU idle -- and it sinks further as the device throttles and the
+compositor thread is scheduled later still.
 
 The limiter now keeps a release grid in time: the next release is the previous
 one plus the target period, and a frame is released on the first vblank whose
