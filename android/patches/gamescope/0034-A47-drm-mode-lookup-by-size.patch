@@ -1,29 +1,27 @@
-A47 — take `-r` as the grid, not as the mode's refresh
+A47 — resolve the mode by size when no mode carries the requested refresh
 
-`-r` is the session's vblank grid, while the panel's real rate is what the DRM
-mode advertises. `init_drm` hands the grid to `preferred_refresh`, and the mode
-search requires `mode->vrefresh` to equal it, so a grid that matches no mode
-falls through to the first mode on the connector — with `-r 1200` it matches
-nothing.
+`init_drm` hands `-r`, when the launcher gives one, to `preferred_refresh`, and
+the mode search requires `mode->vrefresh` to equal it. A connector whose one mode
+carries the display's real rate would then yield no output at all for any other
+preferred refresh.
 
 The lookup now re-finds by the requested size with the refresh unconstrained, so
-the nested refresh is free to differ from the mode's rate and a connector whose
-modes all carry the real rate still yields an output.
+a preferred refresh the connector does not advertise still resolves the mode, and
+the launch line stays free to pass one.
 
 This is the second half of the old A34, kept when A34's fps cap was parked: the
-cap no longer exists, but the grid argument does.
+cap no longer exists, and the size-based lookup stays as insurance.
 
 --- a/src/Backends/DRMBackend.cpp
 +++ b/src/Backends/DRMBackend.cpp
-@@ -1385,6 +1385,16 @@
+@@ -1385,6 +1385,15 @@
  		mode = find_mode(best->GetModeConnector(), drm->preferred_width, drm->preferred_height, gamescope::ConvertmHzToHz( drm->preferred_refresh ));
  	}
  
-+	// gamenative A47: -r is the session's vblank grid, not the mode's rate: the
-+	// panel's real refresh is what the connector advertises, so the grid matches
-+	// no mode. Re-find by size alone rather than let the grid pick the mode, so
-+	// the nested refresh is free to differ from the mode's rate and a connector
-+	// whose only modes carry the real rate still yields an output.
++	// gamenative A47: the mode is the display's rate and the connector
++	// advertises only that, so a preferred refresh it does not carry would find
++	// no mode at all. Re-find by size alone rather than let the preference pick
++	// the mode, so the launch line stays free to pass one.
 +	if (!mode && drm->preferred_refresh != 0)
 +	{
 +		mode = find_mode(best->GetModeConnector(), drm->preferred_width, drm->preferred_height, 0);
