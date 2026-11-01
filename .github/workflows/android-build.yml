@@ -184,6 +184,7 @@ jobs:
           name: gamescope-android-${{ github.sha }}
           path: |
             build-android/src/gamescope
+            xserver/build-android/hw/xwayland/Xwayland
             build-android/src/gamescopereaper
           if-no-files-found: error
 
