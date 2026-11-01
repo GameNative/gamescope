@@ -115,7 +115,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: GameNative/xserver
-          ref: gn-no-implicit-sync
+          ref: xwayland-no-implicit-sync-gamenative
           path: xserver
 
       - name: Build Xwayland
