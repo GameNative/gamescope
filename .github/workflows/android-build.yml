@@ -115,7 +115,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: GameNative/xserver
-          ref: xwayland-no-implicit-sync-gamenative
+          ref: xwayland-shm-attach-via-sysvshm-server
           path: xserver
 
       - name: Build Xwayland
