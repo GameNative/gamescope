@@ -115,7 +115,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: GameNative/xserver
-          ref: gamenative
+          ref: gn-no-implicit-sync
           path: xserver
 
       - name: Build Xwayland
@@ -185,6 +185,7 @@ jobs:
           path: |
             build-android/src/gamescope
             build-android/src/gamescopereaper
+            xserver/build-android/hw/xwayland/Xwayland
           if-no-files-found: error
 
       - name: ccache stats
