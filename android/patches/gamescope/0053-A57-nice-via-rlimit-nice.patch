@@ -1,0 +1,117 @@
+A57 — nice -20 when RLIMIT_NICE allows it, without CAP_SYS_NICE
+
+gamescope only lowers its nice value when it holds CAP_SYS_NICE. An Android
+app never does, so every gamescope thread ran at nice 0 ("No CAP_SYS_NICE,
+falling back to regular-priority compute and threads") while the game's own
+threads ran at nice -5 and -2 and Wine's audio threads at -19. On a Retroid
+Pocket 6 (Android 13, Dave the Diver at a 60 cap, real-vsync daemon) about 1 %
+of frames missed their vblank: 23 of 25 late posts over 44 s were gamescope
+draw spikes, gamescope's own commit coming 3.9 to 10.8 ms late because
+gamescope-xwm was runnable but not scheduled for 1 to 8 ms.
+
+The same device grants RLIMIT_NICE = 40 (soft and hard) to the app and every
+child, which is how Linux lets an unprivileged process lower its nice value:
+setpriority succeeds down to 20 - rlim_cur, so nice -20 here. Realtime is not
+granted (RLIMIT_RTPRIO is 0).
+
+- CanSetNice(n): CAP_SYS_NICE, or an RLIMIT_NICE soft limit that reaches n
+  (20 - rlim_cur <= n, or RLIM_INFINITY). SetNice uses it.
+- main sets nice -20 on that path too, before any gamescope thread exists, so
+  gamescope-xwm, the vblank and wait threads inherit it. SetRealtime stays on
+  CAP_SYS_NICE only.
+- RestoreNice no longer needs CAP_SYS_NICE: raising the value back needs no
+  permission, and SetNice only records values when it lowered them. Children
+  (Xwayland, the game) still start at the nice gamescope was started with.
+- The Vulkan queues are unchanged: VK_QUEUE_GLOBAL_PRIORITY_REALTIME is still
+  requested only with CAP_SYS_NICE (rendervulkan.cpp CreateDevice, with its
+  VK_ERROR_NOT_PERMITTED_KHR fallback), so without it both queues stay at
+  regular priority as before.
+
+Logs: "No CAP_SYS_NICE; RLIMIT_NICE permits nice -20 (threads at nice -20),
+realtime compute queue and scheduling unavailable." once at start, instead of
+the "falling back to regular-priority" line.
+
+diff --git a/src/Utils/Process.cpp b/src/Utils/Process.cpp
+index 1a82f57..2ba91dd 100644
+--- a/src/Utils/Process.cpp
++++ b/src/Utils/Process.cpp
+@@ -900,12 +900,36 @@ namespace gamescope::Process
+ #endif
+     }
+ 
++    static bool RlimitNiceAllows( int nNice )
++    {
++#if defined(__linux__)
++        // Without CAP_SYS_NICE, setpriority may still lower the nice value down to
++        // 20 - RLIMIT_NICE (the soft limit). This is how an unprivileged process is
++        // granted a better priority without the capability.
++        struct rlimit niceLimit{};
++        if ( getrlimit( RLIMIT_NICE, &niceLimit ) != 0 )
++            return false;
++
++        if ( niceLimit.rlim_cur == RLIM_INFINITY )
++            return true;
++
++        return 20 - static_cast<long long>( niceLimit.rlim_cur ) <= nNice;
++#else
++        return false;
++#endif
++    }
++
++    bool CanSetNice( int nNice )
++    {
++        return HasCapSysNice() || RlimitNiceAllows( nNice );
++    }
++
+     std::optional<int> g_oOldNice;
+     std::optional<int> g_oNewNice;
+     void SetNice( int nNice )
+     {
+ #if defined(__linux__)
+-        if ( !HasCapSysNice() )
++        if ( !CanSetNice( nNice ) )
+             return;
+ 
+         errno = 0;
+@@ -927,9 +951,9 @@ namespace gamescope::Process
+     void RestoreNice()
+     {
+ #if defined(__linux__)
+-        if ( !HasCapSysNice() )
+-            return;
+-
++        // Raising the nice value back needs no permission, and SetNice only
++        // records values when it was allowed to lower it (by CAP_SYS_NICE or
++        // RLIMIT_NICE), so children must be restored either way.
+         if ( !g_oOldNice || !g_oNewNice )
+             return;
+ 
+diff --git a/src/Utils/Process.h b/src/Utils/Process.h
+index 1828bce..5456233 100644
+--- a/src/Utils/Process.h
++++ b/src/Utils/Process.h
+@@ -78,6 +78,7 @@ namespace gamescope::Process
+     pid_t SpawnProcessInWatchdog( char **argv, bool bRespawn = false, std::function<void()> fnPreambleInChild = nullptr );
+ 
+     bool HasCapSysNice();
++    bool CanSetNice( int nNice );
+     void SetNice( int nNice );
+     void RestoreNice();
+ 
+diff --git a/src/main.cpp b/src/main.cpp
+index 4b51a16..0d13d0b 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -885,6 +885,12 @@ int main(int argc, char **argv)
+ 		if ( g_bRt )
+ 			gamescope::Process::SetRealtime();
+ 	}
++	else if ( gamescope::Process::CanSetNice( -20 ) )
++	{
++		gamescope::Process::SetNice( -20 );
++
++		fprintf( stderr, "No CAP_SYS_NICE; RLIMIT_NICE permits nice -20 (threads at nice %d), realtime compute queue and scheduling unavailable.\n", getpriority( PRIO_PROCESS, 0 ) );
++	}
+ 	else
+ 	{
+ 		fprintf( stderr, "No CAP_SYS_NICE, falling back to regular-priority compute and threads.\nPerformance will be affected.\n" );
