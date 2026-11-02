@@ -395,7 +395,21 @@ mkdir -p "$STAGE/share/hwdata"
 # runtime prefix files/gamescope — same as gamescope itself). Absorb its stage
 # into this package root so GameNative ships a single gamescope asset.
 XW_DIR="${GN_XWAYLAND_DIR:-$WS_DIR/gamenative-xwayland}"
-[ -x "$XW_DIR/build-android/hw/xwayland/Xwayland" ] || bash "$XW_DIR/android/build-xwayland.sh"
+XW_BIN="$XW_DIR/build-android/hw/xwayland/Xwayland"
+# Rebuilt always, like the daemon libraries above and for the same reason: the
+# binary comes out of a build directory, so an existing file says nothing about
+# whether it is current, and a stale Xwayland is invisible in the payload —
+# gamescope only finds out at run time. build-xwayland.sh is incremental (meson
+# reconfigure, ninja relinks only what changed), so a current tree costs its
+# xkbcomp/xkeyboard-config tail, seconds; a stale one costs a rebuild. The dry
+# run is the assertion in place of a find pattern: ninja knows every input,
+# including the generated config.h the xkb tail rewrites after the link, which
+# a scan of this upstream tree would report as stale on every run.
+bash "$XW_DIR/android/build-xwayland.sh"
+if ! ninja -C "$XW_DIR/build-android" -n 2>/dev/null | grep -qx 'ninja: no work to do.'; then
+    echo "error: $XW_BIN is not current after build-xwayland.sh — ninja still has work" >&2
+    exit 1
+fi
 bash "$XW_DIR/android/package-xwayland.sh" "$DATE" >/dev/null
 XW_TZST="$OUT_ASSETS/xwayland-gamenative-$DATE.tzst"
 [ -f "$XW_TZST" ] || { echo "error: xwayland payload $XW_TZST not produced" >&2; exit 1; }
