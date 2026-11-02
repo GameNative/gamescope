@@ -16,12 +16,24 @@ granted (RLIMIT_RTPRIO is 0).
 
 - CanSetNice(n): CAP_SYS_NICE, or an RLIMIT_NICE soft limit that reaches n
   (20 - rlim_cur <= n, or RLIM_INFINITY). SetNice uses it.
-- main sets nice -20 on that path too, before any gamescope thread exists, so
-  gamescope-xwm, the vblank and wait threads inherit it. SetRealtime stays on
-  CAP_SYS_NICE only.
+- main sets nice -20 on that path too. Threads created after it
+  (gamescope-xwm, -wl, -kms, -wait, -vrmon, the vblank thread) inherit it.
+  SetRealtime stays on CAP_SYS_NICE only.
+- nice() only changes the calling thread, and two waiter threads are started
+  by static constructors before main: g_ImageWaiter ("gamescope_img",
+  steamcompmgr.cpp) and g_LibEisWaiter ("gamescope-eis", wlserver.cpp). They
+  stayed at nice 0 (upstream has the same gap with CAP_SYS_NICE). On the RP6
+  (SteamWorld Dig 2, 30 s live capture) gamescope_img, the thread that marks
+  an Xwayland commit done, first ran 15.5 ms after the commit arrived, on a
+  CPU 67 % busy with app threads; the commit was not done at the next wakeup
+  and gamescope skipped a whole period. SetNice now also gives the new value
+  to every other thread of the process that is still at the old one.
 - RestoreNice no longer needs CAP_SYS_NICE: raising the value back needs no
-  permission, and SetNice only records values when it lowered them. Children
-  (Xwayland, the game) still start at the nice gamescope was started with.
+  permission, and SetNice only records values when it lowered them. The game
+  and the other children gamescope spawns still start at the nice gamescope
+  was started with. Xwayland is forked by wlroots (xwayland/server.c), not
+  through Process::SpawnProcess, so it inherits nice -20, as it does upstream
+  on a desktop with CAP_SYS_NICE.
 - The Vulkan queues are unchanged: VK_QUEUE_GLOBAL_PRIORITY_REALTIME is still
   requested only with CAP_SYS_NICE (rendervulkan.cpp CreateDevice, with its
   VK_ERROR_NOT_PERMITTED_KHR fallback), so without it both queues stay at
@@ -29,13 +41,14 @@ granted (RLIMIT_RTPRIO is 0).
 
 Logs: "No CAP_SYS_NICE; RLIMIT_NICE permits nice -20 (threads at nice -20),
 realtime compute queue and scheduling unavailable." once at start, instead of
-the "falling back to regular-priority" line.
+the "falling back to regular-priority" line, and "Nice -20 also applied to
+N thread(s) started before it was set." when earlier threads were moved.
 
 diff --git a/src/Utils/Process.cpp b/src/Utils/Process.cpp
-index 1a82f57..2ba91dd 100644
+index 1a82f57..b94ae48 100644
 --- a/src/Utils/Process.cpp
 +++ b/src/Utils/Process.cpp
-@@ -900,12 +900,36 @@ namespace gamescope::Process
+@@ -900,12 +900,70 @@ namespace gamescope::Process
  #endif
      }
  
@@ -63,6 +76,40 @@ index 1a82f57..2ba91dd 100644
 +        return HasCapSysNice() || RlimitNiceAllows( nNice );
 +    }
 +
++    // nice() only changes the calling thread. Threads that already exist keep the
++    // nice they were started with, and some are started by static constructors
++    // before main gets here (g_ImageWaiter "gamescope_img", "gamescope-eis").
++    // Give every other thread still at the old value the new one.
++    static void ApplyNiceToEarlierThreads( int nOldNice, int nNewNice )
++    {
++#if defined(__linux__)
++        DIR *pTaskDir = opendir( "/proc/self/task" );
++        if ( !pTaskDir )
++            return;
++        defer( closedir( pTaskDir ) );
++
++        const pid_t nSelf = gettid();
++        int nApplied = 0;
++        while ( struct dirent *pEntry = readdir( pTaskDir ) )
++        {
++            std::optional<pid_t> onTid = Parse<pid_t>( pEntry->d_name );
++            if ( !onTid || *onTid == nSelf )
++                continue;
++
++            errno = 0;
++            int nThreadNice = getpriority( PRIO_PROCESS, *onTid );
++            if ( errno != 0 || nThreadNice != nOldNice )
++                continue;
++
++            if ( setpriority( PRIO_PROCESS, *onTid, nNewNice ) == 0 )
++                nApplied++;
++        }
++
++        if ( nApplied )
++            s_ProcessLog.infof( "Nice %d also applied to %d thread(s) started before it was set.", nNewNice, nApplied );
++#endif
++    }
++
      std::optional<int> g_oOldNice;
      std::optional<int> g_oNewNice;
      void SetNice( int nNice )
@@ -73,7 +120,17 @@ index 1a82f57..2ba91dd 100644
              return;
  
          errno = 0;
-@@ -927,9 +951,9 @@ namespace gamescope::Process
+@@ -920,6 +978,9 @@ namespace gamescope::Process
+         if ( nNewNice != -1 || errno == 0 )
+         {
+             g_oNewNice = nNewNice;
++
++            if ( g_oOldNice && *g_oOldNice != nNewNice )
++                ApplyNiceToEarlierThreads( *g_oOldNice, nNewNice );
+         }
+ #endif
+     }
+@@ -927,9 +988,9 @@ namespace gamescope::Process
      void RestoreNice()
      {
  #if defined(__linux__)
