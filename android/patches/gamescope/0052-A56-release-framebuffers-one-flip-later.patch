@@ -1,0 +1,108 @@
+A56 — release the framebuffers replaced by the previous flip, not this one, on gamenative-drm
+
+On KMS a page-flip event means the new framebuffer is on screen and the one it
+replaced is free, so page_flip_handler drops the FBs that just left the screen
+and their client buffers go back to the producer (wl_buffer.release, Present
+idle). On gamenative-drm the event arrives when SurfaceFlinger latches the new
+frame, but the buffer it replaced is still scanned out until its release fence
+signals, about one vsync later. A producer handed that buffer at the event
+renders into it while it is on the panel: a straight tear, new frame above,
+old below (SteamWorld Dig 2 on the Retroid Pocket 6, about 16 per 30 s).
+
+The buffer replaced by flip N is safely free at flip N+1's event. So under
+gamenative-drm page_flip_handler keeps the FBs a flip took off screen in
+m_RetiredFbIds and drops them at the next flip; a flip that leaves nothing on
+the plane (plane off) drops both sets at once, since no later flip is coming,
+and finish_drm drops everything. Only the release moves; the event, the vblank
+timestamp and the queued/visible bookkeeping are unchanged. A modeset commit is
+a flip like any other and releases the previous retirees.
+
+Swapchain depth: each producer keeps one more buffer held by gamescope (on
+screen + retired) for at most one flip, and none starves:
+- the ICD shim's pool mailbox has 5 slots: 2 held, 3 for the guest;
+- DXVK's 3 images: one on screen, one retired (free at the next flip), one to
+  render; gamescope flips at most once per vblank, so a new image frees every
+  flip and the guest never waits more than one;
+- Xwayland allocates window buffers on demand, so it adds one if it needs it;
+- gamescope's composite output ring of 3 (rendervulkan nOutImage % 3) is reused
+  by index, not by release, and the image written next was replaced two frames
+  earlier, so the deferral does not touch it.
+
+On by default under gamenative-drm (GAMENATIVE_DRM_SOCKET set);
+GAMESCOPE_GN_RELEASE_AT_FLIP=1 restores the KMS behaviour. One line at start:
+"gamescope: A56 release replaced framebuffers one flip later: on|off".
+
+diff --git a/src/Backends/DRMBackend.cpp b/src/Backends/DRMBackend.cpp
+index e25ec21..4435264 100644
+--- a/src/Backends/DRMBackend.cpp
++++ b/src/Backends/DRMBackend.cpp
+@@ -66,6 +66,22 @@ static bool BUsesGameNativeDrm()
+ 	return bUsing;
+ }
+ 
++// gamenative A56: release the FBs a flip replaced at the following flip (see
++// page_flip_handler). On by default under gamenative-drm;
++// GAMESCOPE_GN_RELEASE_AT_FLIP=1 restores the KMS behaviour.
++static bool BReleaseOneFlipLater()
++{
++	static const bool bOn = []()
++	{
++		const char *pszOff = getenv( "GAMESCOPE_GN_RELEASE_AT_FLIP" );
++		const bool bOn = BUsesGameNativeDrm() && !( pszOff && strcmp( pszOff, "1" ) == 0 );
++		if ( BUsesGameNativeDrm() )
++			fprintf( stderr, "gamescope: A56 release replaced framebuffers one flip later: %s\n", bOn ? "on" : "off" );
++		return bOn;
++	}();
++	return bOn;
++}
++
+ #include "wlr_begin.hpp"
+ #include <libliftoff.h>
+ #include <wlr/types/wlr_buffer.h>
+@@ -170,6 +186,9 @@ struct drm_t {
+ 	// Accessed only on page flip handler thread.
+ 	std::mutex m_mutVisibleFbIds;
+ 	std::vector<gamescope::Rc<gamescope::IBackendFb>> m_VisibleFbIds;
++	// gamenative A56: FBs the last flip took off screen, released at the next
++	// flip (guarded by m_mutVisibleFbIds). See page_flip_handler.
++	std::vector<gamescope::Rc<gamescope::IBackendFb>> m_RetiredFbIds;
+ 
+ 	std::atomic < uint32_t > uPendingFlipCount = { 0 };
+ 
+@@ -848,8 +867,26 @@ static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsi
+ 
+ 	{
+ 		std::scoped_lock lock{ g_DRM.m_QueuedFbIdsMutex, g_DRM.m_mutVisibleFbIds };
+-		// Swap and clear from queue -> visible to avoid allocations.
+-		g_DRM.m_VisibleFbIds.swap( g_DRM.m_QueuedFbIds );
++		if ( BReleaseOneFlipLater() )
++		{
++			// gamenative A56: on gamenative-drm the flip event arrives when
++			// SurfaceFlinger latches the new frame, but the buffer it replaced
++			// stays on the panel until its release fence signals, about one
++			// vsync later. So the FBs this flip took off screen are released
++			// at the NEXT flip, and the ones the previous flip retired go now.
++			// A plane turned off (nothing queued) releases both at once, as no
++			// later flip is coming to do it.
++			g_DRM.m_RetiredFbIds.swap( g_DRM.m_VisibleFbIds );
++			g_DRM.m_VisibleFbIds.clear();
++			g_DRM.m_VisibleFbIds.swap( g_DRM.m_QueuedFbIds );
++			if ( g_DRM.m_VisibleFbIds.empty() )
++				g_DRM.m_RetiredFbIds.clear();
++		}
++		else
++		{
++			// Swap and clear from queue -> visible to avoid allocations.
++			g_DRM.m_VisibleFbIds.swap( g_DRM.m_QueuedFbIds );
++		}
+ 		g_DRM.m_QueuedFbIds.clear();
+ 	}
+ 
+@@ -1943,6 +1980,7 @@ void finish_drm(struct drm_t *drm)
+ 	{
+ 		std::unique_lock lock( drm->m_mutVisibleFbIds );
+ 		drm->m_VisibleFbIds.clear();
++		drm->m_RetiredFbIds.clear();
+ 	}
+ 	drm->sdr_static_metadata = nullptr;
+ 	drm->current = drm_t::drm_state_t{};
