@@ -1,0 +1,272 @@
+A58 — under the FPS limiter, hold a second mailbox commit for the next vblank
+
+A mailbox client that paces itself just under the refresh rate (a guest at
+~59.3 fps under a 60 cap on a 59.97 Hz panel) completes two commits inside one
+composite window about once a second. The done-commit handling latches every
+non-FIFO commit as it completes, so the second one replaces the first before
+the paint and the panel repeats a frame (58.3-59.0 fps, 2.7-2.9 % doubled
+intervals in gamenative-drm PR #46, B4-B6). The client cannot avoid it: the
+latch point is gamescope's vblank wakeup (target vblank minus the rolling
+draw-time estimate minus the red zone), which only gamescope knows.
+
+With gn_mailbox_hold on, while the FPS limiter is engaged for a window (a
+target FPS is set, the window is not limiter-exempt, no VRR), the done-commit
+handling for Xwayland and xdg windows does this for non-FIFO commits:
+
+- the first commit to complete for the coming paint is latched as today;
+- a newer one is held in the done list instead of replacing it, and is latched
+  by the first done-commit pass of the next vblank cycle (the vblank pass
+  always runs one, so a held commit never waits for the client);
+- a third replaces the held one; the replaced commit is dropped from the
+  window's queue, which releases its buffer and discards its presentation
+  feedback, as a mailbox replace does today.
+
+The queue is one deep, the client is never blocked, and a window that delivers
+at or below the refresh rate never loses a frame. A held commit's earliest
+present time is stamped by the pass that latches it. FIFO commits, unlimited
+windows and VRR are unchanged.
+
+gn_mailbox_hold: -1 (default) = on when the gamenative-drm backend is in use
+(GAMENATIVE_DRM_SOCKET set), else off; gamescope_gn_mailbox_hold=0/1 overrides
+it; on Android the property debug.gamescope.gn_mailbox_hold=0/1 wins when set.
+It is resolved once, at the first done-commit pass.
+
+Logs: "gn_mailbox_hold=<0|1> source=<default|env|prop>" once at start, and
+"gn_mailbox_hold: held=N replaced=M over K vblanks (total ...)" about every
+600 vblanks while holds happen.
+
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index 81f5cd8..987d54c 100644
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -101,6 +101,10 @@
+ #include "vrclient_detect.h"
+ #include "Utils/Process.h"
+ 
++#if defined(__ANDROID__)
++#include <sys/system_properties.h>
++#endif
++
+ #include "wlr_begin.hpp"
+ #include "wlr/types/wlr_pointer_constraints_v1.h"
+ #include "wlr_end.hpp"
+@@ -8216,6 +8220,133 @@ bool handle_done_commit( steamcompmgr_win_t *w, xwayland_ctx_t *ctx, uint64_t co
+ 	return false;
+ }
+ 
++// gamenative A58: mailbox hold under the FPS limiter.
++//
++// A mailbox client pacing itself just under the refresh rate (59.3 fps under a
++// 60 cap on a 59.97 Hz panel) completes two commits inside one composite window
++// about once a second. Collapsing them to the newest, as mailbox does, makes
++// the panel repeat a frame. Only gamescope knows where its latch point is, so
++// the hold lives here: once a window has had a non-FIFO commit latched for the
++// coming paint, a newer one is held and latched for the paint after it. The
++// hold is one deep: a third commit replaces the held one, which is released
++// (and its presentation feedback discarded) right away, as mailbox would. The
++// client is never blocked, and a window at or below the refresh rate never
++// loses a frame. A held commit is latched by the first done-commit pass of the
++// next vblank cycle; the vblank pass always runs one, so an idle client does
++// not leave it stuck.
++//
++// gn_mailbox_hold: -1 = auto (on when the gamenative-drm backend is in use),
++// 0 = off, 1 = on. Overridable with gamescope_gn_mailbox_hold=0/1 and, on
++// Android, the property debug.gamescope.gn_mailbox_hold=0/1 (wins when set).
++// Resolved once, at the first done-commit pass.
++gamescope::ConVar<int> cv_gn_mailbox_hold{ "gn_mailbox_hold", -1, "gamenative: hold one newer mailbox commit for the next vblank while the FPS limiter is engaged (-1 auto, 0 off, 1 on)." };
++
++static bool gn_mailbox_hold_enabled()
++{
++	static const bool s_bEnabled = []()
++	{
++		const char *pszSource = "default";
++		bool bEnabled;
++		{
++			const char *pszSock = getenv( "GAMENATIVE_DRM_SOCKET" );
++			bEnabled = pszSock && *pszSock;
++		}
++		if ( cv_gn_mailbox_hold != -1 )
++		{
++			bEnabled = cv_gn_mailbox_hold != 0;
++			pszSource = "env";
++		}
++#if defined(__ANDROID__)
++		char szProp[ PROP_VALUE_MAX ] = {};
++		if ( __system_property_get( "debug.gamescope.gn_mailbox_hold", szProp ) > 0 &&
++		     ( szProp[0] == '0' || szProp[0] == '1' ) )
++		{
++			bEnabled = szProp[0] == '1';
++			pszSource = "prop";
++		}
++#endif
++		xwm_log.infof( "gn_mailbox_hold=%d source=%s", bEnabled ? 1 : 0, pszSource );
++		return bEnabled;
++	}();
++	return s_bEnabled;
++}
++
++static bool gn_mailbox_hold_applies( steamcompmgr_win_t *w )
++{
++	if ( !w || !gn_mailbox_hold_enabled() )
++		return false;
++	if ( !g_nSteamCompMgrTargetFPS || !steamcompmgr_window_should_limit_fps( w ) )
++		return false;
++	if ( GetBackend()->GetCurrentConnector() && GetBackend()->GetCurrentConnector()->IsVRRActive() )
++		return false;
++	return true;
++}
++
++static uint64_t s_ulGnHoldCount = 0;
++static uint64_t s_ulGnHoldReplacedCount = 0;
++
++// vblank_idx is the cycle whose paint a done-commit pass feeds (it advances
++// after the vblank pass's done-commit handling); +1 keeps 0 as "none".
++static inline uint64_t gn_mailbox_paint_id( uint64_t vblank_idx ) { return vblank_idx + 1; }
++
++// Decide for a done commit. Returns true when the entry is held: it was put
++// (or replaced the window's held entry) in `held`, the list carried to the
++// next pass. `held_index` maps a window seq to its held entry in `held` for
++// this pass. Returns false when the entry goes on as today.
++static bool gn_mailbox_hold_entry( steamcompmgr_win_t *w, const CommitDoneEntry_t &entry, uint64_t vblank_idx,
++	std::vector< CommitDoneEntry_t > &held, std::unordered_map< uint64_t, size_t > &held_index )
++{
++	if ( entry.fifo || !gn_mailbox_hold_applies( w ) )
++		return false;
++
++	// Nothing latched for the coming paint yet: latch this one.
++	if ( w->gnMailboxLatchedForPaint != gn_mailbox_paint_id( vblank_idx ) )
++		return false;
++
++	auto iter = held_index.find( entry.winSeq );
++	if ( iter == held_index.end() )
++	{
++		held_index[ entry.winSeq ] = held.size();
++		held.push_back( entry );
++		s_ulGnHoldCount++;
++		return true;
++	}
++
++	// A third commit in the window: it replaces the held one. Dropping the
++	// replaced commit from the queue releases its buffer and discards its
++	// presentation feedback (commit_t's destructor), as a mailbox replace does.
++	CommitDoneEntry_t &replaced = held[ iter->second ];
++	for ( auto it = w->commit_queue.begin(); it != w->commit_queue.end(); ++it )
++	{
++		if ( (*it)->commitID == replaced.commitID )
++		{
++			w->commit_queue.erase( it );
++			break;
++		}
++	}
++	replaced = entry;
++	s_ulGnHoldReplacedCount++;
++	return true;
++}
++
++// One line per ~600 cycles while holds happen, to confirm the hold is active.
++static void gn_mailbox_hold_report( uint64_t vblank_idx )
++{
++	static uint64_t s_ulLastReportIdx = 0;
++	static uint64_t s_ulLastHold = 0, s_ulLastReplaced = 0;
++	if ( vblank_idx < s_ulLastReportIdx + 600 )
++		return;
++	if ( s_ulGnHoldCount != s_ulLastHold || s_ulGnHoldReplacedCount != s_ulLastReplaced )
++	{
++		xwm_log.infof( "gn_mailbox_hold: held=%" PRIu64 " replaced=%" PRIu64 " over %" PRIu64 " vblanks (total held=%" PRIu64 " replaced=%" PRIu64 ")",
++			s_ulGnHoldCount - s_ulLastHold, s_ulGnHoldReplacedCount - s_ulLastReplaced,
++			vblank_idx - s_ulLastReportIdx, s_ulGnHoldCount, s_ulGnHoldReplacedCount );
++	}
++	s_ulLastReportIdx = vblank_idx;
++	s_ulLastHold = s_ulGnHoldCount;
++	s_ulLastReplaced = s_ulGnHoldReplacedCount;
++}
++
+ // TODO: Merge these two functions.
+ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vblank_idx )
+ {
+@@ -8233,6 +8364,10 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
+ 	fifo_win_seqs.clear();
+ 	fifo_win_seqs.reserve( 32 );
+ 
++	// gamenative A58: this pass's held mailbox entry per window seq.
++	static std::unordered_map< uint64_t, size_t > gn_held_index;
++	gn_held_index.clear();
++
+ 	uint64_t now = get_time_in_nanos();
+ 
+ 	// very fast loop yes
+@@ -8257,6 +8392,11 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
+ 			continue;
+ 		}
+ 
++		// gamenative A58: before earliestPresentTime is stamped, so a held
++		// commit is stamped by the pass that latches it.
++		if ( entry_win && gn_mailbox_hold_entry( entry_win, entry, vblank_idx, commits_before_their_time, gn_held_index ) )
++			continue;
++
+ 		if (!entry.earliestPresentTime)
+ 		{
+ 			entry.earliestPresentTime = next_refresh_time;
+@@ -8273,10 +8413,15 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
+ 		{
+ 			if (entry.fifo)
+ 				fifo_win_seqs.insert(entry.winSeq);
++			else // gamenative A58: this window has its commit for the coming paint.
++				entry_win->gnMailboxLatchedForPaint = gn_mailbox_paint_id( vblank_idx );
+ 		}
+ 	}
+ 
+ 	ctx->doneCommits.listCommitsDone.swap( commits_before_their_time );
++
++	if ( vblank )
++		gn_mailbox_hold_report( vblank_idx );
+ }
+ 
+ void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
+@@ -8295,6 +8440,10 @@ void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
+ 	fifo_win_seqs.clear();
+ 	fifo_win_seqs.reserve( 32 );
+ 
++	// gamenative A58: this pass's held mailbox entry per window seq.
++	static std::unordered_map< uint64_t, size_t > gn_held_index;
++	gn_held_index.clear();
++
+ 	uint64_t now = get_time_in_nanos();
+ 
+ 	// very fast loop yes
+@@ -8318,6 +8467,11 @@ void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
+ 			commits_before_their_time.push_back( entry );
+ 			continue;
+ 		}
++
++		// gamenative A58: before earliestPresentTime is stamped, so a held
++		// commit is stamped by the pass that latches it.
++		if ( entry_win && gn_mailbox_hold_entry( entry_win, entry, vblank_idx, commits_before_their_time, gn_held_index ) )
++			continue;
+ 		
+ 		if (!entry.earliestPresentTime)
+ 		{
+@@ -8335,6 +8489,8 @@ void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
+ 		{
+ 			if (entry.fifo)
+ 				fifo_win_seqs.insert(entry.winSeq);
++			else // gamenative A58: this window has its commit for the coming paint.
++				entry_win->gnMailboxLatchedForPaint = gn_mailbox_paint_id( vblank_idx );
+ 		}
+ 	}
+ 
+diff --git a/src/steamcompmgr_shared.hpp b/src/steamcompmgr_shared.hpp
+index aea260b..6bdfb54 100644
+--- a/src/steamcompmgr_shared.hpp
++++ b/src/steamcompmgr_shared.hpp
+@@ -164,6 +164,10 @@ struct steamcompmgr_win_t {
+ 	bool unlockedForFrameCallback = false;
+ 	bool receivedDoneCommit = false;
+ 
++	// gamenative A58: vblank_idx + 1 of the paint this window's last non-FIFO
++	// commit was latched for (0 = none); see gn_mailbox_hold_entry.
++	uint64_t gnMailboxLatchedForPaint = 0;
++
+ 	// gamenative: set once the guest's own content (the WSI shim's override
+ 	// surface) has been bound on this window, i.e. this session has had a game
+ 	// window at some point. Only ever set by that coming into existence, so a
