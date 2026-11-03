@@ -26,17 +26,33 @@ at or below the refresh rate never loses a frame. A held commit's earliest
 present time is stamped by the pass that latches it. FIFO commits, unlimited
 windows and VRR are unchanged.
 
+A held commit is shown one paint late. A client that keeps delivering one
+commit per vblank never drains that: each new commit finds its paint taken by
+the carried one and is carried in turn, a standing one-frame delay (seen with
+in-game VSync on, where every commit was carried). So the carry is bounded:
+after gn_mailbox_hold_max_carry paints in a row (default 8) have shown a
+carried commit, the next fresh commit is latched at once and replaces the
+carried one, a mailbox replace that drops one frame and puts the window back
+on its own paint. A client below the refresh rate drains the carry by itself
+at its next gap, as before.
+
 gn_mailbox_hold: -1 (default) = on when the gamenative-drm backend is in use
 (GAMENATIVE_DRM_SOCKET set), else off; gamescope_gn_mailbox_hold=0/1 overrides
 it; on Android the property debug.gamescope.gn_mailbox_hold=0/1 wins when set.
-It is resolved once, at the first done-commit pass.
+gn_mailbox_hold_max_carry (0 = unbounded) follows the same pattern, with the
+property debug.gamescope.gn_mailbox_hold_max_carry. Both are resolved once, at
+the first done-commit pass.
 
-Logs: "gn_mailbox_hold=<0|1> source=<default|env|prop>" once at start, and
-"gn_mailbox_hold: held=N replaced=M over K vblanks (total ...)" about every
-600 vblanks while holds happen.
+Logs: "gn_mailbox_hold=<0|1> source=<default|env|prop> max_carry=N" once at
+start, and about every 600 vblanks while the hold does anything:
+"gn_mailbox_hold: deferred=N carried_paints=C max_run=R collapsed=X
+replaced=M over K vblanks". deferred counts each held commit once;
+carried_paints counts paints that showed a commit one paint late (the latency
+the hold adds); max_run is the longest run of those; collapsed counts carries
+ended by the bound; replaced counts held commits dropped for a newer one.
 
 diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
-index 81f5cd8..987d54c 100644
+index 81f5cd8..df657d1 100644
 --- a/src/steamcompmgr.cpp
 +++ b/src/steamcompmgr.cpp
 @@ -101,6 +101,10 @@
@@ -50,7 +66,7 @@ index 81f5cd8..987d54c 100644
  #include "wlr_begin.hpp"
  #include "wlr/types/wlr_pointer_constraints_v1.h"
  #include "wlr_end.hpp"
-@@ -8216,6 +8220,133 @@ bool handle_done_commit( steamcompmgr_win_t *w, xwayland_ctx_t *ctx, uint64_t co
+@@ -8216,6 +8220,212 @@ bool handle_done_commit( steamcompmgr_win_t *w, xwayland_ctx_t *ctx, uint64_t co
  	return false;
  }
  
@@ -69,11 +85,41 @@ index 81f5cd8..987d54c 100644
 +// next vblank cycle; the vblank pass always runs one, so an idle client does
 +// not leave it stuck.
 +//
++// A held commit is shown one paint after the one it completed for. If the
++// client keeps delivering one commit per vblank, that one-paint delay never
++// drains: every new commit finds its paint taken by the carried one and is
++// carried in turn. So the carry is bounded: once gn_mailbox_hold_max_carry
++// paints in a row have shown a carried commit, the next fresh commit is
++// latched at once and replaces the carried one (a mailbox replace: one frame
++// dropped, the window back on its own paint). A client below the refresh rate
++// drains the carry by itself at its next gap.
++//
 +// gn_mailbox_hold: -1 = auto (on when the gamenative-drm backend is in use),
 +// 0 = off, 1 = on. Overridable with gamescope_gn_mailbox_hold=0/1 and, on
 +// Android, the property debug.gamescope.gn_mailbox_hold=0/1 (wins when set).
-+// Resolved once, at the first done-commit pass.
++// gn_mailbox_hold_max_carry: paints in a row a carried commit may hold the
++// window before a fresh one displaces it (0 = unbounded); same env/property
++// pattern (debug.gamescope.gn_mailbox_hold_max_carry). Both are resolved
++// once, at the first done-commit pass.
 +gamescope::ConVar<int> cv_gn_mailbox_hold{ "gn_mailbox_hold", -1, "gamenative: hold one newer mailbox commit for the next vblank while the FPS limiter is engaged (-1 auto, 0 off, 1 on)." };
++gamescope::ConVar<int> cv_gn_mailbox_hold_max_carry{ "gn_mailbox_hold_max_carry", 8, "gamenative: paints in a row a held mailbox commit may be shown late before a fresh commit displaces it (0 = unbounded)." };
++
++#if defined(__ANDROID__)
++// An integer Android property, or nullopt when it is unset or not a number.
++static std::optional<int> gn_int_property( const char *pszName )
++{
++	char szProp[ PROP_VALUE_MAX ] = {};
++	if ( __system_property_get( pszName, szProp ) <= 0 )
++		return std::nullopt;
++	char *pEnd = nullptr;
++	long lValue = strtol( szProp, &pEnd, 10 );
++	if ( pEnd == szProp || *pEnd != '\0' )
++		return std::nullopt;
++	return (int)lValue;
++}
++#endif
++
++static int s_nGnMailboxMaxCarry = 0;
 +
 +static bool gn_mailbox_hold_enabled()
 +{
@@ -90,16 +136,17 @@ index 81f5cd8..987d54c 100644
 +			bEnabled = cv_gn_mailbox_hold != 0;
 +			pszSource = "env";
 +		}
++		s_nGnMailboxMaxCarry = std::max( 0, (int)cv_gn_mailbox_hold_max_carry );
 +#if defined(__ANDROID__)
-+		char szProp[ PROP_VALUE_MAX ] = {};
-+		if ( __system_property_get( "debug.gamescope.gn_mailbox_hold", szProp ) > 0 &&
-+		     ( szProp[0] == '0' || szProp[0] == '1' ) )
++		if ( std::optional<int> oProp = gn_int_property( "debug.gamescope.gn_mailbox_hold" ); oProp && ( *oProp == 0 || *oProp == 1 ) )
 +		{
-+			bEnabled = szProp[0] == '1';
++			bEnabled = *oProp == 1;
 +			pszSource = "prop";
 +		}
++		if ( std::optional<int> oProp = gn_int_property( "debug.gamescope.gn_mailbox_hold_max_carry" ); oProp && *oProp >= 0 )
++			s_nGnMailboxMaxCarry = *oProp;
 +#endif
-+		xwm_log.infof( "gn_mailbox_hold=%d source=%s", bEnabled ? 1 : 0, pszSource );
++		xwm_log.infof( "gn_mailbox_hold=%d source=%s max_carry=%d", bEnabled ? 1 : 0, pszSource, s_nGnMailboxMaxCarry );
 +		return bEnabled;
 +	}();
 +	return s_bEnabled;
@@ -116,17 +163,23 @@ index 81f5cd8..987d54c 100644
 +	return true;
 +}
 +
-+static uint64_t s_ulGnHoldCount = 0;
-+static uint64_t s_ulGnHoldReplacedCount = 0;
++// Counters for the report line, since start.
++static uint64_t s_ulGnDeferred = 0;      // commits held for a later paint (each counted once)
++static uint64_t s_ulGnReplaced = 0;      // held commits replaced by a newer one before their paint
++static uint64_t s_ulGnCarriedPaints = 0; // paints that showed a carried commit (one paint late)
++static uint64_t s_ulGnCollapsed = 0;     // carries ended by a fresh commit (gn_mailbox_hold_max_carry)
++static uint32_t s_uGnMaxRun = 0;         // longest run of carried paints since the last report
 +
 +// vblank_idx is the cycle whose paint a done-commit pass feeds (it advances
-+// after the vblank pass's done-commit handling); +1 keeps 0 as "none".
++// after the vblank pass's done-commit handling); +1 keeps 0 as "none". A held
++// commit can therefore never be latched for the paint it was held from: the
++// paint id only changes when vblank_idx does.
 +static inline uint64_t gn_mailbox_paint_id( uint64_t vblank_idx ) { return vblank_idx + 1; }
 +
 +// Decide for a done commit. Returns true when the entry is held: it was put
 +// (or replaced the window's held entry) in `held`, the list carried to the
-+// next pass. `held_index` maps a window seq to its held entry in `held` for
-+// this pass. Returns false when the entry goes on as today.
++// next pass, marked gnHeld. `held_index` maps a window seq to its held entry
++// in `held` for this pass. Returns false when the entry is latched now.
 +static bool gn_mailbox_hold_entry( steamcompmgr_win_t *w, const CommitDoneEntry_t &entry, uint64_t vblank_idx,
 +	std::vector< CommitDoneEntry_t > &held, std::unordered_map< uint64_t, size_t > &held_index )
 +{
@@ -137,12 +190,25 @@ index 81f5cd8..987d54c 100644
 +	if ( w->gnMailboxLatchedForPaint != gn_mailbox_paint_id( vblank_idx ) )
 +		return false;
 +
++	// The paint is taken by a carried commit and the carry has run its bound:
++	// a fresh commit is latched now and replaces it (gn_mailbox_hold_latched).
++	if ( !entry.gnHeld && w->gnMailboxLatchedCarried && s_nGnMailboxMaxCarry > 0 &&
++	     w->gnMailboxCarryRun >= (uint32_t)s_nGnMailboxMaxCarry )
++	{
++		s_ulGnCollapsed++;
++		return false;
++	}
++
++	CommitDoneEntry_t heldEntry = entry;
++	heldEntry.gnHeld = true;
++	if ( !entry.gnHeld )
++		s_ulGnDeferred++;
++
 +	auto iter = held_index.find( entry.winSeq );
 +	if ( iter == held_index.end() )
 +	{
 +		held_index[ entry.winSeq ] = held.size();
-+		held.push_back( entry );
-+		s_ulGnHoldCount++;
++		held.push_back( heldEntry );
 +		return true;
 +	}
 +
@@ -158,33 +224,62 @@ index 81f5cd8..987d54c 100644
 +			break;
 +		}
 +	}
-+	replaced = entry;
-+	s_ulGnHoldReplacedCount++;
++	replaced = heldEntry;
++	s_ulGnReplaced++;
 +	return true;
 +}
 +
-+// One line per ~600 cycles while holds happen, to confirm the hold is active.
++// A non-FIFO commit was latched for the coming paint: record it, and whether
++// it is a carried one (held from the paint before).
++static void gn_mailbox_hold_latched( steamcompmgr_win_t *w, const CommitDoneEntry_t &entry, uint64_t vblank_idx )
++{
++	const uint64_t ulPaint = gn_mailbox_paint_id( vblank_idx );
++	if ( w->gnMailboxLatchedForPaint == ulPaint )
++	{
++		// A second latch for the same paint: a fresh commit displacing a
++		// carried one, or a window the hold does not apply to.
++		if ( w->gnMailboxLatchedCarried && !entry.gnHeld && s_ulGnCarriedPaints )
++			s_ulGnCarriedPaints--;
++	}
++	else if ( entry.gnHeld )
++	{
++		w->gnMailboxCarryRun++;
++		s_ulGnCarriedPaints++;
++		s_uGnMaxRun = std::max( s_uGnMaxRun, w->gnMailboxCarryRun );
++	}
++	if ( !entry.gnHeld )
++		w->gnMailboxCarryRun = 0;
++	w->gnMailboxLatchedForPaint = ulPaint;
++	w->gnMailboxLatchedCarried = entry.gnHeld;
++}
++
++// One line per ~600 cycles while the hold does anything, to confirm it is
++// active and show what it costs: deferred = commits held for a later paint,
++// carried_paints = paints that showed a commit one paint late, max_run = the
++// longest run of those in a row, collapsed = carries ended by the bound,
++// replaced = held commits dropped for a newer one.
 +static void gn_mailbox_hold_report( uint64_t vblank_idx )
 +{
 +	static uint64_t s_ulLastReportIdx = 0;
-+	static uint64_t s_ulLastHold = 0, s_ulLastReplaced = 0;
++	static uint64_t s_ulLast[ 4 ] = {};
 +	if ( vblank_idx < s_ulLastReportIdx + 600 )
 +		return;
-+	if ( s_ulGnHoldCount != s_ulLastHold || s_ulGnHoldReplacedCount != s_ulLastReplaced )
++	const uint64_t ulNow[ 4 ] = { s_ulGnDeferred, s_ulGnCarriedPaints, s_ulGnCollapsed, s_ulGnReplaced };
++	if ( memcmp( ulNow, s_ulLast, sizeof( ulNow ) ) != 0 )
 +	{
-+		xwm_log.infof( "gn_mailbox_hold: held=%" PRIu64 " replaced=%" PRIu64 " over %" PRIu64 " vblanks (total held=%" PRIu64 " replaced=%" PRIu64 ")",
-+			s_ulGnHoldCount - s_ulLastHold, s_ulGnHoldReplacedCount - s_ulLastReplaced,
-+			vblank_idx - s_ulLastReportIdx, s_ulGnHoldCount, s_ulGnHoldReplacedCount );
++		xwm_log.infof( "gn_mailbox_hold: deferred=%" PRIu64 " carried_paints=%" PRIu64 " max_run=%u collapsed=%" PRIu64 " replaced=%" PRIu64 " over %" PRIu64 " vblanks",
++			ulNow[ 0 ] - s_ulLast[ 0 ], ulNow[ 1 ] - s_ulLast[ 1 ], s_uGnMaxRun,
++			ulNow[ 2 ] - s_ulLast[ 2 ], ulNow[ 3 ] - s_ulLast[ 3 ], vblank_idx - s_ulLastReportIdx );
 +	}
 +	s_ulLastReportIdx = vblank_idx;
-+	s_ulLastHold = s_ulGnHoldCount;
-+	s_ulLastReplaced = s_ulGnHoldReplacedCount;
++	memcpy( s_ulLast, ulNow, sizeof( ulNow ) );
++	s_uGnMaxRun = 0;
 +}
 +
  // TODO: Merge these two functions.
  void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vblank_idx )
  {
-@@ -8233,6 +8364,10 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
+@@ -8233,6 +8443,10 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
  	fifo_win_seqs.clear();
  	fifo_win_seqs.reserve( 32 );
  
@@ -195,7 +290,7 @@ index 81f5cd8..987d54c 100644
  	uint64_t now = get_time_in_nanos();
  
  	// very fast loop yes
-@@ -8257,6 +8392,11 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
+@@ -8257,6 +8471,11 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
  			continue;
  		}
  
@@ -207,12 +302,12 @@ index 81f5cd8..987d54c 100644
  		if (!entry.earliestPresentTime)
  		{
  			entry.earliestPresentTime = next_refresh_time;
-@@ -8273,10 +8413,15 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
+@@ -8273,10 +8492,15 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
  		{
  			if (entry.fifo)
  				fifo_win_seqs.insert(entry.winSeq);
 +			else // gamenative A58: this window has its commit for the coming paint.
-+				entry_win->gnMailboxLatchedForPaint = gn_mailbox_paint_id( vblank_idx );
++				gn_mailbox_hold_latched( entry_win, entry, vblank_idx );
  		}
  	}
  
@@ -223,7 +318,7 @@ index 81f5cd8..987d54c 100644
  }
  
  void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
-@@ -8295,6 +8440,10 @@ void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
+@@ -8295,6 +8519,10 @@ void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
  	fifo_win_seqs.clear();
  	fifo_win_seqs.reserve( 32 );
  
@@ -234,7 +329,7 @@ index 81f5cd8..987d54c 100644
  	uint64_t now = get_time_in_nanos();
  
  	// very fast loop yes
-@@ -8318,6 +8467,11 @@ void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
+@@ -8318,6 +8546,11 @@ void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
  			commits_before_their_time.push_back( entry );
  			continue;
  		}
@@ -246,27 +341,44 @@ index 81f5cd8..987d54c 100644
  		
  		if (!entry.earliestPresentTime)
  		{
-@@ -8335,6 +8489,8 @@ void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
+@@ -8335,6 +8568,8 @@ void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
  		{
  			if (entry.fifo)
  				fifo_win_seqs.insert(entry.winSeq);
 +			else // gamenative A58: this window has its commit for the coming paint.
-+				entry_win->gnMailboxLatchedForPaint = gn_mailbox_paint_id( vblank_idx );
++				gn_mailbox_hold_latched( entry_win, entry, vblank_idx );
  		}
  	}
  
 diff --git a/src/steamcompmgr_shared.hpp b/src/steamcompmgr_shared.hpp
-index aea260b..6bdfb54 100644
+index aea260b..5da643d 100644
 --- a/src/steamcompmgr_shared.hpp
 +++ b/src/steamcompmgr_shared.hpp
-@@ -164,6 +164,10 @@ struct steamcompmgr_win_t {
+@@ -164,6 +164,14 @@ struct steamcompmgr_win_t {
  	bool unlockedForFrameCallback = false;
  	bool receivedDoneCommit = false;
  
 +	// gamenative A58: vblank_idx + 1 of the paint this window's last non-FIFO
-+	// commit was latched for (0 = none); see gn_mailbox_hold_entry.
++	// commit was latched for (0 = none), whether that commit was a carried one
++	// (held from the paint before), and how many paints in a row have shown a
++	// carried commit; see gn_mailbox_hold_entry.
 +	uint64_t gnMailboxLatchedForPaint = 0;
++	bool gnMailboxLatchedCarried = false;
++	uint32_t gnMailboxCarryRun = 0;
 +
  	// gamenative: set once the guest's own content (the WSI shim's override
  	// surface) has been bound on this window, i.e. this session has had a game
  	// window at some point. Only ever set by that coming into existence, so a
+diff --git a/src/xwayland_ctx.hpp b/src/xwayland_ctx.hpp
+index 7b39ecb..221a95b 100644
+--- a/src/xwayland_ctx.hpp
++++ b/src/xwayland_ctx.hpp
+@@ -55,6 +55,8 @@ struct CommitDoneEntry_t
+ 	uint64_t earliestPresentTime;
+ 	uint64_t earliestLatchTime;
+ 	bool fifo;
++	// gamenative A58: held by the mailbox hold for a later paint.
++	bool gnHeld = false;
+ };
+ 
+ struct CommitDoneList_t
