@@ -8,15 +8,58 @@ to end the session; hold the output black there, and paint one black frame
 before the loop stops.
 
 The same desktop background is what the panel is left holding at the other end:
-from startup until the guest's first frame arrives on the override surface,
-wine's desktop is the only window the compositor has. So the blank is raised on
-the texture selection itself -- is this window's newest done commit still the
-override surface's? -- and not on the reaper alone, and a window that has never
-had an override surface is never blanked.
+from startup until the guest's first frame arrives, wine's desktop is the only
+content the compositor has. So the blank is raised earlier too -- whenever the
+game's window is gone while the session is still alive -- and a window that has
+never had an override surface is never blanked.
 
+What tells the desktop from the game's content is time, not surface. The first
+round of this patch judged it by the surface of the window's newest done commit
+(a commit from the window's own surface was taken to be the desktop), which
+holds for a Vulkan guest but not for one that renders through GL: the xlib
+libGL hands its frames to Xwayland with XShmPutImage, so they arrive on the
+window's own surface, and such a guest may still have bound an override surface
+for a Vulkan swapchain it never presents on (Tomb Raider I-III Remastered loads
+dxgi/d3d11 beside OpenGL). Judged by surface, every one of its frames looked
+like the desktop and the blind never lifted: audio over a black panel for the
+whole session. So the binding is stamped with the window's newest done commit
+id the first time the override is seen, and the startup blind holds until a
+done commit newer than that arrives, from whichever surface carries the game's
+frames; commit ids come from one counter, so "newer" is an id comparison. At
+exit the override is gone after having been bound, which the surface alone does
+say. A DXVK guest keeps the startup blank until its first presented frame (its
+desktop commit precedes the swapchain); a GL guest unblanks on its first
+XShmPutImage frame.
+
+The blind's one-shot log line states the stamped id and the newest done commit
+id at every transition, so the panel evidence can be tied to the comparison.
+
+diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
+index 54e4efc..f3f914a 100644
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -3189,9 +3189,13 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_flat_texture( uint32_t width,
+ 
+ gamescope::OwningRc<CVulkanTexture> vulkan_create_debug_blank_texture()
+ {
+-	// To match Steam's scaling, which is capped at 1080p
+-	int width = std::min<int>( g_nOutputWidth, 1920 );
+-	int height = std::min<int>( g_nOutputHeight, 1080 );
++	// A33: this texture is the session-end blank, painted as one full-output
++	// layer. Its extent must be the output's, not Steam's 1080p overlay cap:
++	// a capped extent is not screen size, which forces the composite path and
++	// leaves the blank's coverage resting on the shader's out-of-extent black
++	// fill instead of on the layer's own geometry.
++	int width = g_nOutputWidth;
++	int height = g_nOutputHeight;
+ 
+ 	return vulkan_create_flat_texture( width, height, 0, 0, 0, 0 );
+ }
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index 2dfdd7f..e9ec9a7 100644
 --- a/src/steamcompmgr.cpp
 +++ b/src/steamcompmgr.cpp
-@@ -3114,6 +3114,92 @@
+@@ -3131,6 +3131,115 @@ gamescope::ConVar<bool> cv_paint_external_overlay_plane{ "paint_external_overlay
  gamescope::ConVar<bool> cv_paint_cursor_plane{ "paint_cursor_plane", true };
  gamescope::ConVar<bool> cv_paint_mura_plane{ "paint_mura_plane", true };
  
@@ -79,11 +122,23 @@ had an override surface is never blanked.
 +// commit's own surface says which of the two content streams is being painted.
 +//
 +// Two properties are load-bearing and are why this is safe:
-+//   - it cannot be true during normal play: while the game runs the override
-+//     commits every frame, so the newest done commit is always the override;
++//   - it cannot be true during normal play: once the game's content has
++//     arrived, the newest done commit is always newer than the binding;
 +//   - it cannot wedge a session that never opens a second window: the latch is
 +//     only ever set by the override surface coming into existence, so a session
 +//     whose guest never brings one up is never blanked.
++//
++// The newest commit's surface alone is not the discriminator, though. A guest
++// that renders through GL hands its frames to Xwayland (the xlib libGL's
++// XShmPutImage), so they arrive on the window's own surface, while the same
++// guest may have bound an override surface for a Vulkan swapchain it never
++// presents on (Tomb Raider I-III Remastered loads dxgi/d3d11 beside OpenGL).
++// Judged by surface, its frames look like the desktop and the blind never
++// lifts. What tells the desktop from content is time, not surface: the desktop
++// is what the window had done before the override came into existence, so the
++// blind at startup holds until a commit newer than that binding is done, from
++// whichever surface carries the game's frames. At exit the override is gone
++// after having been bound, which the surface does say.
 +static bool
 +session_game_window_absent( steamcompmgr_win_t *w )
 +{
@@ -91,25 +146,36 @@ had an override surface is never blanked.
 +		return false;
 +
 +	struct wlr_surface *override_surface = w->xwayland().surface.override_surface;
-+	if ( override_surface != nullptr )
-+		w->bSessionSawGameWindow = true;
-+
-+	if ( !w->bSessionSawGameWindow )
-+		return false;
 +
 +	gamescope::Rc<commit_t> lastCommit;
 +	get_window_last_done_commit( w, lastCommit );
 +
-+	// The guest's own content is what would be painted only while the newest
-+	// done commit is the override's. Null override, no commit, or a commit from
-+	// the window's own surface all mean the desktop is all that is left.
-+	return lastCommit == nullptr || lastCommit->surf != override_surface;
++	if ( override_surface != nullptr && !w->bSessionSawGameWindow )
++	{
++		// First sighting of the game's content: everything done so far is the
++		// desktop. Commit ids are issued from one counter, so "newer" is an
++		// id comparison.
++		w->bSessionSawGameWindow = true;
++		w->ulSessionOverrideBoundCommitID = lastCommit ? lastCommit->commitID : 0;
++	}
++
++	if ( !w->bSessionSawGameWindow )
++		return false;
++
++	// The override is gone after having been bound: the desktop is all that is
++	// left (the game's own exit path, ahead of the reaper).
++	if ( override_surface == nullptr )
++		return true;
++
++	// Startup: nothing done yet, or nothing newer than the binding, is still
++	// the desktop. The first newer commit, from either surface, is the game.
++	return lastCommit == nullptr || lastCommit->commitID <= w->ulSessionOverrideBoundCommitID;
 +}
 +
  static void
  paint_all( global_focus_t *pFocus, bool async )
  {
-@@ -3153,6 +3239,37 @@
+@@ -3170,6 +3279,39 @@ paint_all( global_focus_t *pFocus, bool async )
  	// Decide the fit target once so the window planes and the cursor plane agree.
  	fit = override;
  
@@ -125,12 +191,14 @@ had an override surface is never blanked.
 +	if ( ( bSessionBlank ? 1 : 0 ) != s_nLastBlankState )
 +	{
 +		s_nLastBlankState = bSessionBlank ? 1 : 0;
-+		s_SessionBlankLogScope.infof( "blank=%d reaper=%d window=%s override_bound=%d saw_game_window=%d",
++		s_SessionBlankLogScope.infof( "blank=%d reaper=%d window=%s override_bound=%d saw_game_window=%d bound_commit=%lu last_done_commit=%lu",
 +			s_nLastBlankState,
 +			g_bSessionEndBlank ? 1 : 0,
 +			w ? "present" : "none",
 +			( w && w->type == steamcompmgr_win_type_t::XWAYLAND && w->xwayland().surface.override_surface != nullptr ) ? 1 : 0,
-+			( w && w->type == steamcompmgr_win_type_t::XWAYLAND && w->bSessionSawGameWindow ) ? 1 : 0 );
++			( w && w->type == steamcompmgr_win_type_t::XWAYLAND && w->bSessionSawGameWindow ) ? 1 : 0,
++			( w && w->type == steamcompmgr_win_type_t::XWAYLAND ) ? (unsigned long)w->ulSessionOverrideBoundCommitID : 0ul,
++			(unsigned long)window_last_done_commit_id( w ) );
 +	}
 +
 +	if ( bSessionBlank )
@@ -147,7 +215,7 @@ had an override surface is never blanked.
  	if (++frameCounter == 300)
  	{
  		currentFrameRate = 300 * 1000.0f / (currentTime - lastSampledFrameTime);
-@@ -3184,7 +3301,11 @@
+@@ -3201,7 +3343,11 @@ paint_all( global_focus_t *pFocus, bool async )
  	// find the video underlay and put it up first in the scenegraph
  	if ( cv_paint_primary_plane )
  	{
@@ -160,7 +228,7 @@ had an override surface is never blanked.
  		{
  			if ( w->isSteamStreamingClient == true )
  			{
-@@ -9447,6 +9568,10 @@
+@@ -9464,6 +9610,10 @@ void LaunchNestedChildren( char **ppPrimaryChildArgv )
  			gamescope::Process::WaitForChild( nPrimaryChildPid );
  			s_LaunchLogScope.infof( "Primary child shut down!" );
  
@@ -171,7 +239,7 @@ had an override surface is never blanked.
  			if ( cv_shutdown_on_primary_child_death )
  				ShutdownGamescope();
  		});
-@@ -10040,6 +10165,14 @@
+@@ -10057,6 +10207,14 @@ steamcompmgr_main(int argc, char **argv)
  
  		if ( g_bRun == false )
  		{
@@ -186,9 +254,11 @@ had an override surface is never blanked.
  			break;
  		}
  
+diff --git a/src/steamcompmgr_shared.hpp b/src/steamcompmgr_shared.hpp
+index c344d10..c8d8da5 100644
 --- a/src/steamcompmgr_shared.hpp
 +++ b/src/steamcompmgr_shared.hpp
-@@ -161,6 +161,12 @@
+@@ -161,6 +161,19 @@ struct steamcompmgr_win_t {
  	bool unlockedForFrameCallback = false;
  	bool receivedDoneCommit = false;
  
@@ -198,25 +268,13 @@ had an override surface is never blanked.
 +	// session that never opens a game/second window can never be blanked.
 +	bool bSessionSawGameWindow = false;
 +
++	// gamenative: the newest done commit this window had when the override
++	// surface was first seen bound. Everything done up to then is what the
++	// compositor had before the game's content existed -- wine's desktop -- and
++	// any commit newer than it, from either surface, is content that arrived
++	// after. The blind at startup lifts on the first such commit.
++	uint64_t ulSessionOverrideBoundCommitID = 0;
++
  	std::shared_ptr<std::string> engineName;
  
  	std::vector< gamescope::Rc<commit_t> > commit_queue;
---- a/src/rendervulkan.cpp
-+++ b/src/rendervulkan.cpp
-@@ -3189,9 +3189,13 @@
- 
- gamescope::OwningRc<CVulkanTexture> vulkan_create_debug_blank_texture()
- {
--	// To match Steam's scaling, which is capped at 1080p
--	int width = std::min<int>( g_nOutputWidth, 1920 );
--	int height = std::min<int>( g_nOutputHeight, 1080 );
-+	// A33: this texture is the session-end blank, painted as one full-output
-+	// layer. Its extent must be the output's, not Steam's 1080p overlay cap:
-+	// a capped extent is not screen size, which forces the composite path and
-+	// leaves the blank's coverage resting on the shader's out-of-extent black
-+	// fill instead of on the layer's own geometry.
-+	int width = g_nOutputWidth;
-+	int height = g_nOutputHeight;
- 
- 	return vulkan_create_flat_texture( width, height, 0, 0, 0, 0 );
- }

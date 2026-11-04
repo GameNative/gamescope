@@ -75,3 +75,38 @@ is missing, built from another Mesa version, or older than the sources in
 `android/mesa-glamor/` — a stage directory that exists is not evidence that it
 is current, and the payload's glamor is only as new as that stage. See
 `android/mesa-glamor/README.md`.
+
+### Two Mesas: glamor's and the guest's
+
+The glamor Mesa above is Xwayland's: it lives in the payload and renders the X
+server's own drawing. It is not the OpenGL library a Windows game gets. That one
+is the guest libGL, `usr/lib/libGL.so.1.5.0` (with `libglapi.so.0`) in the app's
+`extra_libs.tzst` archive, which the app extracts into every container at launch
+and which Wine's winex11 loads (`WINE_X11FORCEGLX=1`) on BOTH display servers,
+the in-app X11 server and gamescope/Xwayland: the same file, same bytes. It is
+Mesa's xlib GLX emulation on zink (fbconfigs are X visuals, frames reach the X
+server through XShmPutImage, no DRI), from the Pipetto xlib/zink fork: branch
+`zink-mesa-xlib-pipetto` of GameNative/mesa, and the shipped file reports
+`Mesa 24.3.0-devel (git-c1567e9609)`, so it carries that fork's changes up to
+that commit and nothing above it. Upstream Mesa deleted the xlib GLX frontend in
+26.3 (7055daf6a57), so it cannot be rebuilt from the glamor tarball.
+
+What differs between the two display servers is therefore never the library but
+the X server it asks: Xwayland's default visual is depth 24, the in-app server's
+single visual is depth 32, and the emulation reports GLX_BUFFER_SIZE from the
+visual depth (GameNative/mesa#58 makes it count the emulated alpha channel, so an
+8/8/8/8 format says 32 on both). A guest GL frame always arrives on the X
+window's own surface, not on the WSI shim's override surface, which is what A33
+has to account for.
+
+Building that libGL (no CI does it; the wrapper package script only repacks the
+shipped file): the cross setup of `android/kopper/configure.sh` on GameNative/mesa
+branch `zink-kopper-mali-24.3` (NDK 27.3 + a termux aarch64 sysroot) with
+`-Dglx=xlib -Dgallium-drivers=zink -Dvulkan-drivers= -Degl=disabled -Dgbm=disabled
+-Dplatforms=x11 -Dshared-glapi=enabled -Dglvnd=disabled -Dllvm=disabled
+-Dxmlconfig=disabled -Dexpat=disabled -Dzstd=enabled`, `-fno-emulated-tls` in
+`c_args`/`cpp_args` (the shipped `libglapi.so.0` exports `_glapi_tls_Context` as
+ELF TLS; an emutls libGL fails to dlopen against it). Building a commit from
+before Pipetto's "disable dri options query" hack (the shipped c1567e9609 is
+one) also needs `idep_xmlconfig` on the `libgl-xlib` meson target, since zink's
+driconf calls then need the stub; the branch head does not.
