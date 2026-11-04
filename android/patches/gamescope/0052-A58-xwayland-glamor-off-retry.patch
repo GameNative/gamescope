@@ -1,0 +1,193 @@
+A58 — retry the base Xwayland with glamor off when it exits or stalls before ready
+
+Xwayland's glamor runs on the payload's zink over the guest Vulkan driver (see
+"Two Mesas" in android/README.md). On some device/driver pairs that EGL bring-up
+never completes: an Adreno 750 with a self-built Turnip died with SIGABRT right
+after "Failed to make EGL context current with GL", and the system driver on
+non-Adreno wedges Xwayland (which is why the app sets XWAYLAND_NO_GLAMOR=1
+there). Either way the child never writes its -displayfd, the ready-wait (A24)
+sits out its 15 s deadline, and the session ends with "Failed to initialize
+wlserver" — although nothing in the session needs glamor: every Vulkan guest
+presents through the WSI shim, and Xwayland with XWAYLAND_NO_GLAMOR=1 serves
+the same X clients with software rendering. A user reproduced exactly that by
+forcing LIBGL_ALWAYS_SOFTWARE=1 into the container by hand.
+
+Two changes to the ready-wait:
+
+- A child that dies before ready is seen at once instead of at the deadline.
+  wlroots reaps it in xserver_handle_ready (the -displayfd pipe hangs up,
+  "Xwayland startup failed, not setting up xwm"), unlinks its sockets and
+  leaves display == -1, but emits no signal; the wait now polls that field
+  (has_xwayland_exited) after each dispatch and reports Exited.
+
+- A base server that exited or stalled with glamor on is tried once more with
+  XWAYLAND_NO_GLAMOR=1 in the environment (wlroots spawns Xwayland with
+  gamescope's environ). The old server object is destroyed first — its wlroots
+  half unlinks and closes the X sockets, so the replacement binds the same
+  display number, which the app addresses by path (A20). A stalled child is
+  SIGKILLed before that: wlroots only closes its end of the pipes and relies on
+  the server dying of EPIPE, which a child wedged in its driver never reads.
+  Nothing else in gamescope holds a pointer to a base server at this point.
+  The retry is not attempted when XWAYLAND_NO_GLAMOR is already set, and the
+  servers created later (wlserver_make_new_xwayland_server) are not retried.
+
+The stall snapshot from A24 is still logged before the retry, so a wedge keeps
+its evidence; the log then says which attempt the session is running on.
+diff --git a/src/wlserver.cpp b/src/wlserver.cpp
+index f7635d0..b35db07 100644
+--- a/src/wlserver.cpp
++++ b/src/wlserver.cpp
+@@ -11,6 +11,7 @@
+ #include <dirent.h>
+ #include <stdio.h>
+ #include <limits.h>
++#include <signal.h>
+ #include <atomic>
+ #include <chrono>
+ #include <xf86drm.h>
+@@ -2353,7 +2354,20 @@ log_xwayland_stall( gamescope_xwayland_server_t *pServer, size_t uIndex )
+ 	}
+ }
+ 
+-static bool wait_xwayland_server_ready( gamescope_xwayland_server_t *pServer, size_t uIndex )
++// gamenative (A58): how a ready-wait ended. A child that dies before its
++// -displayfd write is a distinct outcome from one that stalls: wlroots reaps it
++// at once (xserver_handle_ready sees the pipe hang up, "Xwayland startup
++// failed"), tears its sockets down and leaves display == -1, but emits no
++// signal, so without this the wait would sit out the whole deadline on a corpse.
++enum class XWaylandStart
++{
++	Ready,
++	Exited,
++	Stalled,
++	Error,
++};
++
++static XWaylandStart wait_xwayland_server_ready( gamescope_xwayland_server_t *pServer, size_t uIndex )
+ {
+ 	const auto start = std::chrono::steady_clock::now();
+ 
+@@ -2368,7 +2382,16 @@ static bool wait_xwayland_server_ready( gamescope_xwayland_server_t *pServer, si
+ 		if ( ret < 0 )
+ 		{
+ 			wl_log.errorf( "wl_event_loop_dispatch failed\n" );
+-			return false;
++			return XWaylandStart::Error;
++		}
++
++		if ( pServer->has_xwayland_exited() )
++		{
++			const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
++				std::chrono::steady_clock::now() - start ).count();
++			wl_log.errorf( "Xwayland server %zu exited after %lld ms, before it signalled ready (no -displayfd write)\n",
++				uIndex, (long long)elapsedMs );
++			return XWaylandStart::Exited;
+ 		}
+ 
+ 		const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+@@ -2381,11 +2404,58 @@ static bool wait_xwayland_server_ready( gamescope_xwayland_server_t *pServer, si
+ 				"loop was still dispatching requests throughout.\n",
+ 				uIndex, pServer->get_nested_display_name(), kXWaylandReadyTimeoutMs );
+ 			log_xwayland_stall( pServer, uIndex );
+-			return false;
++			return XWaylandStart::Stalled;
+ 		}
+ 	}
+ 
+-	return true;
++	return XWaylandStart::Ready;
++}
++
++// gamenative (A58): a base server that does not come up is tried once more with
++// glamor off. Xwayland's glamor runs on the payload's zink over the guest Vulkan
++// driver; where that EGL bring-up dies (an abort in the driver at make-current
++// has been seen on an Adreno 750) or wedges (the system driver on non-Adreno),
++// Xwayland never reaches its -displayfd write and the whole session fails,
++// although the server itself is fine without glamor: every Vulkan guest presents
++// through the WSI shim, and Xwayland falls back to software rendering when it is
++// told so (XWAYLAND_NO_GLAMOR, the switch the app already sets on non-Adreno).
++// The retry is one attempt, only for the servers created at init, and only when
++// glamor was on for the failed attempt.
++static XWaylandStart start_xwayland_server_with_fallback( size_t uIndex )
++{
++	XWaylandStart eResult = wait_xwayland_server_ready( wlserver.wlr.xwayland_servers[uIndex].get(), uIndex );
++	if ( eResult == XWaylandStart::Ready || eResult == XWaylandStart::Error )
++		return eResult;
++
++	const char *pszNoGlamor = getenv( "XWAYLAND_NO_GLAMOR" );
++	if ( pszNoGlamor && *pszNoGlamor )
++		return eResult;
++
++	wl_log.errorf( "Xwayland server %zu %s with glamor on; retrying once with XWAYLAND_NO_GLAMOR=1 (software rendering for X drawing; Vulkan guests present through the WSI shim regardless)\n",
++		uIndex, eResult == XWaylandStart::Exited ? "exited during startup" : "stalled during startup" );
++
++	if ( eResult == XWaylandStart::Stalled )
++	{
++		// wlroots never kills the child: it closes its end of the wl/wm fds
++		// and expects the server to die of the broken pipe. A child wedged in
++		// its driver does not read them, so end it ourselves before a second
++		// one binds the same display.
++		pid_t pid = wlserver.wlr.xwayland_servers[uIndex]->get_pid();
++		if ( pid > 0 )
++			kill( pid, SIGKILL );
++	}
++
++	setenv( "XWAYLAND_NO_GLAMOR", "1", 1 );
++	// Destroying the old server first: its wlroots half unlinks and closes the
++	// X sockets, so the replacement binds the same display number again, and
++	// nothing else in gamescope holds a pointer to a base server yet.
++	wlserver.wlr.xwayland_servers[uIndex].reset();
++	wlserver.wlr.xwayland_servers[uIndex] = std::make_unique<gamescope_xwayland_server_t>( wlserver.display, (int)uIndex );
++
++	eResult = wait_xwayland_server_ready( wlserver.wlr.xwayland_servers[uIndex].get(), uIndex );
++	if ( eResult == XWaylandStart::Ready )
++		wl_log.infof( "Xwayland server %zu is up with glamor off\n", uIndex );
++	return eResult;
+ }
+ 
+ bool wlserver_init( void ) {
+@@ -2588,7 +2658,7 @@ bool wlserver_init( void ) {
+ 
+ 	for (size_t i = 0; i < wlserver.wlr.xwayland_servers.size(); i++)
+ 	{
+-		if ( !wait_xwayland_server_ready( wlserver.wlr.xwayland_servers[i].get(), i ) )
++		if ( start_xwayland_server_with_fallback( i ) != XWaylandStart::Ready )
+ 			return false;
+ 	}
+ 
+@@ -3766,6 +3836,14 @@ bool gamescope_xwayland_server_t::is_xwayland_ready() const
+ 	return xwayland_ready;
+ }
+ 
++// gamenative (A58): wlroots marks a server whose child died before ready by
++// tearing its display down (display == -1) in xserver_handle_ready's error path;
++// it emits nothing, so this is the only way to see it from outside.
++bool gamescope_xwayland_server_t::has_xwayland_exited() const
++{
++	return !xwayland_ready && xwayland_server && xwayland_server->display < 0;
++}
++
+ _XDisplay *gamescope_xwayland_server_t::get_xdisplay()
+ {
+ 	return dpy;
+@@ -3866,7 +3944,7 @@ uint32_t wlserver_make_new_xwayland_server()
+ 
+ 	auto& server = wlserver.wlr.xwayland_servers.emplace_back(std::make_unique<gamescope_xwayland_server_t>(wlserver.display, (int)wlserver.wlr.xwayland_servers.size()));
+ 
+-	if ( !wait_xwayland_server_ready( server.get(), wlserver.wlr.xwayland_servers.size() - 1 ) )
++	if ( wait_xwayland_server_ready( server.get(), wlserver.wlr.xwayland_servers.size() - 1 ) != XWaylandStart::Ready )
+ 		return ~0u;
+ 
+ 	return uint32_t(wlserver.wlr.xwayland_servers.size() - 1);
+diff --git a/src/wlserver.hpp b/src/wlserver.hpp
+index 54452c1..0bc0f02 100644
+--- a/src/wlserver.hpp
++++ b/src/wlserver.hpp
+@@ -66,6 +66,7 @@ public:
+ 	static void xwayland_ready_callback(struct wl_listener *listener, void *data);
+ 
+ 	bool is_xwayland_ready() const;
++	bool has_xwayland_exited() const;
+ 	const char *get_nested_display_name() const;
+ 
+ 	void set_wl_id( struct wlserver_x11_surface_info *surf, uint32_t id );

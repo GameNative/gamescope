@@ -91,6 +91,16 @@ server through XShmPutImage, no DRI), from the Pipetto xlib/zink fork: branch
 that commit and nothing above it. Upstream Mesa deleted the xlib GLX frontend in
 26.3 (7055daf6a57), so it cannot be rebuilt from the glamor tarball.
 
+Glamor is optional for a session. Every Vulkan guest presents through the WSI
+shim, so an Xwayland without glamor (`XWAYLAND_NO_GLAMOR=1`, software rendering
+for the X server's own drawing) still serves the same clients; the app sets that
+itself on non-Adreno devices, where the system driver wedges the zink bring-up.
+Where glamor's EGL bring-up fails on a device the app did not predict (an abort
+in the driver at make-current was seen on an Adreno 750 with a self-built
+Turnip), the child dies or stalls before its `-displayfd` write, and A58 retries
+the base Xwayland once with `XWAYLAND_NO_GLAMOR=1` instead of failing the session
+at the A24 deadline. The log names the retry and which attempt is running.
+
 What differs between the two display servers is therefore never the library but
 the X server it asks: Xwayland's default visual is depth 24, the in-app server's
 single visual is depth 32, and the emulation reports GLX_BUFFER_SIZE from the
