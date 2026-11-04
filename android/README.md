@@ -106,5 +106,7 @@ branch `zink-kopper-mali-24.3` (NDK 27.3 + a termux aarch64 sysroot) with
 -Dplatforms=x11 -Dshared-glapi=enabled -Dglvnd=disabled -Dllvm=disabled
 -Dxmlconfig=disabled -Dexpat=disabled -Dzstd=enabled`, `-fno-emulated-tls` in
 `c_args`/`cpp_args` (the shipped `libglapi.so.0` exports `_glapi_tls_Context` as
-ELF TLS; an emutls libGL fails to dlopen against it) and `idep_xmlconfig` on the
-`libgl-xlib` meson target (zink's driconf calls need the stub).
+ELF TLS; an emutls libGL fails to dlopen against it). Building a commit from
+before Pipetto's "disable dri options query" hack (the shipped c1567e9609 is
+one) also needs `idep_xmlconfig` on the `libgl-xlib` meson target, since zink's
+driconf calls then need the stub; the branch head does not.
