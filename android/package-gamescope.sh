@@ -88,48 +88,37 @@ LSFG_SO="$GNDRM_REL/liblsfg_engine.so"
 # that its source had already dropped, and nothing in the payload showed it. The
 # scripts are incremental, so a current tree costs a few seconds; a stale one
 # costs a rebuild.
-bash "$GNDRM_DIR/tools/build-lsfg.sh" android
-bash "$GNDRM_DIR/tools/build-shim.sh" android
-bash "$GNDRM_DIR/tools/build-android.sh"
+# The payload carries whatever these scripts produce, so the question the guard
+# has to answer is "was this artifact written by this run?", not "is it newer
+# than some file". Ages answer that wrongly in both directions: a checkout or a
+# rebase rewrites bytes-identical sources and makes a current artifact look
+# stale, and a build that silently did nothing leaves a stale one looking fine.
+# So the Rust side is always rebuilt — touching the workspace's own sources
+# keeps third-party crates cached, which is what holds this to about a minute —
+# and every artifact has to come out of this run newer than the mark below.
+FRESH_MARK="$(mktemp)"
+# Removed once the checks have run: the staging block below replaces this
+# script's EXIT trap, so a trap here would leak the file.
+find "$GNDRM_DIR/modules" "$GNDRM_DIR/icd_shim" "$GNDRM_DIR/utils" \
+    \( -name '*.rs' -o -name 'Cargo.toml' \) -print0 | xargs -0 touch
+bash "$GNDRM_DIR/tools/build-lsfg.sh" android \
+    || { echo "error: build-lsfg.sh failed" >&2; exit 1; }
+bash "$GNDRM_DIR/tools/build-shim.sh" android \
+    || { echo "error: build-shim.sh failed" >&2; exit 1; }
+bash "$GNDRM_DIR/tools/build-android.sh" \
+    || { echo "error: build-android.sh failed" >&2; exit 1; }
 
 for f in "$GAMESCOPE_BIN" "$REAPER_BIN" "$SHIM_SO" "$DRM_SO" "$ICD_SO" "$LSFG_SO" "$DMTEST_BIN" "$WSITEST_BIN" "$XTREE_BIN" "$SCALE_BIN"; do
     [ -e "$f" ] || { echo "error: missing $f" >&2; exit 1; }
 done
-# An up-to-date build keeps the old file, so its age alone proves nothing. What
-# must not happen is a source newer than the artifact built from it: that is the
-# stale file, and the package would carry it.
-# Each artifact is checked against the sources it is built from — its own crate
-# plus the path dependencies it links, and the workspace manifest that sets the
-# profile — not the whole tree: a crate the artifact does not link is not a
-# source of staleness, and `libgamenative_drm.so` never compiles the C shim.
-check_fresh() {
-    local f="$1"; shift
-    local stale
-    stale="$(find "$@" -type f \
-        \( -name '*.rs' -o -name '*.c' -o -name '*.h' -o -name 'Cargo.toml' -o -name '*.map' \) \
-        -newer "$f" -print -quit)"
-    [ -z "$stale" ] || { echo "error: $f is older than $stale" >&2; exit 1; }
-}
-check_fresh "$DRM_SO" \
-    "$GNDRM_DIR/modules/gndrm-android" \
-    "$GNDRM_DIR/modules/gndrm-daemon" \
-    "$GNDRM_DIR/modules/gndrm-uapi" \
-    "$GNDRM_DIR/modules/gndrm-obf" \
-    "$GNDRM_DIR/modules/gndrm-obf-macros" \
-    "$GNDRM_DIR/Cargo.toml"
-check_fresh "$ICD_SO" \
-    "$GNDRM_DIR/icd_shim" \
-    "$GNDRM_DIR/modules/gndrm-lsfg" \
-    "$GNDRM_DIR/modules/gndrm-uapi" \
-    "$GNDRM_DIR/modules/gndrm-obf" \
-    "$GNDRM_DIR/modules/gndrm-obf-macros" \
-    "$GNDRM_DIR/Cargo.toml"
-check_fresh "$SHIM_SO" "$GNDRM_DIR/modules/gndrm-shim"
-check_fresh "$LSFG_SO" \
-    "$GNDRM_DIR/modules/gndrm-lsfg" \
-    "$GNDRM_DIR/modules/gndrm-obf" \
-    "$GNDRM_DIR/modules/gndrm-obf-macros" \
-    "$GNDRM_DIR/Cargo.toml"
+# An artifact older than FRESH_MARK was not written by the run above: either the
+# builders did nothing for it, or one of them failed on a tree whose artifact is
+# still the old one. Either way the payload must not carry it.
+for f in "$SHIM_SO" "$DRM_SO" "$ICD_SO" "$LSFG_SO"; do
+    [ "$f" -nt "$FRESH_MARK" ] \
+        || { echo "error: $f was not rebuilt by this run (stale, or the build failed)" >&2; exit 1; }
+done
+rm -f "$FRESH_MARK"
 
 # --- staging ----------------------------------------------------------------
 WORK="$(mktemp -d)"
