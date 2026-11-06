@@ -1,0 +1,371 @@
+A54 — the compositor stops waking when nothing is pending
+
+After every timer wakeup steamcompmgr re-armed the vblank timer
+unconditionally ("just in case the page-flip handler doesn't happen"), so the
+loop ran at the full grid rate for the whole session: epoll, X dispatch, the
+frame-callback walk over every window, presentation feedback, the mangoapp
+publish and the cursor checks, with only the composite skipped. On the
+Retroid Pocket 6 that was ~1500 wakeups and 6-9 % of a core on gamescope-xwm,
+whatever the frame count.
+
+The re-arm now runs on every pass of the loop, not only timer ones, and only
+while there is work for the next wakeup:
+
+- a repaint is pending (hasRepaint, a non-base-plane repaint, a forced
+  repaint, a forwarded VR overlay) or a focus is fading out;
+- a flip is in flight;
+- a window has a done commit whose frame callback (or the limiter's release
+  of it) has not gone out, or a done commit is held for a later vblank (FIFO,
+  a desired present time);
+- the cursor is shown and its auto-hide time has not passed (plus 100 ms, so
+  the wakeup that hides it is never the one that stops);
+- VRR is active or PipeWire is streaming (both keep the old behaviour).
+
+After vblank_idle_ticks (default 2) timer wakeups with none of that, the
+timer stays off until the next nudge. The page-flip handler still re-arms on
+every flip, so the wakeup after a flip always runs. vblank_idle_ticks 0
+restores the old always-armed behaviour.
+
+Everything that set hasRepaint from another thread without waking the loop
+now wakes it, or it would wait for an unrelated wakeup: cursor motion and
+buttons (wlserver_oncursorevent), the cursor hide (wlserver_mousehide), the
+set_look ConCommand and gamescope_control set_look / unset_look (through the
+new wlserver_request_repaint: set, and nudge once per painted frame), and
+screenshots (CScreenshotManager::TakeScreenshot). gamescope_private commands
+repaint through A53's force_repaint.
+
+A commit that becomes done while the compositor is idle takes its earliest
+present time from the next grid point, not the last wakeup's target, which
+is in the past after an idle stretch; the present margin (earliest present
+minus latch, unsigned) no longer wraps when the two cross.
+
+With vblank_debug on, idle/resume transitions are logged (rate-limited).
+
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index 6af0c7e..0770097 100644
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -8193,7 +8193,7 @@ bool handle_done_commit( steamcompmgr_win_t *w, xwayland_ctx_t *ctx, uint64_t co
+ 			gpuvis_trace_printf( "commit %lu done", w->commit_queue[ j ]->commitID );
+ 			w->commit_queue[ j ]->done = true;
+ 			w->commit_queue[ j ]->earliest_present_time = earliestPresentTime;
+-			w->commit_queue[ j ]->present_margin = earliestPresentTime - earliestLatchTime;
++			w->commit_queue[ j ]->present_margin = earliestPresentTime > earliestLatchTime ? earliestPresentTime - earliestLatchTime : 0;
+ 			bFoundWindow = true;
+ 
+ 			// Window just got a new available commit, determine if that's worth a repaint
+@@ -8280,12 +8280,24 @@ bool handle_done_commit( steamcompmgr_win_t *w, xwayland_ctx_t *ctx, uint64_t co
+ 	return false;
+ }
+ 
++// The vblank a commit that is done now can first be shown on. The last wakeup's target
++// is that vblank while the timer runs on every vblank; after the compositor has been
++// idle (A54) it is in the past, and a commit's earliest present time and present margin
++// (earliest present - latch, unsigned) must not be taken from it.
++static uint64_t steamcompmgr_next_refresh_time()
++{
++	uint64_t ulTarget = g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank;
++	if ( ulTarget < get_time_in_nanos() )
++		ulTarget = GetVBlankTimer().GetNextVBlank( 0 );
++	return ulTarget;
++}
++
+ // TODO: Merge these two functions.
+ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vblank_idx )
+ {
+ 	std::lock_guard<std::mutex> lock( ctx->doneCommits.listCommitsDoneLock );
+ 
+-	uint64_t next_refresh_time = g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank;
++	uint64_t next_refresh_time = steamcompmgr_next_refresh_time();
+ 
+ 	// commits that were not ready to be presented based on their display timing.
+ 	static std::vector< CommitDoneEntry_t > commits_before_their_time;
+@@ -8347,7 +8359,7 @@ void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
+ {
+ 	std::lock_guard<std::mutex> lock( g_steamcompmgr_xdg_done_commits.listCommitsDoneLock );
+ 
+-	uint64_t next_refresh_time = g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank;
++	uint64_t next_refresh_time = steamcompmgr_next_refresh_time();
+ 
+ 	// commits that were not ready to be presented based on their display timing.
+ 	static std::vector< CommitDoneEntry_t > commits_before_their_time;
+@@ -10097,6 +10109,133 @@ static void relay_mangoapp_control()
+ 		s_bMangoappLogging = !s_bMangoappLogging;
+ }
+ 
++namespace gamescope
++{
++	extern ConVar<bool> vblank_debug;
++}
++
++// The vblank timer re-armed itself after every wakeup, so the compositor thread woke at
++// the full grid rate for the whole session whether or not anything was pending: epoll,
++// X dispatch, the frame-callback walk over every window, presentation feedback and the
++// mangoapp publish, with only the composite skipped. It now stops after a few idle
++// wakeups and starts again on the next nudge (a commit, an X event, input, a flip).
++gamescope::ConVar<int> cv_vblank_idle_ticks( "vblank_idle_ticks", 2, "Vblank wakeups with nothing pending before the compositor stops waking on the vblank grid; it restarts on the next commit, input or command. 0 = wake on every vblank (old behaviour)." );
++
++// A window that has a done commit whose frame callback has not gone out yet: the
++// callback (or the limiter's release that lets it out) is only sent on a vblank wakeup.
++static bool steamcompmgr_any_window_owes_frame_done()
++{
++	gamescope_xwayland_server_t *server = NULL;
++	for ( size_t i = 0; ( server = wlserver_get_xwayland_server( i ) ); i++ )
++	{
++		for ( steamcompmgr_win_t *w = server->ctx->list; w; w = w->xwayland().next )
++		{
++			if ( w->receivedDoneCommit && w->current_surface() )
++				return true;
++		}
++
++		// Commits held for a later vblank (FIFO, or a desired present time ahead).
++		std::lock_guard<std::mutex> lock( server->ctx->doneCommits.listCommitsDoneLock );
++		if ( !server->ctx->doneCommits.listCommitsDone.empty() )
++			return true;
++	}
++
++	for ( const auto &xdg_win : g_steamcompmgr_xdg_wins )
++	{
++		if ( xdg_win->receivedDoneCommit && xdg_win->current_surface() )
++			return true;
++	}
++
++	std::lock_guard<std::mutex> lock( g_steamcompmgr_xdg_done_commits.listCommitsDoneLock );
++	return !g_steamcompmgr_xdg_done_commits.listCommitsDone.empty();
++}
++
++// Something the next vblank wakeup has to do: paint, finish a fade, send a frame
++// callback, see a flip retire, or hide an idle cursor when its time comes.
++static bool steamcompmgr_vblank_has_work( bool bVRR )
++{
++	if ( bVRR )
++		return true;
++
++	if ( hasRepaint || hasRepaintNonBasePlane || g_bForceRepaint || g_bUpdateForwardedVROverlays )
++		return true;
++
++	if ( is_any_focus_fading_out() )
++		return true;
++
++	if ( GetBackend()->GetCurrentConnector() &&
++		 GetBackend()->GetCurrentConnector()->PresentationFeedback().CurrentPresentsInFlight() != 0 )
++		return true;
++
++	if ( steamcompmgr_any_window_owes_frame_done() )
++		return true;
++
++	// A shown cursor auto-hides cursorHideTime after it last moved, checked on a wakeup;
++	// a little margin so the wakeup that hides it is never the one that stops.
++	if ( ShouldDrawCursor() && !wlserver.bCursorHidden && wlserver.bCursorHasImage )
++	{
++		static constexpr uint64_t k_ulCursorHideMargin = 100'000'000ul; // 100ms
++		if ( get_time_in_nanos() <= wlserver.ulLastMovedCursorTime + cursorHideTime + k_ulCursorHideMargin )
++			return true;
++	}
++
++#if HAVE_PIPEWIRE
++	if ( pipewire_is_streaming() )
++		return true;
++#endif
++
++	return false;
++}
++
++static void steamcompmgr_rearm_vblank( bool bIsVBlankFromTimer, bool bVRR )
++{
++	const int nIdleTicks = cv_vblank_idle_ticks;
++	if ( nIdleTicks <= 0 )
++	{
++		// Old behaviour: re-arm after every timer wakeup, just in case the page-flip
++		// handler never comes, so we never stop vblanking.
++		if ( bIsVBlankFromTimer )
++			GetVBlankTimer().ArmNextVBlank( true );
++		return;
++	}
++
++	static int s_nIdleTicks = 0;
++	static bool s_bIdle = false;
++
++	if ( steamcompmgr_vblank_has_work( bVRR ) )
++		s_nIdleTicks = 0;
++	else if ( bIsVBlankFromTimer )
++		s_nIdleTicks++;
++
++	const bool bIdle = s_nIdleTicks >= nIdleTicks;
++	if ( !bIdle )
++	{
++		// Pre-emptive: a no-op while armed, so a nudge never moves a wakeup already set.
++		GetVBlankTimer().ArmNextVBlank( true );
++	}
++
++	if ( bIdle != s_bIdle )
++	{
++		s_bIdle = bIdle;
++		if ( gamescope::vblank_debug )
++		{
++			static uint64_t s_ulLastLog = 0;
++			static uint32_t s_uSuppressed = 0;
++			const uint64_t ulNow = get_time_in_nanos();
++			if ( ulNow - s_ulLastLog >= 100'000'000ul )
++			{
++				xwm_log.infof( "vblank: %s (%u transitions not logged)", bIdle ? "idle" : "resume", s_uSuppressed );
++				s_ulLastLog = ulNow;
++				s_uSuppressed = 0;
++			}
++			else
++			{
++				s_uSuppressed++;
++			}
++		}
++	}
++}
++
+ void
+ steamcompmgr_main(int argc, char **argv)
+ {
+@@ -11018,16 +11157,6 @@ steamcompmgr_main(int argc, char **argv)
+ 		publish_mangoapp_connector_snapshots();
+ 		relay_mangoapp_control();
+ 
+-		if ( bIsVBlankFromTimer )
+-		{
+-			// Pre-emptively re-arm the vblank timer if it
+-			// isn't already re-armed.
+-			//
+-			// Juuust in case pageflip handler doesn't happen
+-			// so we don't stop vblanking forever.
+-			GetVBlankTimer().ArmNextVBlank( true );
+-		}
+-
+ #if HAVE_PIPEWIRE
+ 		// Drive on vblank, not the timer: under VRR the timer starves (page flips re-arm it).
+ 		if ( vblank && pipewire_is_streaming() )
+@@ -11056,6 +11185,12 @@ steamcompmgr_main(int argc, char **argv)
+ 			XFlush(root_ctx->dpy);
+ 		}
+ 
++		// Re-arm on every pass, not only timer ones, so the nudge that brought new work
++		// (a commit, an X event, input) arms the next grid point; with nothing pending
++		// for a few wakeups the timer stays off. A flip always re-arms it from the
++		// page-flip handler, so the wakeup after a flip still runs.
++		steamcompmgr_rearm_vblank( bIsVBlankFromTimer, bVRR );
++
+ 		vulkan_garbage_collect();
+ 
+ 		vblank = false;
+diff --git a/src/steamcompmgr_shared.hpp b/src/steamcompmgr_shared.hpp
+index 87cf86d..ffcff65 100644
+--- a/src/steamcompmgr_shared.hpp
++++ b/src/steamcompmgr_shared.hpp
+@@ -291,6 +291,7 @@ struct steamcompmgr_win_t {
+ };
+ 
+ extern std::atomic<bool> hasRepaint;
++void nudge_steamcompmgr( void );
+ 
+ namespace gamescope
+ {
+@@ -311,6 +312,8 @@ namespace gamescope
+ 			std::unique_lock lock{ m_ScreenshotInfoMutex };
+ 			m_ScreenshotInfo = std::move( info );
+ 			hasRepaint = true;
++			// The compositor may be asleep with nothing else pending (A54).
++			nudge_steamcompmgr();
+ 		}
+ 
+ 		void TakeScreenshot( bool bAVIF )
+diff --git a/src/wlserver.cpp b/src/wlserver.cpp
+index 8229dfb..da058e1 100644
+--- a/src/wlserver.cpp
++++ b/src/wlserver.cpp
+@@ -1286,7 +1286,7 @@ static gamescope::ConCommand cc_set_look("set_look", "Set a look for a specific
+ 		g_ColorMgmtLooks[ EOTF_Gamma22 ] = LoadCubeLut( arg1.c_str(), bRaisesBlackLevelFloor );
+ 		cv_overlay_unmultiplied_alpha = bRaisesBlackLevelFloor;
+ 		g_ColorMgmt.pending.externalDirtyCtr++;
+-		hasRepaint = true;
++		wlserver_request_repaint();
+ 	}
+ 	else if ( args.size() == 3 )
+ 	{
+@@ -1317,7 +1317,7 @@ static gamescope::ConCommand cc_set_look("set_look", "Set a look for a specific
+ 		}
+ 		cv_overlay_unmultiplied_alpha = bRaisesBlackLevelFloor;
+ 		g_ColorMgmt.pending.externalDirtyCtr++;
+-		hasRepaint = true;
++		wlserver_request_repaint();
+ 	}
+ 	else
+ 	{
+@@ -1325,7 +1325,7 @@ static gamescope::ConCommand cc_set_look("set_look", "Set a look for a specific
+ 		g_ColorMgmtLooks[ EOTF_Gamma22 ] = nullptr;
+ 		g_ColorMgmtLooks[ EOTF_PQ ] = nullptr;
+ 		g_ColorMgmt.pending.externalDirtyCtr++;
+-		hasRepaint = true;
++		wlserver_request_repaint();
+ 	}
+ });
+ 
+@@ -1374,7 +1374,7 @@ static void gamescope_control_set_look( struct wl_client *client, struct wl_reso
+ 	g_ColorMgmtLooks[ EOTF_Gamma22 ] = pG22LUT;
+ 	g_ColorMgmtLooks[ EOTF_PQ ] = pPQLUT;
+ 	g_ColorMgmt.pending.externalDirtyCtr++;
+-	hasRepaint = true;
++	wlserver_request_repaint();
+ }
+ 
+ static void gamescope_control_unset_look( struct wl_client *client, struct wl_resource *resource )
+@@ -1383,7 +1383,7 @@ static void gamescope_control_unset_look( struct wl_client *client, struct wl_re
+ 	g_ColorMgmtLooks[ EOTF_Gamma22 ] = nullptr;
+ 	g_ColorMgmtLooks[ EOTF_PQ ] = nullptr;
+ 	g_ColorMgmt.pending.externalDirtyCtr++;
+-	hasRepaint = true;
++	wlserver_request_repaint();
+ }
+ 
+ static void gamescope_control_handle_destroy( struct wl_client *client, struct wl_resource *resource )
+@@ -2932,6 +2932,15 @@ std::pair<int, int> wlserver_get_surface_extent( struct wlr_surface *pSurface )
+ 	return std::make_pair( pSurface->current.width, pSurface->current.height );
+ }
+ 
++// Ask the compositor for a repaint from outside its loop. The compositor stops waking on
++// the vblank grid when it has nothing pending (A54), so a repaint request must also wake
++// it. One nudge per painted frame: a request while one is outstanding is already covered.
++void wlserver_request_repaint()
++{
++	if ( !hasRepaint.exchange( true ) )
++		nudge_steamcompmgr();
++}
++
+ bool ShouldDrawCursor();
+ void wlserver_oncursorevent()
+ {
+@@ -2941,7 +2950,7 @@ void wlserver_oncursorevent()
+ 
+ 	if ( !wlserver.bCursorHidden && wlserver.bCursorHasImage )
+ 	{
+-		hasRepaint = true;
++		wlserver_request_repaint();
+ 	}
+ }
+ 
+@@ -3095,7 +3104,7 @@ void wlserver_mousehide()
+ 	if ( wlserver.bCursorHidden != true )
+ 	{
+ 		wlserver.bCursorHidden = true;
+-		hasRepaint = true;
++		wlserver_request_repaint();
+ 	}
+ }
+ 
+diff --git a/src/wlserver.hpp b/src/wlserver.hpp
+index 54452c1..885bab5 100644
+--- a/src/wlserver.hpp
++++ b/src/wlserver.hpp
+@@ -281,6 +281,7 @@ void wlserver_clear_dropdowns();
+ void wlserver_notify_dropdown( struct wlr_surface *wlrsurface, int nX, int nY );
+ void wlserver_mousemotion( double x, double y, uint32_t time );
+ void wlserver_mousehide();
++void wlserver_request_repaint();
+ void wlserver_mousewarp( double x, double y, uint32_t time, bool bSynthetic );
+ void wlserver_mousebutton( int button, bool press, uint32_t time );
+ void wlserver_mousewheel( double x, double y, uint32_t time );
