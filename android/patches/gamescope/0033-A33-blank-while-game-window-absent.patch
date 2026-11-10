@@ -25,11 +25,19 @@ like the desktop and the blind never lifted: audio over a black panel for the
 whole session. So the binding is stamped with the window's newest done commit
 id the first time the override is seen, and the startup blind holds until a
 done commit newer than that arrives, from whichever surface carries the game's
-frames; commit ids come from one counter, so "newer" is an id comparison. At
-exit the override is gone after having been bound, which the surface alone does
-say. A DXVK guest keeps the startup blank until its first presented frame (its
-desktop commit precedes the swapchain); a GL guest unblanks on its first
-XShmPutImage frame.
+frames; commit ids come from one counter, so "newer" is an id comparison. A
+DXVK guest keeps the startup blank until its first presented frame (its desktop
+commit precedes the swapchain); a GL guest unblanks on its first XShmPutImage
+frame.
+
+The same override can also go away and come back. The WSI shim binds the window
+at a swapchain's first commit and now tears that surface down when the guest
+destroys it (drm #64), so a device loss or a rebuild on a new surface leaves a
+gap with no binding, one that closes a frame or two later. Blanking on the
+absence alone would put a black frame on the panel for a gap that is about to
+close. So a gap only means "the desktop is all that is left" once the window has
+painted again from something that is not the game -- which is what wine's
+desktop does when the game's window goes away, and what a recreate does not do.
 
 The blind's one-shot log line states the stamped id and the newest done commit
 id at every transition, so the panel evidence can be tied to the comparison.
@@ -59,7 +67,7 @@ diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
 index 2dfdd7f..e9ec9a7 100644
 --- a/src/steamcompmgr.cpp
 +++ b/src/steamcompmgr.cpp
-@@ -3131,6 +3131,115 @@ gamescope::ConVar<bool> cv_paint_external_overlay_plane{ "paint_external_overlay
+@@ -3131,6 +3131,125 @@ gamescope::ConVar<bool> cv_paint_external_overlay_plane{ "paint_external_overlay
  gamescope::ConVar<bool> cv_paint_cursor_plane{ "paint_cursor_plane", true };
  gamescope::ConVar<bool> cv_paint_mura_plane{ "paint_mura_plane", true };
  
@@ -162,10 +170,20 @@ index 2dfdd7f..e9ec9a7 100644
 +	if ( !w->bSessionSawGameWindow )
 +		return false;
 +
-+	// The override is gone after having been bound: the desktop is all that is
-+	// left (the game's own exit path, ahead of the reaper).
++	// The override can go away and come back: a guest that destroys its Vulkan
++	// surface sends no binding until its next surface commits. Blanking on the
++	// absence alone would put a black frame on the panel for a gap that closes
++	// a frame later, so the gap only means "the desktop is all that is left"
++	// once the window has painted again from something that is not the game.
++	// That is what wine's desktop does when the game's window goes away; a
++	// recreate does not repaint it.
 +	if ( override_surface == nullptr )
-+		return true;
++	{
++		if ( w->ulSessionOverrideGapCommitID == 0 )
++			w->ulSessionOverrideGapCommitID = lastCommit ? lastCommit->commitID : 1;
++		return lastCommit != nullptr && lastCommit->commitID > w->ulSessionOverrideGapCommitID;
++	}
++	w->ulSessionOverrideGapCommitID = 0;
 +
 +	// Startup: nothing done yet, or nothing newer than the binding, is still
 +	// the desktop. The first newer commit, from either surface, is the game.
@@ -175,7 +193,7 @@ index 2dfdd7f..e9ec9a7 100644
  static void
  paint_all( global_focus_t *pFocus, bool async )
  {
-@@ -3170,6 +3279,39 @@ paint_all( global_focus_t *pFocus, bool async )
+@@ -3170,6 +3289,40 @@ paint_all( global_focus_t *pFocus, bool async )
  	// Decide the fit target once so the window planes and the cursor plane agree.
  	fit = override;
  
@@ -191,13 +209,14 @@ index 2dfdd7f..e9ec9a7 100644
 +	if ( ( bSessionBlank ? 1 : 0 ) != s_nLastBlankState )
 +	{
 +		s_nLastBlankState = bSessionBlank ? 1 : 0;
-+		s_SessionBlankLogScope.infof( "blank=%d reaper=%d window=%s override_bound=%d saw_game_window=%d bound_commit=%lu last_done_commit=%lu",
++		s_SessionBlankLogScope.infof( "blank=%d reaper=%d window=%s override_bound=%d saw_game_window=%d bound_commit=%lu gap_commit=%lu last_done_commit=%lu",
 +			s_nLastBlankState,
 +			g_bSessionEndBlank ? 1 : 0,
 +			w ? "present" : "none",
 +			( w && w->type == steamcompmgr_win_type_t::XWAYLAND && w->xwayland().surface.override_surface != nullptr ) ? 1 : 0,
 +			( w && w->type == steamcompmgr_win_type_t::XWAYLAND && w->bSessionSawGameWindow ) ? 1 : 0,
 +			( w && w->type == steamcompmgr_win_type_t::XWAYLAND ) ? (unsigned long)w->ulSessionOverrideBoundCommitID : 0ul,
++			( w && w->type == steamcompmgr_win_type_t::XWAYLAND ) ? (unsigned long)w->ulSessionOverrideGapCommitID : 0ul,
 +			(unsigned long)window_last_done_commit_id( w ) );
 +	}
 +
@@ -215,7 +234,7 @@ index 2dfdd7f..e9ec9a7 100644
  	if (++frameCounter == 300)
  	{
  		currentFrameRate = 300 * 1000.0f / (currentTime - lastSampledFrameTime);
-@@ -3201,7 +3343,11 @@ paint_all( global_focus_t *pFocus, bool async )
+@@ -3201,7 +3354,11 @@ paint_all( global_focus_t *pFocus, bool async )
  	// find the video underlay and put it up first in the scenegraph
  	if ( cv_paint_primary_plane )
  	{
@@ -228,7 +247,7 @@ index 2dfdd7f..e9ec9a7 100644
  		{
  			if ( w->isSteamStreamingClient == true )
  			{
-@@ -9464,6 +9610,10 @@ void LaunchNestedChildren( char **ppPrimaryChildArgv )
+@@ -9464,6 +9621,10 @@ void LaunchNestedChildren( char **ppPrimaryChildArgv )
  			gamescope::Process::WaitForChild( nPrimaryChildPid );
  			s_LaunchLogScope.infof( "Primary child shut down!" );
  
@@ -239,7 +258,7 @@ index 2dfdd7f..e9ec9a7 100644
  			if ( cv_shutdown_on_primary_child_death )
  				ShutdownGamescope();
  		});
-@@ -10057,6 +10207,14 @@ steamcompmgr_main(int argc, char **argv)
+@@ -10057,6 +10218,14 @@ steamcompmgr_main(int argc, char **argv)
  
  		if ( g_bRun == false )
  		{
@@ -258,7 +277,7 @@ diff --git a/src/steamcompmgr_shared.hpp b/src/steamcompmgr_shared.hpp
 index c344d10..c8d8da5 100644
 --- a/src/steamcompmgr_shared.hpp
 +++ b/src/steamcompmgr_shared.hpp
-@@ -161,6 +161,19 @@ struct steamcompmgr_win_t {
+@@ -161,6 +161,25 @@ struct steamcompmgr_win_t {
  	bool unlockedForFrameCallback = false;
  	bool receivedDoneCommit = false;
  
@@ -274,6 +293,12 @@ index c344d10..c8d8da5 100644
 +	// any commit newer than it, from either surface, is content that arrived
 +	// after. The blind at startup lifts on the first such commit.
 +	uint64_t ulSessionOverrideBoundCommitID = 0;
++
++	// gamenative: the commit id this window had when the override went away, so
++	// a gap can be told from an exit. Zero means the override is bound. A gap is
++	// only "the desktop is all that is left" once something has painted after
++	// it; a guest recreating its surface binds and commits before that happens.
++	uint64_t ulSessionOverrideGapCommitID = 0;
 +
  	std::shared_ptr<std::string> engineName;
  
