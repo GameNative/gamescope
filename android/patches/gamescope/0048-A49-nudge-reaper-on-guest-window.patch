@@ -18,11 +18,11 @@ guest rule.
 
 The reaper's pid is the primary child gamescope spawned through the watchdog.
 diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
-index adafff0..773e95c 100644
+index c624c5d..fce939a 100644
 --- a/src/steamcompmgr.cpp
 +++ b/src/steamcompmgr.cpp
-@@ -5960,6 +5960,14 @@ static void gn_activate_nested_app_window( xwayland_ctx_t *ctx, Window window )
- 	if ( hint.res_class ) XFree( hint.res_class );
+@@ -5955,6 +5955,14 @@ handle_desktop_window(steamcompmgr_win_t *w)
+ 	}
  }
  
 +// A window whose owner is a guest, or whose owner is unknown, is one the
@@ -36,7 +36,7 @@ index adafff0..773e95c 100644
  static void
  map_win(xwayland_ctx_t* ctx, Window id, unsigned long sequence)
  {
-@@ -5969,6 +5977,8 @@ map_win(xwayland_ctx_t* ctx, Window id, unsigned long sequence)
+@@ -5964,6 +5972,8 @@ map_win(xwayland_ctx_t* ctx, Window id, unsigned long sequence)
  		return;
  
  	w->xwayland().a.map_state = IsViewable;
@@ -45,7 +45,7 @@ index adafff0..773e95c 100644
  
  	/* This needs to be here or else we lose transparency messages */
  	XSelectInput(ctx->dpy, id, PropertyChangeMask | SubstructureNotifyMask |
-@@ -6090,6 +6100,8 @@ unmap_win(xwayland_ctx_t *ctx, Window id, bool fade)
+@@ -6085,6 +6095,8 @@ unmap_win(xwayland_ctx_t *ctx, Window id, bool fade)
  	if (!w)
  		return;
  	w->xwayland().a.map_state = IsUnmapped;
@@ -54,7 +54,7 @@ index adafff0..773e95c 100644
  
  	MakeFocusDirty();
  
-@@ -6211,6 +6223,7 @@ add_win(xwayland_ctx_t *ctx, Window id, Window prev, unsigned long sequence)
+@@ -6206,6 +6218,7 @@ add_win(xwayland_ctx_t *ctx, Window id, Window prev, unsigned long sequence)
  	{
  		new_win->pid = -1;
  	}
@@ -62,7 +62,7 @@ index adafff0..773e95c 100644
  
  	new_win->isOverlay = false;
  	new_win->isExternalOverlay = false;
-@@ -6459,7 +6472,11 @@ finish_destroy_win(xwayland_ctx_t *ctx, Window id, bool gone)
+@@ -6454,7 +6467,11 @@ finish_destroy_win(xwayland_ctx_t *ctx, Window id, bool gone)
  		if (w->xwayland().id == id)
  		{
  			if (gone)
@@ -74,7 +74,7 @@ index adafff0..773e95c 100644
  			
  			{
  				std::unique_lock lock( ctx->list_mutex );
-@@ -9620,6 +9637,7 @@ void LaunchNestedChildren( char **ppPrimaryChildArgv )
+@@ -9613,6 +9630,7 @@ void LaunchNestedChildren( char **ppPrimaryChildArgv )
  	if ( ppPrimaryChildArgv && *ppPrimaryChildArgv )
  	{
  		pid_t nPrimaryChildPid = gamescope::Process::SpawnProcessInWatchdog( ppPrimaryChildArgv, false );
@@ -83,7 +83,7 @@ index adafff0..773e95c 100644
  		std::thread waitThread([ nPrimaryChildPid ]()
  		{
 diff --git a/src/steamcompmgr_shared.hpp b/src/steamcompmgr_shared.hpp
-index 7d96cfa..87cf86d 100644
+index 23bd2d4..e5a80e5 100644
 --- a/src/steamcompmgr_shared.hpp
 +++ b/src/steamcompmgr_shared.hpp
 @@ -108,6 +108,9 @@ struct steamcompmgr_win_t {
