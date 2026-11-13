@@ -1,0 +1,221 @@
+A61 — while the guest presents on its override surface, its window's X commits wait
+
+Every game runs inside wine's virtual desktop, so the desktop window is the only
+top-level gamescope manages, and the WSI shim binds its override surface
+(gamescope_swapchain.override_window_content) to that window. Wine, for a Vulkan
+surface it considers offscreen -- Wine 11: a swapchain on a child HWND, always;
+Wine 9 without XComposite: once a child window appears -- copies the X client
+window into the top-level after every present. On the override route that X
+window never receives the guest's pixels, so the copy is black, damages the whole
+window, and Xwayland commits it on the main surface right after the shim's
+override commit. get_window_last_done_commit() is last-done-wins across both
+surfaces, so the panel shows whichever finished last: OMORI (Wine 11, D3D11 on a
+child window) was ~95 % black desktop frames, Portal 2 on Wine 9 ~83 %.
+
+update_wayland_res() already drops main-surface commits while an override is
+bound, but only those without damage (or every one, with
+surface_update_force_only_current_surface or after a non-sRGB colour space).
+Forcing that convar on OMORI gave 476 of 476 game frames full-screen at 60 fps,
+but as a default it would hide X content for good: a wine message box the game
+blocks on, which stops the game presenting, would never show.
+
+So the rule becomes time-based. A window records when its override surface last
+committed (frame generation commits arrive on the same surface and count). While
+that is within surface_update_override_hold_ms (default 500, 0 = off, env
+gamescope_surface_update_override_hold_ms), a damaged main-surface commit that
+the existing rule would have accepted is held instead: its presentation feedback
+is discarded and the commit is marked done for the client right away (frame
+callbacks keep flowing, exactly as the existing drop path), but the wlr_buffer
+lock is kept and the entry parked per window. A newer held commit releases the
+older one's lock, a main-surface commit that goes through (no override bound any
+more) releases it as stale, and destroying the window releases it.
+
+Once the override has been quiet for the hold time, check_new_xwayland_res()
+pushes the parked commit through update_wayland_res() before that round's new
+commits, so X content reappears without waiting for new X damage (Xwayland does
+not re-commit an unchanged window) and anything newer still lands after it. A
+parked commit whose surface is no longer the window's main surface, or one the
+existing current-surface rule would never show (non-sRGB, the force convar), is
+released instead of shown. When the override commits again its frames are
+newer and take over.
+
+500 ms: a game that is presenting delivers a frame every 8-50 ms, and a shader
+compile or streaming hitch rarely blocks for more than a few hundred; anything
+longer is the game not presenting (blocked on a dialog, paused, gone), and a
+dialog showing half a second late is fine. A session whose override never
+commits (a GL guest that bound a dormant Vulkan swapchain) never holds anything.
+
+One info line each, once per window: "override-hold: ... holds back
+main-surface commits" the first time a commit is held, and "override-hold: ...
+override quiet for N ms, showing the held main-surface commit" the first time a
+held one is shown.
+
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index 1b55fb7..3728530 100644
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -6515,6 +6515,8 @@ static void circulate_request( xwayland_ctx_t *ctx, XCirculateRequestEvent *circ
+ 	XCirculateSubwindows( ctx->dpy, circulateRequest->window, circulateRequest->place );
+ }
+ 
++static void release_held_main_commit( steamcompmgr_win_t *w );
++
+ static void
+ finish_destroy_win(xwayland_ctx_t *ctx, Window id, bool gone)
+ {
+@@ -6546,6 +6548,8 @@ finish_destroy_win(xwayland_ctx_t *ctx, Window id, bool gone)
+                 w->commit_queue.clear();
+ 			}
+ 
++			release_held_main_commit( w );
++
+ 			wlserver_lock();
+ 			wlserver_x11_surface_info_finish( &w->xwayland().surface );
+ 			wlserver_unlock();
+@@ -8549,7 +8553,40 @@ static TempUpscaleImage_t *GetTempUpscaleImage( global_focus_t *pFocus, uint32_t
+ 
+ gamescope::ConVar<bool> cv_surface_update_force_only_current_surface( "surface_update_force_only_current_surface", false, "Force updates to apply only to the current surface, ignoring commits for other surfaces." );
+ 
+-void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, ResListEntry_t& reslistentry)
++// gamenative A61: wine blits a Vulkan child window's X client window into the
++// top-level after every present. On the override route that X window never
++// gets the guest's pixels, so each blit is a damaged, black main-surface commit
++// that lands right after the guest's override commit and wins the
++// last-done-wins race. While the override has committed within this window,
++// main-surface commits are held back; the newest one held is shown once the
++// override has been quiet this long, so X content (a dialog the game blocks
++// on, the desktop after a crash) still appears without new X damage.
++gamescope::ConVar<int> cv_surface_update_override_hold_ms( "surface_update_override_hold_ms", 500, "While a window's override surface has committed within this many ms, hold back commits to its main surface; the newest held one is shown once the override goes quiet. 0 disables." );
++
++// The newest main-surface commit held back per window. Owns the entry's
++// wlr_buffer lock; presentation feedback is already discarded.
++static std::unordered_map<steamcompmgr_win_t *, ResListEntry_t> s_HeldMainCommits;
++
++static void release_held_main_commit( steamcompmgr_win_t *w )
++{
++	auto it = s_HeldMainCommits.find( w );
++	if ( it == s_HeldMainCommits.end() )
++		return;
++
++	wlserver_lock();
++	wlr_buffer_unlock( it->second.buf );
++	wlserver_unlock();
++	s_HeldMainCommits.erase( it );
++}
++
++static bool override_recently_committed( steamcompmgr_win_t *w, uint64_t now )
++{
++	int nHoldMs = cv_surface_update_override_hold_ms;
++	return nHoldMs > 0 && w->ulLastOverrideCommitTime != 0 &&
++		now - w->ulLastOverrideCommitTime < uint64_t( nHoldMs ) * 1'000'000ull;
++}
++
++void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, ResListEntry_t& reslistentry, bool bReleasingHeld = false)
+ {
+ 	struct wlr_buffer *buf = reslistentry.buf;
+ 
+@@ -8596,7 +8633,7 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
+ 		xwm_log.debugf( "Got commit not for current surface." );
+ 	}
+ 
+-	if ( bOnlyCurrentSurface && !for_current_surface )
++	if ( bOnlyCurrentSurface && !for_current_surface && !bReleasingHeld )
+ 	{
+ 		wlserver_lock();
+ 		wlr_buffer_unlock( buf );
+@@ -8605,6 +8642,36 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
+ 		return;
+ 	}
+ 
++	if ( w->override_surface() && reslistentry.surf == w->override_surface() )
++	{
++		w->ulLastOverrideCommitTime = get_time_in_nanos();
++	}
++	else if ( !bReleasingHeld && reslistentry.surf == w->main_surface() )
++	{
++		if ( !for_current_surface && override_recently_committed( w, get_time_in_nanos() ) )
++		{
++			// Keep the buffer locked, finish the commit for the client now.
++			wlserver_lock();
++			if ( !reslistentry.presentation_feedbacks.empty() )
++				wlserver_presentation_feedback_discard( reslistentry.surf, reslistentry.presentation_feedbacks );
++			wlserver_unlock();
++			release_held_main_commit( w );
++			s_HeldMainCommits.emplace( w, std::move( reslistentry ) );
++			w->receivedDoneCommit = true;
++
++			if ( !w->bLoggedOverrideHold )
++			{
++				w->bLoggedOverrideHold = true;
++				xwm_log.infof( "override-hold: window 0x%lx holds back main-surface commits while its override surface presents",
++					w->type == steamcompmgr_win_type_t::XWAYLAND ? (unsigned long)w->xwayland().id : 0ul );
++			}
++			return;
++		}
++
++		// A newer main-surface commit goes through, so the held one is stale.
++		release_held_main_commit( w );
++	}
++
+ 	bool already_exists = false;
+ 	for ( const auto& existing_commit : w->commit_queue )
+ 	{
+@@ -8819,6 +8886,40 @@ void check_new_xwayland_res(xwayland_ctx_t *ctx)
+ 	// wayland_commit_queue lock because that causes deadlocks.
+ 	std::vector<ResListEntry_t>& tmp_queue = ctx->xwayland_server->retrieve_commits();
+ 
++	// A61: a held main-surface commit whose override has gone quiet is shown
++	// now, before this round's commits, so anything newer still lands after it.
++	if ( !s_HeldMainCommits.empty() )
++	{
++		uint64_t now = get_time_in_nanos();
++		for ( steamcompmgr_win_t *w = ctx->list; w; w = w->xwayland().next )
++		{
++			auto it = s_HeldMainCommits.find( w );
++			if ( it == s_HeldMainCommits.end() || override_recently_committed( w, now ) )
++				continue;
++
++			ResListEntry_t entry = std::move( it->second );
++			s_HeldMainCommits.erase( it );
++
++			// Gone, or a commit the existing current-surface rule never shows.
++			if ( entry.surf != w->main_surface() ||
++				 ( w->override_surface() && ( w->bHasHadNonSRGBColorSpace || cv_surface_update_force_only_current_surface ) ) )
++			{
++				wlserver_lock();
++				wlr_buffer_unlock( entry.buf );
++				wlserver_unlock();
++				continue;
++			}
++
++			if ( !w->bLoggedOverrideHoldRelease )
++			{
++				w->bLoggedOverrideHoldRelease = true;
++				xwm_log.infof( "override-hold: window 0x%lx override quiet for %d ms, showing the held main-surface commit",
++					(unsigned long)w->xwayland().id, (int)cv_surface_update_override_hold_ms );
++			}
++			update_wayland_res( &ctx->doneCommits, w, entry, true );
++		}
++	}
++
+ 	for ( uint32_t i = 0; i < tmp_queue.size(); i++ )
+ 	{
+ 		steamcompmgr_win_t	*w = find_win( ctx, tmp_queue[ i ].surf );
+diff --git a/src/steamcompmgr_shared.hpp b/src/steamcompmgr_shared.hpp
+index 9b77ce4..91ee3e4 100644
+--- a/src/steamcompmgr_shared.hpp
++++ b/src/steamcompmgr_shared.hpp
+@@ -183,6 +183,13 @@ struct steamcompmgr_win_t {
+ 	// it; a guest recreating its surface binds and commits before that happens.
+ 	uint64_t ulSessionOverrideGapCommitID = 0;
+ 
++	// gamenative A61: when the override surface last committed. While that is
++	// recent the guest is presenting, and the window's own (Xwayland) commits
++	// are held back instead of racing the guest's frames; see update_wayland_res.
++	uint64_t ulLastOverrideCommitTime = 0;
++	bool bLoggedOverrideHold = false;
++	bool bLoggedOverrideHoldRelease = false;
++
+ 	std::shared_ptr<std::string> engineName;
+ 
+ 	std::vector< gamescope::Rc<commit_t> > commit_queue;

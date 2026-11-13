@@ -110,3 +110,28 @@ ELF TLS; an emutls libGL fails to dlopen against it). Building a commit from
 before Pipetto's "disable dri options query" hack (the shipped c1567e9609 is
 one) also needs `idep_xmlconfig` on the `libgl-xlib` meson target, since zink's
 driconf calls then need the stub; the branch head does not.
+
+### The guest's frames and the desktop window's own commits
+
+Every game runs inside Wine's virtual desktop (`explorer /desktop=shell,WxH`), so
+the desktop is the only top-level window gamescope manages. The gamenative-drm
+Vulkan ICD shim presents the guest's swapchain images straight to gamescope on an
+override surface (`gamescope_swapchain.override_window_content`) bound to that
+window; the window's own surface is Xwayland's and carries what X drew there.
+The compositor shows whichever of the two finished its commit last.
+
+Wine, for a Vulkan surface it treats as offscreen (Wine 11: a swapchain on a
+child window, always; Wine 9 without XComposite: once a child window exists),
+copies the X client window into the top-level after every present. On this route
+that X window never gets the guest's pixels, so each copy is a black, damaged
+commit that lands just after the guest's frame (OMORI ~95 % black frames, Portal
+2 on Wine 9 ~83 %). A61 makes the override win while it is live: while the
+override surface has committed within `surface_update_override_hold_ms` (default
+500 ms, `0` turns it off; environment form
+`gamescope_surface_update_override_hold_ms=<ms>`), commits on the window's own
+surface are held back, the newest one kept. Once the override has been quiet that
+long, the held commit is shown without waiting for new X damage, so a Wine
+dialog the game blocks on, or the desktop after the game is gone, still appears.
+A guest whose override never commits (a GL game with a dormant Vulkan swapchain,
+see A33) never has anything held. `override-hold:` lines in the gamescope log say
+when a window first held a commit and first showed a held one.
