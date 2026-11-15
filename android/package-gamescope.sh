@@ -77,6 +77,7 @@ DMTEST_BIN="$GNDRM_REL/gn-dmabuf-test"
 WSITEST_BIN="$GNDRM_REL/gn-wsi-test"
 XTREE_BIN="$GNDRM_REL/gn-xtree-probe"
 SCALE_BIN="$GNDRM_REL/gn-scaling-mode"
+ACTIVATE_EXE="$GNDRM_DIR/target/win32/gn-activate.exe"
 LSFG_SO="$GNDRM_REL/liblsfg_engine.so"
 
 # --- prerequisites ----------------------------------------------------------
@@ -107,8 +108,13 @@ bash "$GNDRM_DIR/tools/build-shim.sh" android \
     || { echo "error: build-shim.sh failed" >&2; exit 1; }
 bash "$GNDRM_DIR/tools/build-android.sh" \
     || { echo "error: build-android.sh failed" >&2; exit 1; }
+# The Win32 helper is a separate toolchain (mingw, not the NDK), so it is its own
+# step rather than part of build-android.sh. It has to be rebuilt here for the
+# same reason as everything else: the payload ships the file this run produced.
+bash "$GNDRM_DIR/tools/build-gn-activate.sh" \
+    || { echo "error: build-gn-activate.sh failed" >&2; exit 1; }
 
-for f in "$GAMESCOPE_BIN" "$REAPER_BIN" "$SHIM_SO" "$DRM_SO" "$ICD_SO" "$LSFG_SO" "$DMTEST_BIN" "$WSITEST_BIN" "$XTREE_BIN" "$SCALE_BIN"; do
+for f in "$GAMESCOPE_BIN" "$REAPER_BIN" "$SHIM_SO" "$DRM_SO" "$ICD_SO" "$LSFG_SO" "$DMTEST_BIN" "$WSITEST_BIN" "$XTREE_BIN" "$SCALE_BIN" "$ACTIVATE_EXE"; do
     [ -e "$f" ] || { echo "error: missing $f" >&2; exit 1; }
 done
 # An artifact older than FRESH_MARK was not written by the run above: either the
@@ -344,6 +350,13 @@ cp "$XTREE_BIN" "$STAGE/bin/gn-xtree-probe"
 # mode change applies without a relaunch. Spawned by the app per committed
 # selection; links the payload's libxcb.
 cp "$SCALE_BIN" "$STAGE/bin/gn-scaling-mode"
+# bin/gn-activate.exe: a Win32 helper, staged into the container prefix by the
+# app and run inside it, which is the only place WM_ACTIVATE can be raised from.
+# It is not a Linux binary like the clients above, so it is NOT passed to
+# resolve_libs -- mingw's PE has no bionic NEEDEDs. It ships here rather than in
+# the app's assets because it only exists for gamescope sessions, and because the
+# payload VERSION then invalidates the app's staged copy for free.
+cp "$ACTIVATE_EXE" "$STAGE/bin/gn-activate.exe"
 resolve_libs "$STAGE/bin/gn-dmabuf-test" "$STAGE/bin/gn-wsi-test" "$STAGE/bin/gn-xtree-probe" "$STAGE/bin/gn-scaling-mode"
 
 # --- data files --------------------------------------------------------------
