@@ -238,7 +238,7 @@ index 7333229..d21171d 100644
  #include <sys/wait.h>
  #if defined(__linux__)
  #if HAVE_LIBCAP
-@@ -142,6 +146,256 @@ namespace gamescope::Process
+@@ -142,6 +146,268 @@ namespace gamescope::Process
          return false;
      }
  
@@ -304,6 +304,16 @@ index 7333229..d21171d 100644
 +        return {};
 +    }
 +
++    // Our own helper, which is a guest-shaped process by every test here: a wine
++    // process naming a .exe outside drive_c/windows. It is session infrastructure,
++    // not a guest of the session, and it outlives the title on purpose (it
++    // watches for later windows before idling out), so counting it would hold the
++    // session open after the game exits -- the same mistake as counting the shell.
++    static bool IsSessionHelper( const char *pszBase )
++    {
++        return strcasecmp( pszBase, "gn-activate.exe" ) == 0;
++    }
++
 +    static bool IsGuestImage( pid_t nPid, const char *pszValue )
 +    {
 +        if ( !*pszValue || IsUnderWindowsDirectory( pszValue ) )
@@ -312,6 +322,8 @@ index 7333229..d21171d 100644
 +        const char *pszBase = Basename( pszValue );
 +        size_t nLength = strlen( pszBase );
 +        if ( nLength <= 4 || strcasecmp( pszBase + nLength - 4, ".exe" ) != 0 )
++            return false;
++        if ( IsSessionHelper( pszBase ) )
 +            return false;
 +
 +        // Started by path: the path says where the image lives. Started by
