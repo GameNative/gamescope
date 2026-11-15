@@ -42,6 +42,14 @@ desktop does when the game's window goes away, and what a recreate does not do.
 The blind's one-shot log line states the stamped id and the newest done commit
 id at every transition, so the panel evidence can be tied to the comparison.
 
+GAMENATIVE_ROOT_DESKTOP=1 (wine's root desktop, read in A26) switches the
+blank off: there is no virtual desktop window to hide, so neither the
+startup/absence blind nor the reaper-end blank is raised, no per-window
+state is stamped and no extra frame is painted at shutdown. The log line
+states root_desktop= so a session shows which mode it ran in. The blank
+texture's output-size extent (rendervulkan.cpp) is not switched; it is not a
+blank by itself. Unset or any other value keeps all of the above.
+
 diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
 index 54e4efc..f3f914a 100644
 --- a/src/rendervulkan.cpp
@@ -64,10 +72,10 @@ index 54e4efc..f3f914a 100644
  	return vulkan_create_flat_texture( width, height, 0, 0, 0, 0 );
  }
 diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
-index 2dfdd7f..e9ec9a7 100644
+index ee14377..65307ae 100644
 --- a/src/steamcompmgr.cpp
 +++ b/src/steamcompmgr.cpp
-@@ -3131,6 +3131,125 @@ gamescope::ConVar<bool> cv_paint_external_overlay_plane{ "paint_external_overlay
+@@ -3142,6 +3142,125 @@ gamescope::ConVar<bool> cv_paint_external_overlay_plane{ "paint_external_overlay
  gamescope::ConVar<bool> cv_paint_cursor_plane{ "paint_cursor_plane", true };
  gamescope::ConVar<bool> cv_paint_mura_plane{ "paint_mura_plane", true };
  
@@ -193,7 +201,7 @@ index 2dfdd7f..e9ec9a7 100644
  static void
  paint_all( global_focus_t *pFocus, bool async )
  {
-@@ -3170,6 +3289,40 @@ paint_all( global_focus_t *pFocus, bool async )
+@@ -3181,6 +3300,42 @@ paint_all( global_focus_t *pFocus, bool async )
  	// Decide the fit target once so the window planes and the cursor plane agree.
  	fit = override;
  
@@ -201,16 +209,18 @@ index 2dfdd7f..e9ec9a7 100644
 +	// that is left to composite, so the frame is a black plane in place of
 +	// every window. This round the same blind is raised earlier -- whenever the
 +	// game's window is gone while the session is still alive -- so the desktop
-+	// blue is not what the panel is left holding at either transition.
-+	bool bSessionBlank = g_bSessionEndBlank || session_game_window_absent( w );
++	// blue is not what the panel is left holding at either transition. On
++	// wine's root desktop there is no desktop window to hide: never blank.
++	bool bSessionBlank = !g_bGameNativeRootDesktop && ( g_bSessionEndBlank || session_game_window_absent( w ) );
 +
 +	// One-shot stated outcome, raised on every change of the blind's state.
 +	static int s_nLastBlankState = -1;
 +	if ( ( bSessionBlank ? 1 : 0 ) != s_nLastBlankState )
 +	{
 +		s_nLastBlankState = bSessionBlank ? 1 : 0;
-+		s_SessionBlankLogScope.infof( "blank=%d reaper=%d window=%s override_bound=%d saw_game_window=%d bound_commit=%lu gap_commit=%lu last_done_commit=%lu",
++		s_SessionBlankLogScope.infof( "blank=%d root_desktop=%d reaper=%d window=%s override_bound=%d saw_game_window=%d bound_commit=%lu gap_commit=%lu last_done_commit=%lu",
 +			s_nLastBlankState,
++			g_bGameNativeRootDesktop ? 1 : 0,
 +			g_bSessionEndBlank ? 1 : 0,
 +			w ? "present" : "none",
 +			( w && w->type == steamcompmgr_win_type_t::XWAYLAND && w->xwayland().surface.override_surface != nullptr ) ? 1 : 0,
@@ -234,7 +244,7 @@ index 2dfdd7f..e9ec9a7 100644
  	if (++frameCounter == 300)
  	{
  		currentFrameRate = 300 * 1000.0f / (currentTime - lastSampledFrameTime);
-@@ -3201,7 +3354,11 @@ paint_all( global_focus_t *pFocus, bool async )
+@@ -3212,7 +3367,11 @@ paint_all( global_focus_t *pFocus, bool async )
  	// find the video underlay and put it up first in the scenegraph
  	if ( cv_paint_primary_plane )
  	{
@@ -247,18 +257,20 @@ index 2dfdd7f..e9ec9a7 100644
  		{
  			if ( w->isSteamStreamingClient == true )
  			{
-@@ -9464,6 +9621,10 @@ void LaunchNestedChildren( char **ppPrimaryChildArgv )
+@@ -9475,6 +9634,12 @@ void LaunchNestedChildren( char **ppPrimaryChildArgv )
  			gamescope::Process::WaitForChild( nPrimaryChildPid );
  			s_LaunchLogScope.infof( "Primary child shut down!" );
  
 +			// The reaper has ended the session: the compositor's only remaining
-+			// client is wine's desktop window, so hold the output black.
-+			g_bSessionEndBlank = true;
++			// client is wine's desktop window, so hold the output black. On
++			// wine's root desktop there is none, and no blank is raised.
++			if ( !g_bGameNativeRootDesktop )
++				g_bSessionEndBlank = true;
 +
  			if ( cv_shutdown_on_primary_child_death )
  				ShutdownGamescope();
  		});
-@@ -10057,6 +10218,14 @@ steamcompmgr_main(int argc, char **argv)
+@@ -10068,6 +10233,14 @@ steamcompmgr_main(int argc, char **argv)
  
  		if ( g_bRun == false )
  		{
@@ -274,7 +286,7 @@ index 2dfdd7f..e9ec9a7 100644
  		}
  
 diff --git a/src/steamcompmgr_shared.hpp b/src/steamcompmgr_shared.hpp
-index c344d10..c8d8da5 100644
+index c344d10..23bd2d4 100644
 --- a/src/steamcompmgr_shared.hpp
 +++ b/src/steamcompmgr_shared.hpp
 @@ -161,6 +161,25 @@ struct steamcompmgr_win_t {

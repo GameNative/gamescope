@@ -55,6 +55,23 @@ fixed member mtimes, `--sort=name` order, `uid/gid 0` — so identical inputs
 rebuild to byte-identical `.tzst` bytes. The dated filename is a name only; it
 does not enter the archive.
 
+## Wine's root desktop: `GAMENATIVE_ROOT_DESKTOP`
+
+The app launches a game either inside Wine's virtual desktop
+(`explorer /desktop=shell,WxH`, one top-level X window with the game nested in
+it) or on Wine's root desktop (`explorer /desktop=root`, each game window a
+managed top-level X window, as upstream gamescope expects). Three patches exist
+only for the virtual desktop. The app sets `GAMENATIVE_ROOT_DESKTOP` in
+gamescope's environment, and gamescope reads it once at startup:
+
+| value | effect |
+|---|---|
+| unset, `0` or anything else | virtual desktop: A26, A33 and A48 act as described in their headers |
+| `1` | root desktop: A26 leaves upstream's app id (the X window id), A33 never blanks, A48 never sends its bring-to-front request |
+
+Under `1` the uniform app id is gone, so a `gamescope_control` performance-stats
+request for that id matches no window.
+
 ## Related projects
 
 This tree is only the display server. The pieces it stages but does not build:

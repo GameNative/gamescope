@@ -23,8 +23,13 @@ Verified on the Odin 3: sent at map time the game goes live (pad, keyboard,
 continuous XInput polling); sent after the game has hidden its window it
 does nothing, so the map event is the only usable trigger.
 
+GAMENATIVE_ROOT_DESKTOP=1 (wine's root desktop, read in A26) switches the
+request off: each game window is then a managed top-level window that the
+compositor maps and focuses itself, so no nested map sends anything. Unset
+or any other value keeps the request.
+
 diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
-index 5f4f19c..adafff0 100644
+index 65307ae..726f2ef 100644
 --- a/src/steamcompmgr.cpp
 +++ b/src/steamcompmgr.cpp
 @@ -68,6 +68,7 @@
@@ -35,7 +40,7 @@ index 5f4f19c..adafff0 100644
  #include <sys/resource.h>
  #include <time.h>
  #include <unistd.h>
-@@ -5919,6 +5920,46 @@ handle_desktop_window(steamcompmgr_win_t *w)
+@@ -5968,6 +5969,49 @@ handle_desktop_window(steamcompmgr_win_t *w)
  	}
  }
  
@@ -64,6 +69,9 @@ index 5f4f19c..adafff0 100644
 +
 +static void gn_activate_nested_app_window( xwayland_ctx_t *ctx, Window window )
 +{
++	// Wine's root desktop maps game windows as managed top-level windows.
++	if ( g_bGameNativeRootDesktop )
++		return;
 +	XClassHint hint = {};
 +	if ( !XGetClassHint( ctx->dpy, window, &hint ) )
 +		return;
@@ -82,7 +90,7 @@ index 5f4f19c..adafff0 100644
  static void
  map_win(xwayland_ctx_t* ctx, Window id, unsigned long sequence)
  {
-@@ -8788,6 +8829,8 @@ void xwayland_ctx_t::Dispatch()
+@@ -8837,6 +8881,8 @@ void xwayland_ctx_t::Dispatch()
  
  				if (w && w->xwayland().id == ev.xmap.window)
  					map_win(ctx, ev.xmap.window, ev.xmap.serial);
