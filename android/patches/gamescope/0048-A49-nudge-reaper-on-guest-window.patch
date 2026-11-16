@@ -21,8 +21,7 @@ diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
 index adafff0..773e95c 100644
 --- a/src/steamcompmgr.cpp
 +++ b/src/steamcompmgr.cpp
-@@ -5960,6 +5960,14 @@ static void gn_activate_nested_app_window( xwayland_ctx_t *ctx, Window window )
- 	if ( hint.res_class ) XFree( hint.res_class );
+@@ -5945,6 +5945,14 @@ map_win(xwayland_ctx_t* ctx, Window id, unsigned long sequence)
  }
  
 +// A window whose owner is a guest, or whose owner is unknown, is one the
@@ -36,6 +35,7 @@ index adafff0..773e95c 100644
  static void
  map_win(xwayland_ctx_t* ctx, Window id, unsigned long sequence)
  {
+ 	steamcompmgr_win_t		*w = find_win(ctx, id);
 @@ -5969,6 +5977,8 @@ map_win(xwayland_ctx_t* ctx, Window id, unsigned long sequence)
  		return;
  

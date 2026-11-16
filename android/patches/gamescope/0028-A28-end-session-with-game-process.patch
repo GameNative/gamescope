@@ -238,7 +238,7 @@ index 7333229..d21171d 100644
  #include <sys/wait.h>
  #if defined(__linux__)
  #if HAVE_LIBCAP
-@@ -142,6 +146,256 @@ namespace gamescope::Process
+@@ -142,6 +146,286 @@
          return false;
      }
  
@@ -304,6 +304,34 @@ index 7333229..d21171d 100644
 +        return {};
 +    }
 +
++    // Processes that are part of the session rather than content in it. They pass
++    // every other test here -- a wine process naming a .exe outside
++    // drive_c/windows -- and counting them would hold the session open after the
++    // game exits, which is exactly what a launcher flow produces: the launch line
++    // is `winhandler.exe "steam.exe"`, so Steam and its helpers outlive the title
++    // and "no guest image left" only becomes true when Steam quits.
++    //
++    // gn-activate.exe is ours: it sets the foreground window, then watches for
++    // later windows before idling out, so it outlives the title by design.
++    static bool IsSessionInfrastructure( const char *pszBase )
++    {
++        static const char *const ppszShells[] =
++        {
++            "gn-activate.exe",
++            "winhandler.exe",
++            "steam.exe",
++            "steamwebhelper.exe",
++            "steamhost32.exe",
++            "eastub.exe",
++        };
++        for ( size_t i = 0; i < sizeof( ppszShells ) / sizeof( ppszShells[ 0 ] ); i++ )
++        {
++            if ( strcasecmp( pszBase, ppszShells[ i ] ) == 0 )
++                return true;
++        }
++        return false;
++    }
++
 +    static bool IsGuestImage( pid_t nPid, const char *pszValue )
 +    {
 +        if ( !*pszValue || IsUnderWindowsDirectory( pszValue ) )
@@ -312,6 +340,8 @@ index 7333229..d21171d 100644
 +        const char *pszBase = Basename( pszValue );
 +        size_t nLength = strlen( pszBase );
 +        if ( nLength <= 4 || strcasecmp( pszBase + nLength - 4, ".exe" ) != 0 )
++            return false;
++        if ( IsSessionInfrastructure( pszBase ) )
 +            return false;
 +
 +        // Started by path: the path says where the image lives. Started by
@@ -495,8 +525,6 @@ index 7333229..d21171d 100644
      void KillProcessTree( std::vector<pid_t> nPids, int nSignal )
      {
          for ( pid_t nPid : nPids )
-diff --git a/src/Utils/Process.h b/src/Utils/Process.h
-index 2208dae..1828bce 100644
 --- a/src/Utils/Process.h
 +++ b/src/Utils/Process.h
 @@ -16,6 +16,34 @@ namespace gamescope::Process
