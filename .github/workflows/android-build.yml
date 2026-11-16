@@ -111,11 +111,15 @@ jobs:
 
       # wlroots' xwayland dependency resolves from xwayland.pc, which the
       # Xwayland build installs.
+      #
+      # Pinned to a branch, not a moving one: the payload ships this Xwayland, so
+      # a CI build has to be the same Xwayland the local builds and the device
+      # runs are. `gamenative` would silently adopt whatever lands there next.
       - name: Check out Xwayland
         uses: actions/checkout@v4
         with:
           repository: GameNative/xserver
-          ref: gamenative
+          ref: gamenative-xwayland-24.1.15
           path: xserver
 
       - name: Build Xwayland
