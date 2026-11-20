@@ -11,3 +11,5 @@ android/cross/aarch64-linux-android.txt
 
 # Work dir of android/mesa-glamor/build-mesa-glamor.sh (tarball, source, stage).
 /build-android-mesa-glamor/
+# Work dir of android/mesa-gl/build-mesa-gl.sh (same shape, the guest GL stack).
+/build-android-mesa-gl/
