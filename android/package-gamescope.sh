@@ -341,9 +341,32 @@ for n in "${GL_EGL[@]}"; do
     ln -sfn "$n" "$STAGE/lib/gl/${n%.*}"
 done
 cp -L "$GN_MESA_GL_STAGE/lib/gbm/dri_gbm.so" "$STAGE/lib/gl/gbm/dri_gbm.so"
+# The server's glamor runs on GLES2, not GL: Mesa's EGL refuses EGL_OPENGL_API
+# under DETECT_OS_ANDROID ("OpenGL is not a valid/supported API on Android",
+# src/egl/main/eglcurrent.h), so eglBindAPI(EGL_OPENGL_API) returns
+# EGL_BAD_PARAMETER and the display advertises only EGL_OPENGL_ES. That leaves
+# the GLES2 path as the only one Xwayland can take -- and it needs a real
+# libGLESv2. The one in lib/ is libglvnd's dispatch stub from the termux prefix:
+# it resolves entry points through libGLdispatch, whose vendor is registered by a
+# glvnd EGL vendor library, and this stage is glvnd=disabled, so every GLES call
+# came back NULL and glamor stopped at "glGetString() returned NULL, your GL is
+# broken". This copy is the same Mesa, monolithic, so it needs no vendor.
+# Measured after shipping it: glGetString reports "zink Vulkan 1.4(Turnip Adreno
+# (TM) 740)", glamor initialises on GLES2, DRI3 appears, and a GL guest (GLX +
+# kopper libGL above) reaches the shim -- the first GL title ever to create a
+# swapchain through it.
+GL_GLES=(libGLESv2.so.2)
+for n in "${GL_GLES[@]}"; do
+    src="$(ls "$GN_MESA_GL_STAGE/lib/$n".*.* 2>/dev/null | head -1)"
+    [ -f "$src" ] || { echo "error: no $n.*.* in $GN_MESA_GL_STAGE/lib" >&2; exit 1; }
+    cp -L "$src" "$STAGE/lib/gl/$n.0.0"
+    ln -sfn "$n.0.0" "$STAGE/lib/gl/$n"
+    ln -sfn "$n" "$STAGE/lib/gl/${n%.*}"
+done
 resolve_libs "$STAGE/lib/gl/libGL.so.1.2.0" "$STAGE/lib/gl/${GL_GALLIUM[0]##*/}" \
              "$STAGE/lib/gl/dri/libdril_dri.so" "$STAGE/lib/gl/libEGL.so.1.0.0" \
-             "$STAGE/lib/gl/libgbm.so.1.0.0" "$STAGE/lib/gl/gbm/dri_gbm.so"
+             "$STAGE/lib/gl/libgbm.so.1.0.0" "$STAGE/lib/gl/gbm/dri_gbm.so" \
+             "$STAGE/lib/gl/libGLESv2.so.2.0.0"
 
 # glvnd EGL vendor json (library_path: libEGL_mesa.so.0, resolved from
 # LD_LIBRARY_PATH = filesDir/gamescope/lib and .../lib/gl on device).

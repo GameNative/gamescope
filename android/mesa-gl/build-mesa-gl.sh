@@ -108,17 +108,22 @@ EOF
 # glvnd=disabled  one monolithic libGL.so.1.2.0, the shape the container image
 #                 already has, so nothing has to learn about libGLX_mesa
 # vulkan-drivers= zink dlopens the system ICD at runtime
-# egl=gbm=enabled measured, not assumed: with the glamor stage's EGL the X server
-#                 never got glamor. Xwayland logged "Failed to make EGL context
-#                 current with GL/GLES2" then "EGL setup failed, disabling
-#                 glamor", fell back to software, and every GL client then read
-#                 "DRI3 not available" and stayed off the shim. That EGL is
-#                 libglvnd's dispatch stub, built for the termux prefix: its
-#                 compiled-in vendor dirs are /data/data/com.termux/files/usr/
-#                 {etc,share}/glvnd/egl_vendor.d, absent on device, so no vendor
-#                 loads (client extension list empty) unless something sets
-#                 __EGL_VENDOR_LIBRARY_DIRS. glvnd=disabled below removes the
-#                 indirection: this libEGL IS the implementation
+# egl=gbm=enabled with gles2 is what Xwayland's glamor actually runs on, and the
+#                 reason is not a build preference. Mesa refuses desktop GL on
+#                 Android outright -- src/egl/main/eglcurrent.h gates EGL_OPENGL_API
+#                 on `#if HAVE_OPENGL && !DETECT_OS_ANDROID` -- so
+#                 eglBindAPI(EGL_OPENGL_API) returns EGL_BAD_PARAMETER, the display
+#                 advertises EGL_CLIENT_APIS="OpenGL_ES" only, and every config's
+#                 RENDERABLE_TYPE carries no EGL_OPENGL_BIT. Measured on device:
+#                 GL 3.1 core -> EGL_BAD_ATTRIBUTE (profile mask rejected because the
+#                 bound API was still ES), 2.1 -> EGL_BAD_MATCH, 1.0 -> EGL_BAD_ALLOC,
+#                 GLES2/GLES3 -> SUCCESS. glamor's try_big_gl_api can therefore
+#                 never succeed here; try_gles_api is the only path, which is also
+#                 how Android Xwayland is normally configured.
+#                 glvnd=disabled additionally removes a vendor lookup that cannot
+#                 work on device: libglvnd's stub has compiled-in vendor dirs under
+#                 /data/data/com.termux/files/usr/{etc,share}/glvnd/egl_vendor.d,
+#                 which do not exist there, so with that stub no vendor loads at all
 rm -rf "$BUILD_DIR"
 meson setup "$BUILD_DIR" "$SRC" \
     --cross-file "$CROSS" \
