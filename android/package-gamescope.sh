@@ -46,6 +46,9 @@ DEPS="${GAMESCOPE_TERMUX_PREFIX:-$HOME/termuxfs/aarch64/data/data/com.termux/fil
 # libxml2/libicu). libglvnd's loader/GLES libs and everything else still come
 # from the prefix.
 GN_MESA_GLAMOR_STAGE="${GN_MESA_GLAMOR_STAGE:-$GS_DIR/build-android-mesa-glamor/stage}"
+# Second Mesa stage: the GL a *guest* loads (android/mesa-gl/build-mesa-gl.sh),
+# GLX + DRI3 + kopper rather than the glamor stage's GLES/EGL.
+GN_MESA_GL_STAGE="${GN_MESA_GL_STAGE:-$GS_DIR/build-android-mesa-gl/stage}"
 # macOS writes an AppleDouble "._name" sibling for every file it copies or
 # archives, which lands in the payload as a thousand extra members. BSD cp and
 # tar honour this; on Linux it is inert.
@@ -279,8 +282,52 @@ mkdir -p "$STAGE/lib/gbm"
 cp -L "$GN_MESA_GLAMOR_STAGE/lib/gbm/dri_gbm.so" "$STAGE/lib/gbm/dri_gbm.so"
 resolve_libs "$STAGE/lib/gbm/dri_gbm.so"
 
+# --- the guest's GL: GLX + DRI3 + kopper (android/mesa-gl) ---------------------
+# A GL guest loads libGL.so.1 through wine's opengl32. The container image's own
+# library is Mesa 24.3's glx/xlib build, which presents with XShmPutImage: the
+# frames are copied into the X server and never create a Vulkan surface, so the
+# shim sees no swapchain, applies no acquire cap, generates nothing and never gets
+# a release note. This one presents through GLX/DRI3 (kopper), so the client
+# creates a surface from its X window and rides the same ring and the same gate as
+# a Vulkan guest.
+#
+# -Dglvnd=disabled means this is one monolithic library that dispatches nothing,
+# so no libGLX_mesa vendor for glvnd to find is needed. glapi is built in
+# (-Dshared-glapi=disabled), so the imagefs's Mesa 24.3 libglapi.so.0 is
+# untouched: nothing at this path links it.
+ensure_mesa_gl_stage() {
+    local want
+    want="$(ls "$GN_MESA_GL_STAGE"/lib/libGL.so.1.* 2>/dev/null | head -1)"
+    if [ -n "$want" ] && [ -z "$(find "$GS_DIR/android/mesa-gl" -type f -newer "$want" 2>/dev/null | head -1)" ]; then
+        return 0
+    fi
+    echo "mesa-gl: building the guest GL stage at $GN_MESA_GL_STAGE"
+    bash "$GS_DIR/android/mesa-gl/build-mesa-gl.sh"
+}
+ensure_mesa_gl_stage
+GL_LIB="$(ls "$GN_MESA_GL_STAGE"/lib/libGL.so.1.* 2>/dev/null | head -1)"
+[ -f "$GL_LIB" ] || { echo "error: no libGL.so.1.* in $GN_MESA_GL_STAGE/lib" >&2; exit 1; }
+GL_GALLIUM=("$GN_MESA_GL_STAGE"/lib/libgallium-*.so)
+[ "${#GL_GALLIUM[@]}" = 1 ] && [ -f "${GL_GALLIUM[0]}" ] || {
+    echo "error: expected one libgallium-*.so in $GN_MESA_GL_STAGE/lib" >&2; exit 1; }
+# Its own directory, because both Mesa stages emit the same megadriver soname
+# (libgallium-26.2.6.so) and one would overwrite the other. lib/gl comes first on
+# LD_LIBRARY_PATH (launcher), so a GL guest resolves this libGL and this gallium;
+# the glamor stage's copies in lib/ stay what gamescope and Xwayland's EGL path
+# use. Both are the same Mesa version, so the split cannot produce two different
+# gallium APIs in one process.
+mkdir -p "$STAGE/lib/gl/dri"
+cp -L "$GL_LIB" "$STAGE/lib/gl/libGL.so.1.2.0"
+ln -sfn libGL.so.1.2.0 "$STAGE/lib/gl/libGL.so.1"
+ln -sfn libGL.so.1 "$STAGE/lib/gl/libGL.so"
+cp -L "${GL_GALLIUM[0]}" "$STAGE/lib/gl/${GL_GALLIUM[0]##*/}"
+cp -L "$GN_MESA_GL_STAGE/lib/dri/libdril_dri.so" "$STAGE/lib/gl/dri/libdril_dri.so"
+ln -sfn libdril_dri.so "$STAGE/lib/gl/dri/zink_dri.so"
+resolve_libs "$STAGE/lib/gl/libGL.so.1.2.0" "$STAGE/lib/gl/${GL_GALLIUM[0]##*/}" \
+             "$STAGE/lib/gl/dri/libdril_dri.so"
+
 # glvnd EGL vendor json (library_path: libEGL_mesa.so.0, resolved from
-# LD_LIBRARY_PATH = filesDir/gamescope/lib on device).
+# LD_LIBRARY_PATH = filesDir/gamescope/lib and .../lib/gl on device).
 mkdir -p "$STAGE/share/glvnd/egl_vendor.d"
 cp "$GN_MESA_GLAMOR_STAGE/share/glvnd/egl_vendor.d/50_mesa.json" \
    "$STAGE/share/glvnd/egl_vendor.d/"
