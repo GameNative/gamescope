@@ -312,19 +312,38 @@ GL_GALLIUM=("$GN_MESA_GL_STAGE"/lib/libgallium-*.so)
     echo "error: expected one libgallium-*.so in $GN_MESA_GL_STAGE/lib" >&2; exit 1; }
 # Its own directory, because both Mesa stages emit the same megadriver soname
 # (libgallium-26.2.6.so) and one would overwrite the other. lib/gl comes first on
-# LD_LIBRARY_PATH (launcher), so a GL guest resolves this libGL and this gallium;
-# the glamor stage's copies in lib/ stay what gamescope and Xwayland's EGL path
-# use. Both are the same Mesa version, so the split cannot produce two different
+# LD_LIBRARY_PATH (launcher), so a GL guest resolves this libGL and this gallium.
+# Both are the same Mesa version, so the split cannot produce two different
 # gallium APIs in one process.
-mkdir -p "$STAGE/lib/gl/dri"
+#
+# The same directory also carries this build's EGL + GBM, and that is what the
+# *server* side of the socket loads: Xwayland's glamor is EGL-on-GBM. With the
+# glamor stage's EGL (libglvnd's dispatch stub, compiled for termux-prefix vendor
+# dirs) Xwayland logged "Failed to make EGL context current with GL" and
+# "with GLES2", then disabled glamor and fell back to software — and every GL
+# client then reported "DRI3 not available" and stayed off the shim. This one is
+# glvnd=disabled, so LIBEGL IS the implementation and there is no vendor lookup
+# to get wrong. GBM comes with it because EGL's GBM platform is linked against
+# it, and libgbm's dri backend must be the one built from the same tree.
+mkdir -p "$STAGE/lib/gl/dri" "$STAGE/lib/gl/gbm"
 cp -L "$GL_LIB" "$STAGE/lib/gl/libGL.so.1.2.0"
 ln -sfn libGL.so.1.2.0 "$STAGE/lib/gl/libGL.so.1"
 ln -sfn libGL.so.1 "$STAGE/lib/gl/libGL.so"
 cp -L "${GL_GALLIUM[0]}" "$STAGE/lib/gl/${GL_GALLIUM[0]##*/}"
 cp -L "$GN_MESA_GL_STAGE/lib/dri/libdril_dri.so" "$STAGE/lib/gl/dri/libdril_dri.so"
 ln -sfn libdril_dri.so "$STAGE/lib/gl/dri/zink_dri.so"
+GL_EGL=(libEGL.so.1 libgbm.so.1)
+for n in "${GL_EGL[@]}"; do
+    src="$(ls "$GN_MESA_GL_STAGE/lib/$n".*.* 2>/dev/null | head -1)"
+    [ -f "$src" ] || { echo "error: no $n.*.* in $GN_MESA_GL_STAGE/lib" >&2; exit 1; }
+    cp -L "$src" "$STAGE/lib/gl/$n.0.0"
+    ln -sfn "$n.0.0" "$STAGE/lib/gl/$n"
+    ln -sfn "$n" "$STAGE/lib/gl/${n%.*}"
+done
+cp -L "$GN_MESA_GL_STAGE/lib/gbm/dri_gbm.so" "$STAGE/lib/gl/gbm/dri_gbm.so"
 resolve_libs "$STAGE/lib/gl/libGL.so.1.2.0" "$STAGE/lib/gl/${GL_GALLIUM[0]##*/}" \
-             "$STAGE/lib/gl/dri/libdril_dri.so"
+             "$STAGE/lib/gl/dri/libdril_dri.so" "$STAGE/lib/gl/libEGL.so.1.0.0" \
+             "$STAGE/lib/gl/libgbm.so.1.0.0" "$STAGE/lib/gl/gbm/dri_gbm.so"
 
 # glvnd EGL vendor json (library_path: libEGL_mesa.so.0, resolved from
 # LD_LIBRARY_PATH = filesDir/gamescope/lib and .../lib/gl on device).

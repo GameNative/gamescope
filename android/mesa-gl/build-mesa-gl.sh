@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # NDK cross-build of the GL library a *guest* loads: Mesa zink with GLX + DRI3,
-# i.e. the kopper path, as one monolithic libGL.so.1.5.0.
+# i.e. the kopper path, as one monolithic libGL.so.1.2.0.
 #
 # Why this exists: the container image ships Mesa 24.3's classic libGL (glx/xlib
 # frontend on winsys/sw/xlib, presenting with XShmPutImage). A GL guest then
@@ -17,8 +17,10 @@
 # one version and one toolchain.
 #
 # Installs into a stage prefix:
-#   lib/libGL.so.1.5.0, libGL.so.1, libGL.so     the GL/GLX client, glapi built in
+#   lib/libGL.so.1.2.0, libGL.so.1, libGL.so     the GL/GLX client, glapi built in
+#   lib/libEGL.so.1, lib/libgbm.so.1, libgbm.so  the server's glamor EGL + GBM
 #   lib/dri/zink_dri.so                          the swrast-free DRI driver
+#   lib/gbm/dri_gbm.so                           libgbm's dri backend
 #   share/glvnd/...                              absent: glvnd is disabled on purpose
 #
 # Env overrides are the same as build-mesa-glamor.sh: NDK, TERMUXFS,
@@ -95,16 +97,28 @@ print("pkg_config_libdir:", want)
 EOF
 
 # platforms=x11   the GLX client talks X directly; this is what the glamor build
-#                 turns off because glamor is EGL+GBM only
+#                 turns off because glamor is EGL+GBM only. The GBM EGL platform
+#                 is not a choice in `platforms` -- it comes with -Dgbm=enabled,
+#                 which is why this stage builds both sides of the socket: the
+#                 guest's GLX client and the server's EGL-on-GBM.
 # glx=dri         GLX with a DRI backend -- the frontend that carries kopper.
 #                 'disabled' means no GLX at all, 'xlib' would mean an indirect
 #                 server-side path that presents by copy
 # opengl=true     build libGL; without it there is no client library
-# glvnd=disabled  one monolithic libGL.so.1.5.0, the shape the container image
+# glvnd=disabled  one monolithic libGL.so.1.2.0, the shape the container image
 #                 already has, so nothing has to learn about libGLX_mesa
 # vulkan-drivers= zink dlopens the system ICD at runtime
-# gbm/egl         kept off: a GLX client needs neither, and every library the
-#                 payload ships has to resolve inside it (check-payload-closure)
+# egl=gbm=enabled measured, not assumed: with the glamor stage's EGL the X server
+#                 never got glamor. Xwayland logged "Failed to make EGL context
+#                 current with GL/GLES2" then "EGL setup failed, disabling
+#                 glamor", fell back to software, and every GL client then read
+#                 "DRI3 not available" and stayed off the shim. That EGL is
+#                 libglvnd's dispatch stub, built for the termux prefix: its
+#                 compiled-in vendor dirs are /data/data/com.termux/files/usr/
+#                 {etc,share}/glvnd/egl_vendor.d, absent on device, so no vendor
+#                 loads (client extension list empty) unless something sets
+#                 __EGL_VENDOR_LIBRARY_DIRS. glvnd=disabled below removes the
+#                 indirection: this libEGL IS the implementation
 rm -rf "$BUILD_DIR"
 meson setup "$BUILD_DIR" "$SRC" \
     --cross-file "$CROSS" \
@@ -113,8 +127,8 @@ meson setup "$BUILD_DIR" "$SRC" \
     -Dplatforms=x11 \
     -Dglx=dri \
     -Dopengl=true \
-    -Dgles1=disabled -Dgles2=disabled \
-    -Degl=disabled -Dgbm=disabled \
+    -Dgles1=disabled -Dgles2=enabled \
+    -Degl=enabled -Dgbm=enabled \
     -Dgallium-drivers=zink \
     -Dvulkan-drivers= \
     -Dshared-glapi=disabled \
@@ -133,4 +147,5 @@ meson setup "$BUILD_DIR" "$SRC" \
 ninja -C "$BUILD_DIR" install
 
 echo "staged: $STAGE"
-ls -l "$STAGE/lib"/libGL.so* "$STAGE/lib/dri" 2>/dev/null || true
+ls -l "$STAGE/lib"/libGL.so* "$STAGE/lib"/libEGL.so* "$STAGE/lib"/libgbm.so* \
+      "$STAGE/lib/dri" "$STAGE/lib/gbm" 2>/dev/null || true
