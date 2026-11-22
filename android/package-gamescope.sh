@@ -46,6 +46,9 @@ DEPS="${GAMESCOPE_TERMUX_PREFIX:-$HOME/termuxfs/aarch64/data/data/com.termux/fil
 # libxml2/libicu). libglvnd's loader/GLES libs and everything else still come
 # from the prefix.
 GN_MESA_GLAMOR_STAGE="${GN_MESA_GLAMOR_STAGE:-$GS_DIR/build-android-mesa-glamor/stage}"
+# Second Mesa stage: the GL a *guest* loads (android/mesa-gl/build-mesa-gl.sh),
+# GLX + DRI3 + kopper rather than the glamor stage's GLES/EGL.
+GN_MESA_GL_STAGE="${GN_MESA_GL_STAGE:-$GS_DIR/build-android-mesa-gl/stage}"
 # macOS writes an AppleDouble "._name" sibling for every file it copies or
 # archives, which lands in the payload as a thousand extra members. BSD cp and
 # tar honour this; on Linux it is inert.
@@ -279,8 +282,94 @@ mkdir -p "$STAGE/lib/gbm"
 cp -L "$GN_MESA_GLAMOR_STAGE/lib/gbm/dri_gbm.so" "$STAGE/lib/gbm/dri_gbm.so"
 resolve_libs "$STAGE/lib/gbm/dri_gbm.so"
 
+# --- the guest's GL: GLX + DRI3 + kopper (android/mesa-gl) ---------------------
+# A GL guest loads libGL.so.1 through wine's opengl32. The container image's own
+# library is Mesa 24.3's glx/xlib build, which presents with XShmPutImage: the
+# frames are copied into the X server and never create a Vulkan surface, so the
+# shim sees no swapchain, applies no acquire cap, generates nothing and never gets
+# a release note. This one presents through GLX/DRI3 (kopper), so the client
+# creates a surface from its X window and rides the same ring and the same gate as
+# a Vulkan guest.
+#
+# -Dglvnd=disabled means this is one monolithic library that dispatches nothing,
+# so no libGLX_mesa vendor for glvnd to find is needed. glapi is built in
+# (-Dshared-glapi=disabled), so the imagefs's Mesa 24.3 libglapi.so.0 is
+# untouched: nothing at this path links it.
+ensure_mesa_gl_stage() {
+    local want
+    want="$(ls "$GN_MESA_GL_STAGE"/lib/libGL.so.1.* 2>/dev/null | head -1)"
+    if [ -n "$want" ] && [ -z "$(find "$GS_DIR/android/mesa-gl" -type f -newer "$want" 2>/dev/null | head -1)" ]; then
+        return 0
+    fi
+    echo "mesa-gl: building the guest GL stage at $GN_MESA_GL_STAGE"
+    bash "$GS_DIR/android/mesa-gl/build-mesa-gl.sh"
+}
+ensure_mesa_gl_stage
+GL_LIB="$(ls "$GN_MESA_GL_STAGE"/lib/libGL.so.1.* 2>/dev/null | head -1)"
+[ -f "$GL_LIB" ] || { echo "error: no libGL.so.1.* in $GN_MESA_GL_STAGE/lib" >&2; exit 1; }
+GL_GALLIUM=("$GN_MESA_GL_STAGE"/lib/libgallium-*.so)
+[ "${#GL_GALLIUM[@]}" = 1 ] && [ -f "${GL_GALLIUM[0]}" ] || {
+    echo "error: expected one libgallium-*.so in $GN_MESA_GL_STAGE/lib" >&2; exit 1; }
+# Its own directory, because both Mesa stages emit the same megadriver soname
+# (libgallium-26.2.6.so) and one would overwrite the other. lib/gl comes first on
+# LD_LIBRARY_PATH (launcher), so a GL guest resolves this libGL and this gallium.
+# Both are the same Mesa version, so the split cannot produce two different
+# gallium APIs in one process.
+#
+# The same directory also carries this build's EGL + GBM, and that is what the
+# *server* side of the socket loads: Xwayland's glamor is EGL-on-GBM. With the
+# glamor stage's EGL (libglvnd's dispatch stub, compiled for termux-prefix vendor
+# dirs) Xwayland logged "Failed to make EGL context current with GL" and
+# "with GLES2", then disabled glamor and fell back to software — and every GL
+# client then reported "DRI3 not available" and stayed off the shim. This one is
+# glvnd=disabled, so LIBEGL IS the implementation and there is no vendor lookup
+# to get wrong. GBM comes with it because EGL's GBM platform is linked against
+# it, and libgbm's dri backend must be the one built from the same tree.
+mkdir -p "$STAGE/lib/gl/dri" "$STAGE/lib/gl/gbm"
+cp -L "$GL_LIB" "$STAGE/lib/gl/libGL.so.1.2.0"
+ln -sfn libGL.so.1.2.0 "$STAGE/lib/gl/libGL.so.1"
+ln -sfn libGL.so.1 "$STAGE/lib/gl/libGL.so"
+cp -L "${GL_GALLIUM[0]}" "$STAGE/lib/gl/${GL_GALLIUM[0]##*/}"
+cp -L "$GN_MESA_GL_STAGE/lib/dri/libdril_dri.so" "$STAGE/lib/gl/dri/libdril_dri.so"
+ln -sfn libdril_dri.so "$STAGE/lib/gl/dri/zink_dri.so"
+GL_EGL=(libEGL.so.1 libgbm.so.1)
+for n in "${GL_EGL[@]}"; do
+    src="$(ls "$GN_MESA_GL_STAGE/lib/$n".*.* 2>/dev/null | head -1)"
+    [ -f "$src" ] || { echo "error: no $n.*.* in $GN_MESA_GL_STAGE/lib" >&2; exit 1; }
+    cp -L "$src" "$STAGE/lib/gl/$n.0.0"
+    ln -sfn "$n.0.0" "$STAGE/lib/gl/$n"
+    ln -sfn "$n" "$STAGE/lib/gl/${n%.*}"
+done
+cp -L "$GN_MESA_GL_STAGE/lib/gbm/dri_gbm.so" "$STAGE/lib/gl/gbm/dri_gbm.so"
+# The server's glamor runs on GLES2, not GL: Mesa's EGL refuses EGL_OPENGL_API
+# under DETECT_OS_ANDROID ("OpenGL is not a valid/supported API on Android",
+# src/egl/main/eglcurrent.h), so eglBindAPI(EGL_OPENGL_API) returns
+# EGL_BAD_PARAMETER and the display advertises only EGL_OPENGL_ES. That leaves
+# the GLES2 path as the only one Xwayland can take -- and it needs a real
+# libGLESv2. The one in lib/ is libglvnd's dispatch stub from the termux prefix:
+# it resolves entry points through libGLdispatch, whose vendor is registered by a
+# glvnd EGL vendor library, and this stage is glvnd=disabled, so every GLES call
+# came back NULL and glamor stopped at "glGetString() returned NULL, your GL is
+# broken". This copy is the same Mesa, monolithic, so it needs no vendor.
+# Measured after shipping it: glGetString reports "zink Vulkan 1.4(Turnip Adreno
+# (TM) 740)", glamor initialises on GLES2, DRI3 appears, and a GL guest (GLX +
+# kopper libGL above) reaches the shim -- the first GL title ever to create a
+# swapchain through it.
+GL_GLES=(libGLESv2.so.2)
+for n in "${GL_GLES[@]}"; do
+    src="$(ls "$GN_MESA_GL_STAGE/lib/$n".*.* 2>/dev/null | head -1)"
+    [ -f "$src" ] || { echo "error: no $n.*.* in $GN_MESA_GL_STAGE/lib" >&2; exit 1; }
+    cp -L "$src" "$STAGE/lib/gl/$n.0.0"
+    ln -sfn "$n.0.0" "$STAGE/lib/gl/$n"
+    ln -sfn "$n" "$STAGE/lib/gl/${n%.*}"
+done
+resolve_libs "$STAGE/lib/gl/libGL.so.1.2.0" "$STAGE/lib/gl/${GL_GALLIUM[0]##*/}" \
+             "$STAGE/lib/gl/dri/libdril_dri.so" "$STAGE/lib/gl/libEGL.so.1.0.0" \
+             "$STAGE/lib/gl/libgbm.so.1.0.0" "$STAGE/lib/gl/gbm/dri_gbm.so" \
+             "$STAGE/lib/gl/libGLESv2.so.2.0.0"
+
 # glvnd EGL vendor json (library_path: libEGL_mesa.so.0, resolved from
-# LD_LIBRARY_PATH = filesDir/gamescope/lib on device).
+# LD_LIBRARY_PATH = filesDir/gamescope/lib and .../lib/gl on device).
 mkdir -p "$STAGE/share/glvnd/egl_vendor.d"
 cp "$GN_MESA_GLAMOR_STAGE/share/glvnd/egl_vendor.d/50_mesa.json" \
    "$STAGE/share/glvnd/egl_vendor.d/"
