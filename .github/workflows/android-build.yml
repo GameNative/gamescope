@@ -104,6 +104,15 @@ jobs:
             /usr/lib/x86_64-linux-gnu/pkgconfig/wayland-scanner.pc
           wayland-scanner --version
 
+      # The Mesa release tarball is cached before the first step that reads it:
+      # the prefix provisions the GL headers a GLX-enabled Xwayland compiles
+      # against, and the GL stage builds below use the same release.
+      - name: Cache the Mesa release tarball
+        uses: actions/cache@v4
+        with:
+          path: ~/mesa-tarball
+          key: mesa-tarball-${{ hashFiles('android/mesa-glamor/fetch-mesa.sh') }}
+
       # wayland-protocols (>= 1.47 for wlroots), libXres, libxkbfile,
       # xcb-util-wm, luajit and hwdata are not in the termux tree.
       - name: Install the missing build dependencies
@@ -137,12 +146,6 @@ jobs:
       # it provisions its own meson + Python modules into a venv in its work dir.
       - name: Install the glamor Mesa build tools
         run: sudo apt-get install -y bison flex python3-venv
-
-      - name: Cache the Mesa release tarball
-        uses: actions/cache@v4
-        with:
-          path: ~/mesa-tarball
-          key: mesa-tarball-${{ hashFiles('android/mesa-glamor/fetch-mesa.sh') }}
 
       - name: Cache ccache (glamor Mesa)
         uses: actions/cache@v4

@@ -19,6 +19,9 @@ TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
 TERMUXFS_URL="https://github.com/GameNative/termux-on-gha/releases/download/build-20260218/termuxfs-aarch64.tar"
 TERMUX_REPO="https://packages-cf.termux.dev/apt/termux-main"
 WAYLAND_PROTOCOLS_VERSION="1.49"
+# Same cache the Mesa stage builds read; the GL headers below come from the
+# same release, so one download serves both.
+MESA_TARBALL_DIR="${GN_MESA_TARBALL_DIR:-$HOME/mesa-tarball}"
 
 # Same layout the workflow provisions (and proton-wine uses).
 ROOT="$HOME/termuxfs/aarch64"
@@ -197,6 +200,43 @@ build_lib libXfont2 2.0.9 xfont2.pc \
     https://xorg.freedesktop.org/releases/individual/lib/libXfont2-2.0.9.tar.gz
 build_lib_meson libxcvt 0.1.3 libxcvt.pc \
     https://xorg.freedesktop.org/releases/individual/lib/libxcvt-0.1.3.tar.xz
+
+# --- 5. the GL headers a GLX-enabled Xwayland compiles against ---------------
+# The payload's Xwayland is built with -Dglx=true, so a GL guest has something
+# to bind to; its glx/ sources include <GL/gl.h>, <GL/glx.h> and <GL/glext.h>,
+# and the DRI2/DRISW screens <GL/internal/dri_interface.h>. The termux tree
+# carries only the protocol headers (glxproto.h, glxtokens.h) and dri_interface.h
+# under its own names, so the Xwayland build stops in its preflight check.
+#
+# Taken from the Mesa release this repo already pins for its own GL stages
+# (android/mesa-glamor/fetch-mesa.sh, same sha256), not from a distro package:
+# the prefix then matches the Mesa the payload ships, and the version moves with
+# the one place that already moves it. KHR/khrplatform.h comes along because
+# glext.h includes it.
+if [ ! -f "$PREFIX/include/GL/glx.h" ]; then
+    REPO_DIR="$(cd "$CI_DIR/../.." && pwd)"
+    MESA_VERSION="$(sed -n 's/^MESA_VERSION="\(.*\)"/\1/p' "$REPO_DIR/android/mesa-glamor/fetch-mesa.sh")"
+    MESA_SHA256="$(sed -n 's/^MESA_SHA256="\(.*\)"/\1/p' "$REPO_DIR/android/mesa-glamor/fetch-mesa.sh")"
+    [ -n "$MESA_VERSION" ] && [ -n "$MESA_SHA256" ] || {
+        echo "could not read MESA_VERSION/MESA_SHA256 from android/mesa-glamor/fetch-mesa.sh" >&2
+        exit 1; }
+    log "GL headers (mesa-$MESA_VERSION)"
+    tarball="$MESA_TARBALL_DIR/mesa-$MESA_VERSION.tar.xz"
+    mkdir -p "$MESA_TARBALL_DIR"
+    [ -f "$tarball" ] || curl -fL --retry 3 -o "$tarball.part" \
+        "https://archive.mesa3d.org/mesa-$MESA_VERSION.tar.xz"
+    [ -f "$tarball" ] || mv "$tarball.part" "$tarball"
+    if command -v sha256sum >/dev/null; then got="$(sha256sum "$tarball" | cut -d' ' -f1)"
+    else got="$(shasum -a 256 "$tarball" | cut -d' ' -f1)"; fi
+    [ "$got" = "$MESA_SHA256" ] || {
+        echo "sha256 mismatch for $tarball: $got, expected $MESA_SHA256" >&2; exit 1; }
+    rm -rf "${WORK:?}/src/mesa-gl-headers" && mkdir -p "$WORK/src/mesa-gl-headers"
+    tar -xf "$tarball" -C "$WORK/src/mesa-gl-headers" \
+        "mesa-$MESA_VERSION/include/GL" "mesa-$MESA_VERSION/include/KHR"
+    mkdir -p "$PREFIX/include/GL/internal" "$PREFIX/include/KHR"
+    cp -a "$WORK/src/mesa-gl-headers/mesa-$MESA_VERSION/include/GL/." "$PREFIX/include/GL/"
+    cp -a "$WORK/src/mesa-gl-headers/mesa-$MESA_VERSION/include/KHR/." "$PREFIX/include/KHR/"
+fi
 
 normalize_pc
 
